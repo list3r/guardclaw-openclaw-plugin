@@ -1,0 +1,14 @@
+@centrase/guardclaw
+Copyright (c) 2026 Centrase AI (https://centrase.com)
+
+This package is maintained by Centrase AI and published under the
+@centrase npm namespace.
+
+---
+
+Derived from EdgeClaw (https://github.com/openbmb/edgeclaw)
+Copyright (c) OpenBMB / Tsinghua University
+Licensed under MIT License
+
+If you fork, extend, or redistribute this package, please retain this
+NOTICE file and the copyright attribution in LICENSE.

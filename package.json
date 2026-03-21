@@ -1,0 +1,70 @@
+{
+  "name": "@centrase/guardclaw",
+  "version": "1.0.0",
+  "description": "Privacy-aware OpenClaw plugin with S1/S2/S3 sensitivity detection, local processing, and guard agent support. Built by Centrase AI.",
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48",
+    "synckit": "^0.11.12",
+    "tsx": "^4.21.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  },
+  "author": {
+    "name": "Centrase AI",
+    "email": "hello@centrase.com",
+    "url": "https://centrase.com"
+  },
+  "homepage": "https://github.com/list3r/guardclaw-openclaw-plugin#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/list3r/guardclaw-openclaw-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/list3r/guardclaw-openclaw-plugin/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "privacy",
+    "pii-detection",
+    "sensitivity-classification",
+    "guard-agent",
+    "local-model",
+    "edge-ai",
+    "s1-s2-s3",
+    "centrase"
+  ],
+  "files": [
+    "dist/",
+    "prompts/",
+    "openclaw.plugin.json",
+    "config.example.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
+}
