@@ -3,10 +3,14 @@ set -euo pipefail
 
 # GuardClaw Install Script
 # Usage: bash scripts/install.sh [--install-dir /path] [--no-restart]
+#
+# Default install dir: /opt/guardclaw
+# The script expects to be run from the cloned repo root:
+#   git clone https://github.com/list3r/guardclaw-openclaw-plugin /opt/guardclaw
+#   cd /opt/guardclaw && bash scripts/install.sh
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/edgeclaw}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/guardclaw}"
 RESTART_GATEWAY=true
-REPO_URL="https://github.com/openbmb/edgeclaw"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -17,7 +21,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-PLUGIN_DIR="$INSTALL_DIR/extensions/guardclaw"
 OPENCLAW_DIR="$HOME/.openclaw"
 GUARDCLAW_CONFIG="$OPENCLAW_DIR/guardclaw.json"
 
@@ -48,26 +51,32 @@ fi
 echo "  ✓ npm $(npm --version)"
 
 if ! command -v openclaw &>/dev/null; then
-  echo "✗ openclaw CLI not found. Install OpenClaw first."
+  echo "✗ openclaw CLI not found. Install OpenClaw first: https://openclaw.ai"
   exit 1
 fi
 echo "  ✓ openclaw CLI found"
 echo ""
 
-# ── Clone or update ──
-if [[ -d "$PLUGIN_DIR" ]]; then
-  echo "→ Plugin directory exists at $PLUGIN_DIR"
-  echo "  Skipping clone (use git pull to update)"
+# ── Detect run location ──
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -f "$REPO_ROOT/package.json" ]] && grep -q "@centrase/guardclaw" "$REPO_ROOT/package.json" 2>/dev/null; then
+  # Running from inside the cloned repo — install in-place
+  PLUGIN_DIR="$REPO_ROOT"
+  echo "→ Running from repo root: $PLUGIN_DIR"
 else
-  echo "→ Cloning EdgeClaw (sparse checkout)..."
-  if [[ ! -d "$INSTALL_DIR" ]]; then
-    sudo mkdir -p "$INSTALL_DIR"
-    sudo chown "$(whoami)" "$INSTALL_DIR"
+  # Running standalone — clone to INSTALL_DIR
+  echo "→ Install directory: $INSTALL_DIR"
+  if [[ -d "$INSTALL_DIR" && -f "$INSTALL_DIR/package.json" ]]; then
+    echo "  Directory exists — skipping clone"
+    PLUGIN_DIR="$INSTALL_DIR"
+  else
+    echo "→ Cloning guardclaw-openclaw-plugin..."
+    git clone --depth 1 https://github.com/list3r/guardclaw-openclaw-plugin "$INSTALL_DIR"
+    PLUGIN_DIR="$INSTALL_DIR"
+    echo "  ✓ Cloned to $INSTALL_DIR"
   fi
-  git clone --depth 1 --filter=blob:none --sparse "$REPO_URL" "$INSTALL_DIR"
-  cd "$INSTALL_DIR"
-  git sparse-checkout set extensions/guardclaw
-  echo "  ✓ Cloned to $INSTALL_DIR"
 fi
 echo ""
 
@@ -86,12 +95,8 @@ echo ""
 
 # ── Register plugin ──
 echo "→ Registering plugin with OpenClaw..."
-if openclaw plugins list 2>/dev/null | grep -q "guardclaw"; then
-  echo "  Plugin already registered"
-else
-  openclaw plugins install --link "$PLUGIN_DIR" 2>&1 || true
-  echo "  ✓ Plugin registered"
-fi
+openclaw plugins install --link "$PLUGIN_DIR" 2>&1 | tail -3 || true
+echo "  ✓ Plugin registered"
 echo ""
 
 # ── Generate default config if missing ──
@@ -102,6 +107,7 @@ if [[ ! -f "$GUARDCLAW_CONFIG" ]]; then
   "privacy": {
     "enabled": true,
     "s2Policy": "proxy",
+    "s3Policy": "local-only",
     "proxyPort": 8403,
     "checkpoints": {
       "onUserMessage": ["ruleDetector"],
@@ -168,10 +174,10 @@ else
 fi
 
 echo ""
-echo "╔══════════════════════════════════════════════════╗"
-echo "║  ✅ GuardClaw installed successfully!             ║"
-echo "║                                                  ║"
-echo "║  Config:    ~/.openclaw/guardclaw.json           ║"
-echo "║  Dashboard: http://127.0.0.1:18789/plugins/guardclaw/stats ║"
-echo "║  Docs:      BUILD.md                             ║"
-echo "╚══════════════════════════════════════════════════╝"
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║  ✅ GuardClaw installed successfully!                            ║"
+echo "║                                                                  ║"
+echo "║  Config:    ~/.openclaw/guardclaw.json                           ║"
+echo "║  Dashboard: http://127.0.0.1:18789/plugins/guardclaw/stats       ║"
+echo "║  Docs:      https://github.com/list3r/guardclaw-openclaw-plugin  ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
