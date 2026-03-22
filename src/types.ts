@@ -111,6 +111,23 @@ export type PrivacyConfig = {
   redaction?: RedactionOptions;
 };
 
+export type InjectionConfig = {
+  /** Enable S0 injection detection. Default: true */
+  enabled?: boolean;
+  /** Skip ML model, use heuristics only (faster but less accurate). Default: false */
+  heuristics_only?: boolean;
+  /** Score threshold for blocking (0-100, default 70) */
+  block_threshold?: number;
+  /** Score threshold for sanitising (0-100, default 30) */
+  sanitise_threshold?: number;
+  /** Discord channel ID for block alerts */
+  alert_channel?: string;
+  /** Source types exempt from scanning (e.g. ["file"] to trust local files) */
+  exempt_sources?: string[];
+  /** Discord user IDs exempt from scanning */
+  exempt_senders?: string[];
+};
+
 export type RedactionOptions = {
   /** Internal IP addresses (10.x, 172.16-31.x, 192.168.x). Default: false */
   internalIp?: boolean;

@@ -90,10 +90,12 @@ function getDetectorsForCheckpoint(
 /**
  * Run detectors and collect results.
  *
- * Short-circuits on S3: once any detector returns S3 (highest level),
- * remaining detectors are skipped — no further detection can raise the
- * level and running an LLM judge for a message that will stay local is
- * both wasteful and a needless exposure of sensitive content.
+ * Short-circuits on high-confidence rule hits:
+ * - S3 always skips remaining detectors (highest level, content stays local)
+ * - S2 with confidence >= 1.0 (rule engine pattern/keyword match) also skips
+ *   the LLM — the regex already knows, running inference adds only latency.
+ *
+ * S1 results and low-confidence hits proceed to the LLM classifier as normal.
  */
 async function runDetectors(
   detectors: DetectorType[],
@@ -120,7 +122,17 @@ async function runDetectors(
 
       results.push(result);
 
-      if (result.level === "S3") break;
+      // Short-circuit: skip LLM when rule engine already has a definitive answer.
+      // S3 always short-circuits. S2 short-circuits only on high-confidence rule hits
+      // (confidence === 1.0 means the regex/keyword matched — no ambiguity).
+      const isHighConfidenceRuleHit =
+        detector === "ruleDetector" && (result.confidence ?? 0) >= 1.0;
+      if (result.level === "S3" || (result.level === "S2" && isHighConfidenceRuleHit)) {
+        if (isHighConfidenceRuleHit && result.level === "S2") {
+          console.debug(`[GuardClaw] Short-circuit: rule engine S2 hit (${result.reason}) — skipping LLM`);
+        }
+        break;
+      }
     } catch (err) {
       console.error(`[GuardClaw] Detector ${detector} failed:`, err);
     }

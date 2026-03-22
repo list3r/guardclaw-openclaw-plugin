@@ -7,6 +7,7 @@ import {
   clearActiveLocalRouting,
   clearSessionState,
   consumeDetection,
+  defaultInjectionConfig,
   defaultPrivacyConfig,
   deleteCorrection,
   desensitizeWithLocalModel,
@@ -20,6 +21,7 @@ import {
   getLastReplyModelOrigin,
   getLastTurnTokens,
   getLiveConfig,
+  getLiveInjectionConfig,
   getPendingDetection,
   guardClawConfigSchema,
   initLiveConfig,
@@ -40,15 +42,15 @@ import {
   updateLiveConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-7OOOFMI5.js";
+} from "./chunk-WPXZDJXK.js";
 
 // index.ts
-import { join as join5 } from "path";
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
+import { join as join6 } from "path";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 
 // src/hooks.ts
 import * as fs3 from "fs";
-import * as path3 from "path";
+import * as path4 from "path";
 
 // src/guard-agent.ts
 function isGuardAgentConfigured(config) {
@@ -135,15 +137,15 @@ import * as fs from "fs";
 import * as path from "path";
 
 // src/utils.ts
-function normalizePath(path4) {
-  if (path4.startsWith("~/")) {
+function normalizePath(path5) {
+  if (path5.startsWith("~/")) {
     const home = process.env.HOME || process.env.USERPROFILE || "~";
-    return path4.replace("~", home);
+    return path5.replace("~", home);
   }
-  return path4;
+  return path5;
 }
-function matchesPathPattern(path4, patterns) {
-  const normalizedPath = normalizePath(path4);
+function matchesPathPattern(path5, patterns) {
+  const normalizedPath = normalizePath(path5);
   for (const pattern of patterns) {
     const normalizedPattern = normalizePath(pattern);
     if (normalizedPath === normalizedPattern) {
@@ -1045,29 +1047,29 @@ function checkToolParams(params, config) {
     return { level: "S1" };
   }
   const s3Paths = config.rules?.tools?.S3?.paths ?? [];
-  for (const path4 of paths) {
-    if (matchesPathPattern(path4, s3Paths)) {
+  for (const path5 of paths) {
+    if (matchesPathPattern(path5, s3Paths)) {
       return {
         level: "S3",
-        reason: `S3 path detected: ${path4}`
+        reason: `S3 path detected: ${path5}`
       };
     }
   }
   const s2Paths = config.rules?.tools?.S2?.paths ?? [];
-  for (const path4 of paths) {
-    if (matchesPathPattern(path4, s2Paths)) {
+  for (const path5 of paths) {
+    if (matchesPathPattern(path5, s2Paths)) {
       return {
         level: "S2",
-        reason: `S2 path detected: ${path4}`
+        reason: `S2 path detected: ${path5}`
       };
     }
   }
-  for (const path4 of paths) {
-    const lowerPath = path4.toLowerCase();
+  for (const path5 of paths) {
+    const lowerPath = path5.toLowerCase();
     if (lowerPath.endsWith(".pem") || lowerPath.endsWith(".key") || lowerPath.endsWith(".p12") || lowerPath.endsWith(".pfx") || lowerPath.includes("id_rsa") || lowerPath.includes("id_dsa") || lowerPath.includes("id_ecdsa") || lowerPath.includes("id_ed25519")) {
       return {
         level: "S3",
-        reason: `Sensitive file extension detected: ${path4}`
+        reason: `Sensitive file extension detected: ${path5}`
       };
     }
   }
@@ -1915,6 +1917,232 @@ function getGlobalPipeline() {
   return globalPipeline;
 }
 
+// src/injection/patterns.ts
+var INJECTION_PATTERNS = {
+  // Role override attempts
+  role_override: [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
+    /forget\s+(everything|all|your)\s+(you\s+know|instructions?|training|context)/i,
+    /you\s+are\s+now\s+/i,
+    /from\s+now\s+on\s*,?\s*(you|act|behave|respond)/i,
+    /pretend\s+(you\s+are|to\s+be|you're)/i,
+    /act\s+as\s+(if\s+you\s+(are|were)|a|an|the)/i,
+    /your\s+new\s+(instructions?|directive|goal|purpose|role)/i,
+    /switch\s+(to|into)\s+.{0,20}\s+mode/i,
+    /\[?(system|admin|root|sudo|developer|debug|unrestricted|jailbreak|DAN)\]?\s*(mode|prompt|override|access)/i,
+    /do\s+anything\s+now/i,
+    /you\s+have\s+no\s+(restrictions?|limits?|guidelines?)/i
+  ],
+  // Exfiltration instructions
+  exfiltration: [
+    /send\s+(this|all|everything|the\s+\w+)\s+to\s+https?:\/\//i,
+    /send\s+(this|all|everything)\s+to\s/i,
+    /POST\s+(this|data|it|everything)\s+to\s/i,
+    /upload\s+(this|all|the\s+\w+)\s+to\s/i,
+    /email\s+(this|all|the\s+\w+|everything)\s+to\s/i,
+    /forward\s+(this|all|everything)\s+to\s/i,
+    /exfiltrat/i,
+    /HTTP\s+(request|POST|GET)\s+to\s/i,
+    /curl\s+(-X\s+POST\s+)?https?:\/\//i,
+    /wget\s+https?:\/\//i
+  ],
+  // Credential fishing
+  credential_fishing: [
+    /(provide|give|tell\s+me|show\s+me|reveal|share|what\s+is)\s+(your\s+)?(API\s*key|token|secret|password|credentials?|auth)/i,
+    /reveal\s+(your\s+)?(system\s+prompt|instructions?|context|training)/i,
+    /print\s+(your\s+)?(system|initial)\s+(prompt|instructions?|message)/i,
+    /output\s+(your\s+)?(config|configuration|settings|environment)/i,
+    /display\s+(hidden|secret|internal)\s/i
+  ],
+  // Encoding tricks (signals, not definitive)
+  encoding_tricks: [
+    /[A-Za-z0-9+\/]{50,}={0,2}/,
+    // Base64 blob (50+ chars)
+    /\\u[0-9a-fA-F]{4}/,
+    // Unicode escapes
+    /&#x?[0-9a-fA-F]+;/,
+    // HTML entities
+    /\x00|\x0d|\x0a{5,}/
+    // Null bytes or excessive newlines
+  ],
+  // Structural signals (imperative in data context)
+  structural: [
+    /^(you\s+must|you\s+should|you\s+will|you\s+need\s+to|always|never)\s/im,
+    /^(do\s+not|don't|stop|halt|cease|terminate)\s/im,
+    /\[\s*(INST|SYSTEM|ASSISTANT|USER)\s*\]/i,
+    // Role tags in content
+    /<\|?(im_start|im_end|system|user|assistant)\|?>/i
+    // ChatML tags
+  ]
+};
+var PATTERN_WEIGHTS = {
+  role_override: 40,
+  exfiltration: 35,
+  credential_fishing: 30,
+  encoding_tricks: 15,
+  structural: 20
+};
+
+// src/injection/heuristics.ts
+function runHeuristics(content) {
+  const matches = [];
+  const matchedPatterns = [];
+  let score = 0;
+  for (const [category, patterns] of Object.entries(INJECTION_PATTERNS)) {
+    for (const pattern of patterns) {
+      const match = content.match(pattern);
+      if (match) {
+        if (!matches.includes(category)) {
+          matches.push(category);
+          score += PATTERN_WEIGHTS[category] || 10;
+        }
+        matchedPatterns.push({
+          category,
+          pattern: pattern.toString(),
+          match: match[0].slice(0, 100)
+        });
+      }
+    }
+  }
+  score = Math.min(score, 100);
+  return { score, matches, matchedPatterns };
+}
+
+// src/injection/deberta.ts
+import { spawn } from "child_process";
+import * as path3 from "path";
+import { existsSync as existsSync3 } from "fs";
+import { fileURLToPath as fileURLToPath2 } from "url";
+var __filename = fileURLToPath2(import.meta.url);
+var __dirname = path3.dirname(__filename);
+var CLASSIFIER_SCRIPT = path3.join(__dirname, "../scripts/injection_classifier.py");
+var VENV_PYTHON = path3.join(__dirname, "../.venv/bin/python3");
+var PYTHON_BIN = existsSync3(VENV_PYTHON) ? VENV_PYTHON : "python3";
+var TIMEOUT_MS = 5e3;
+async function runDebertaClassifier(content) {
+  return new Promise((resolve2) => {
+    let resolved = false;
+    const proc = spawn(PYTHON_BIN, [CLASSIFIER_SCRIPT], {
+      timeout: TIMEOUT_MS
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (data) => {
+      stdout += data;
+    });
+    proc.stderr.on("data", (data) => {
+      stderr += data;
+    });
+    proc.on("close", (code) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve2({ label: 0, score: 0, injection: false, error: stderr || "Process failed" });
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout);
+        resolve2(result);
+      } catch {
+        resolve2({ label: 0, score: 0, injection: false, error: "Invalid JSON response" });
+      }
+    });
+    proc.on("error", (err) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      resolve2({ label: 0, score: 0, injection: false, error: err.message });
+    });
+    proc.stdin.write(content);
+    proc.stdin.end();
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      proc.kill();
+      resolve2({ label: 0, score: 0, injection: false, error: "Timeout" });
+    }, TIMEOUT_MS + 1e3);
+  });
+}
+
+// src/injection/sanitiser.ts
+var REDACTION_MARKER = "[CONTENT REDACTED \u2014 POTENTIAL INJECTION]";
+function sanitiseContent(content, matchedPatterns) {
+  let sanitised = content;
+  const sorted = [...matchedPatterns].filter((p) => p.match.length > 0).sort((a, b) => b.match.length - a.match.length);
+  for (const { match } of sorted) {
+    const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(escaped, "gi");
+    sanitised = sanitised.replace(regex, REDACTION_MARKER);
+  }
+  const escapedMarker = REDACTION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  sanitised = sanitised.replace(
+    new RegExp(`(${escapedMarker}\\s*)+`, "g"),
+    REDACTION_MARKER + "\n"
+  );
+  return sanitised.trim();
+}
+
+// src/injection/index.ts
+var DEFAULT_BLOCK_THRESHOLD = 70;
+var DEFAULT_SANITISE_THRESHOLD = 30;
+var SECURITY_CHANNEL = "1483608914774986943";
+function formatBlockAlert(result, source, preview) {
+  return `\u{1F6E1}\uFE0F **GuardClaw S0 \u2014 Injection Blocked**
+> **Source:** ${source}
+> **Score:** ${result.score}/100
+> **Patterns:** ${result.matches.join(", ")}
+> **Preview:** \`${preview.slice(0, 100)}${preview.length > 100 ? "..." : ""}\`
+>
+> Content blocked and not passed to model. Review in guardclaw-injections.log`;
+}
+var _injectionConfig = {};
+function initInjectionConfig(config) {
+  _injectionConfig = config;
+}
+async function detectInjection(content, source, config) {
+  const cfg = config ?? _injectionConfig;
+  if (cfg.exempt_sources?.includes(source)) {
+    return { pass: true, score: 0, action: "pass", matches: [] };
+  }
+  const blockThreshold = cfg.block_threshold ?? DEFAULT_BLOCK_THRESHOLD;
+  const sanitiseThreshold = cfg.sanitise_threshold ?? DEFAULT_SANITISE_THRESHOLD;
+  const heuristic = runHeuristics(content);
+  let finalScore = heuristic.score;
+  let debertaResult = null;
+  if (!cfg.heuristics_only && heuristic.score >= 20 && heuristic.score <= 80) {
+    debertaResult = await runDebertaClassifier(content);
+    if (!debertaResult.error) {
+      if (debertaResult.injection) {
+        finalScore = Math.max(finalScore, 70 + debertaResult.score * 30);
+      } else if (debertaResult.score > 0.7 && debertaResult.label === 0) {
+        finalScore = Math.min(finalScore, 25);
+      }
+    }
+  }
+  let action;
+  if (finalScore < sanitiseThreshold) {
+    action = "pass";
+  } else if (finalScore < blockThreshold) {
+    action = "sanitise";
+  } else {
+    action = "block";
+  }
+  let sanitised;
+  if (action === "sanitise") {
+    sanitised = sanitiseContent(content, heuristic.matchedPatterns);
+  }
+  return {
+    pass: action === "pass",
+    score: Math.round(finalScore),
+    action,
+    sanitised,
+    matches: heuristic.matches,
+    blocked_reason: action === "block" ? `Injection detected (score ${Math.round(finalScore)}): ${heuristic.matches.join(", ")}` : void 0
+  };
+}
+
 // src/hooks.ts
 function getPipelineConfig() {
   return { privacy: getLiveConfig() };
@@ -2006,6 +2234,37 @@ function registerHooks(api) {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
       const msgStr = String(prompt);
       if (shouldSkipMessage(msgStr)) return;
+      const injectionCfg = getLiveInjectionConfig();
+      if (injectionCfg.enabled !== false) {
+        const senderId = ctx.senderId;
+        const isExemptSender = senderId && (injectionCfg.exempt_senders ?? []).includes(senderId);
+        if (!isExemptSender) {
+          try {
+            const injResult = await detectInjection(msgStr, "user_message", injectionCfg);
+            if (injResult.action === "block") {
+              api.logger.warn(
+                `[GuardClaw S0] BLOCKED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
+              );
+              const alertChannel = injectionCfg.alert_channel ?? SECURITY_CHANNEL;
+              const alertMsg = formatBlockAlert(injResult, "user_message", msgStr);
+              void api.discord?.sendMessage?.(alertChannel, alertMsg)?.catch?.(() => {
+              });
+              throw new Error(
+                `[GuardClaw S0] Message blocked: ${injResult.blocked_reason ?? "Prompt injection detected"}`
+              );
+            } else if (injResult.action === "sanitise" && injResult.sanitised) {
+              api.logger.warn(
+                `[GuardClaw S0] SANITISED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
+              );
+              event.prompt = injResult.sanitised;
+            }
+          } catch (err) {
+            const msg = String(err);
+            if (msg.includes("[GuardClaw S0] Message blocked")) throw err;
+            api.logger.warn(`[GuardClaw S0] Detection error (non-fatal): ${msg}`);
+          }
+        }
+      }
       const rulePreCheck = detectByRules(
         { checkpoint: "onUserMessage", message: msgStr, sessionKey },
         privacyConfig
@@ -2899,7 +3158,7 @@ function isMemoryWritePath(writePath) {
 }
 async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, isGuardSession = false) {
   const rel = writePath.replace(/^\.\//, "");
-  const absPath = path3.isAbsolute(writePath) ? writePath : path3.resolve(workspaceDir, rel);
+  const absPath = path4.isAbsolute(writePath) ? writePath : path4.resolve(workspaceDir, rel);
   let content;
   try {
     content = await fs3.promises.readFile(absPath, "utf-8");
@@ -2915,8 +3174,8 @@ async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, i
   } else {
     return;
   }
-  const fullAbsPath = path3.resolve(workspaceDir, fullRelPath);
-  await fs3.promises.mkdir(path3.dirname(fullAbsPath), { recursive: true });
+  const fullAbsPath = path4.resolve(workspaceDir, fullRelPath);
+  await fs3.promises.mkdir(path4.dirname(fullAbsPath), { recursive: true });
   const fullContent = isGuardSession ? `${GUARD_SECTION_BEGIN}
 ${content}
 ${GUARD_SECTION_END}` : content;
@@ -3021,7 +3280,13 @@ async function runDetectors(detectors, context, config) {
           continue;
       }
       results.push(result);
-      if (result.level === "S3") break;
+      const isHighConfidenceRuleHit = detector === "ruleDetector" && (result.confidence ?? 0) >= 1;
+      if (result.level === "S3" || result.level === "S2" && isHighConfidenceRuleHit) {
+        if (isHighConfidenceRuleHit && result.level === "S2") {
+          console.debug(`[GuardClaw] Short-circuit: rule engine S2 hit (${result.reason}) \u2014 skipping LLM`);
+        }
+        break;
+      }
     } catch (err) {
       console.error(`[GuardClaw] Detector ${detector} failed:`, err);
     }
@@ -3329,11 +3594,11 @@ var tokenSaverRouter = {
 
 // src/stats-dashboard.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2 } from "fs";
-import { join as join4 } from "path";
+import { join as join5 } from "path";
 
 // src/presets.ts
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { join as join3 } from "path";
+import { join as join4 } from "path";
 var BUILTIN_PRESETS = [
   {
     id: "vllm-qwen35",
@@ -3362,9 +3627,9 @@ var BUILTIN_PRESETS = [
     defaultModel: "minimax/MiniMax-M2.5-highspeed"
   }
 ];
-var OPENCLAW_DIR = join3(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH = join3(OPENCLAW_DIR, "guardclaw.json");
-var OPENCLAW_CONFIG_PATH = join3(OPENCLAW_DIR, "openclaw.json");
+var OPENCLAW_DIR = join4(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH = join4(OPENCLAW_DIR, "guardclaw.json");
+var OPENCLAW_CONFIG_PATH = join4(OPENCLAW_DIR, "openclaw.json");
 function readConfig() {
   try {
     return JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8"));
@@ -3661,10 +3926,10 @@ function createConfigurableRouter(id) {
 }
 
 // src/stats-dashboard.ts
-var GUARDCLAW_CONFIG_PATH2 = join4(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+var GUARDCLAW_CONFIG_PATH2 = join5(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
 function saveGuardClawConfig(privacy) {
   try {
-    const dir = join4(process.env.HOME ?? "/tmp", ".openclaw");
+    const dir = join5(process.env.HOME ?? "/tmp", ".openclaw");
     mkdirSync2(dir, { recursive: true });
     let existing = {};
     try {
@@ -6422,9 +6687,9 @@ if (LANG !== 'en') setLang(LANG);
 }
 
 // index.ts
-var OPENCLAW_DIR2 = join5(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH3 = join5(OPENCLAW_DIR2, "guardclaw.json");
-var LEGACY_DASHBOARD_PATH = join5(OPENCLAW_DIR2, "guardclaw-dashboard.json");
+var OPENCLAW_DIR2 = join6(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH3 = join6(OPENCLAW_DIR2, "guardclaw.json");
+var LEGACY_DASHBOARD_PATH = join6(OPENCLAW_DIR2, "guardclaw-dashboard.json");
 function loadGuardClawConfigFile() {
   try {
     return JSON.parse(readFileSync3(GUARDCLAW_CONFIG_PATH3, "utf-8"));
@@ -6452,11 +6717,11 @@ function getPrivacyConfig3(pluginConfig) {
 }
 function readApiKeyFromAuthProfiles(providerName) {
   const authPaths = [
-    join5(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
+    join6(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
   ];
   for (const authPath of authPaths) {
     try {
-      if (!existsSync3(authPath)) continue;
+      if (!existsSync4(authPath)) continue;
       const data = JSON.parse(readFileSync3(authPath, "utf-8"));
       const lastGoodKey = data.lastGood?.[providerName];
       if (lastGoodKey && data.profiles?.[lastGoodKey]?.key) {
@@ -6702,7 +6967,15 @@ var plugin = {
     api.logger.info(`[GuardClaw] Router pipeline initialized (built-in: privacy)`);
     initLiveConfig(resolvedPluginConfig);
     watchConfigFile(GUARDCLAW_CONFIG_PATH3, api.logger);
-    const statsPath = join5(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
+    const userInjection = resolvedPluginConfig.injection ?? {};
+    const injectionConfig = { ...defaultInjectionConfig, ...userInjection };
+    initInjectionConfig(injectionConfig);
+    if (injectionConfig.enabled !== false && !injectionConfig.heuristics_only) {
+      runDebertaClassifier("test").catch(() => {
+      });
+    }
+    api.logger.info(`[GuardClaw] S0 injection detection initialized (heuristics_only=${injectionConfig.heuristics_only ?? false})`);
+    const statsPath = join6(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
     const collector = new TokenStatsCollector(statsPath);
     setGlobalCollector(collector);
     collector.load().then(() => {

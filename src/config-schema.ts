@@ -7,6 +7,17 @@
 import { Type } from "@sinclair/typebox";
 
 export const guardClawConfigSchema = Type.Object({
+  injection: Type.Optional(
+    Type.Object({
+      enabled: Type.Optional(Type.Boolean()),
+      heuristics_only: Type.Optional(Type.Boolean()),
+      block_threshold: Type.Optional(Type.Number()),
+      sanitise_threshold: Type.Optional(Type.Number()),
+      alert_channel: Type.Optional(Type.String()),
+      exempt_sources: Type.Optional(Type.Array(Type.String())),
+      exempt_senders: Type.Optional(Type.Array(Type.String())),
+    }),
+  ),
   privacy: Type.Optional(
     Type.Object({
       enabled: Type.Optional(Type.Boolean()),
@@ -224,4 +235,14 @@ export const defaultPrivacyConfig = {
     onToolCallProposed: ["privacy"],
     onToolCallExecuted: ["privacy"],
   },
+};
+
+export const defaultInjectionConfig = {
+  enabled: true,
+  heuristics_only: false,
+  block_threshold: 70,
+  sanitise_threshold: 30,
+  alert_channel: "1483608914774986943",
+  exempt_sources: [] as string[],
+  exempt_senders: ["1317396442993922061"],
 };

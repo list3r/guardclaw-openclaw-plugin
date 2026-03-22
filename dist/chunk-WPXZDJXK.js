@@ -1,6 +1,17 @@
 // src/config-schema.ts
 import { Type } from "@sinclair/typebox";
 var guardClawConfigSchema = Type.Object({
+  injection: Type.Optional(
+    Type.Object({
+      enabled: Type.Optional(Type.Boolean()),
+      heuristics_only: Type.Optional(Type.Boolean()),
+      block_threshold: Type.Optional(Type.Number()),
+      sanitise_threshold: Type.Optional(Type.Number()),
+      alert_channel: Type.Optional(Type.String()),
+      exempt_sources: Type.Optional(Type.Array(Type.String())),
+      exempt_senders: Type.Optional(Type.Array(Type.String()))
+    })
+  ),
   privacy: Type.Optional(
     Type.Object({
       enabled: Type.Optional(Type.Boolean()),
@@ -207,14 +218,26 @@ var defaultPrivacyConfig = {
     onToolCallExecuted: ["privacy"]
   }
 };
+var defaultInjectionConfig = {
+  enabled: true,
+  heuristics_only: false,
+  block_threshold: 70,
+  sanitise_threshold: 30,
+  alert_channel: "1483608914774986943",
+  exempt_sources: [],
+  exempt_senders: ["1317396442993922061"]
+};
 
 // src/live-config.ts
 import { readFileSync, watch } from "fs";
 var liveConfig = { ...defaultPrivacyConfig };
+var liveInjectionConfig = { ...defaultInjectionConfig };
 var configWatcher = null;
 function initLiveConfig(pluginConfig) {
   const userConfig = pluginConfig?.privacy ?? {};
   liveConfig = mergeConfig(userConfig);
+  const userInjection = pluginConfig?.injection ?? {};
+  liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
 }
 function watchConfigFile(configPath, logger) {
   if (configWatcher) return;
@@ -227,6 +250,8 @@ function watchConfigFile(configPath, logger) {
           const raw = JSON.parse(readFileSync(configPath, "utf-8"));
           const privacy = raw.privacy ?? {};
           liveConfig = mergeConfig(privacy);
+          const injection = raw.injection ?? {};
+          liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
           logger.info("[GuardClaw] guardclaw.json changed \u2014 config hot-reloaded");
         } catch {
         }
@@ -237,6 +262,9 @@ function watchConfigFile(configPath, logger) {
 }
 function getLiveConfig() {
   return liveConfig;
+}
+function getLiveInjectionConfig() {
+  return liveInjectionConfig;
 }
 function updateLiveConfig(patch) {
   liveConfig = mergeConfig({ ...liveConfig, ...patch });
@@ -1732,6 +1760,7 @@ function parseModelResponse(response) {
 export {
   guardClawConfigSchema,
   defaultPrivacyConfig,
+  defaultInjectionConfig,
   loadPrompt,
   writePrompt,
   readPromptFromDisk,
@@ -1758,6 +1787,7 @@ export {
   initLiveConfig,
   watchConfigFile,
   getLiveConfig,
+  getLiveInjectionConfig,
   updateLiveConfig,
   TokenStatsCollector,
   setGlobalCollector,

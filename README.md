@@ -291,6 +291,20 @@ openclaw gateway restart
 
 ---
 
+## Attribution
+
+GuardClaw's S0 prompt injection detection layer is inspired by and builds upon
+[LLM Guard](https://github.com/protectai/llm-guard) by [Protect AI](https://protectai.com).
+
+LLM Guard is open source under the Apache 2.0 licence. We gratefully acknowledge
+their work in pioneering LLM security tooling.
+
+The injection classifier uses the
+[deberta-v3-base-prompt-injection-v2](https://huggingface.co/ProtectAI/deberta-v3-base-prompt-injection-v2)
+model, also by Protect AI, licensed under Apache 2.0.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

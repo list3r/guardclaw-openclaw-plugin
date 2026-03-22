@@ -55,7 +55,8 @@ import {
 } from "./privacy-proxy.js";
 import { getGlobalPipeline } from "./router-pipeline.js";
 import { getGlobalCollector } from "./token-stats.js";
-import { getLiveConfig } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig } from "./live-config.js";
+import { detectInjection, SECURITY_CHANNEL, formatBlockAlert } from "./injection/index.js";
 import { finalizeLoop } from "./loop-detection-level.js";
 import { recordFinalReply } from "./usage-intel.js";
 
@@ -198,6 +199,45 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       const msgStr = String(prompt);
       if (shouldSkipMessage(msgStr)) return;
+
+      // ── S0: Prompt injection detection (runs before S1/S2/S3 pipeline) ──
+      const injectionCfg = getLiveInjectionConfig();
+      if (injectionCfg.enabled !== false) {
+        // Check if sender is exempt
+        const senderId = (ctx as Record<string, unknown>).senderId as string | undefined;
+        const isExemptSender = senderId && (injectionCfg.exempt_senders ?? []).includes(senderId);
+
+        if (!isExemptSender) {
+          try {
+            const injResult = await detectInjection(msgStr, 'user_message', injectionCfg);
+            if (injResult.action === 'block') {
+              api.logger.warn(
+                `[GuardClaw S0] BLOCKED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(',')}`,
+              );
+              // Send alert to Discord security channel (best-effort, fire-and-forget)
+              const alertChannel = injectionCfg.alert_channel ?? SECURITY_CHANNEL;
+              const alertMsg = formatBlockAlert(injResult, 'user_message', msgStr);
+              void (api as unknown as Record<string, Record<string, (a: string, b: string) => Promise<void>>>)
+                .discord?.sendMessage?.(alertChannel, alertMsg)?.catch?.(() => {});
+              // Block the message by throwing — prevents model invocation
+              throw new Error(
+                `[GuardClaw S0] Message blocked: ${injResult.blocked_reason ?? 'Prompt injection detected'}`,
+              );
+            } else if (injResult.action === 'sanitise' && injResult.sanitised) {
+              api.logger.warn(
+                `[GuardClaw S0] SANITISED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(',')}`,
+              );
+              // Replace the prompt with sanitised content for the rest of the pipeline
+              (event as unknown as Record<string, unknown>).prompt = injResult.sanitised;
+            }
+          } catch (err) {
+            // Re-throw block errors; swallow other S0 errors (non-fatal)
+            const msg = String(err);
+            if (msg.includes('[GuardClaw S0] Message blocked')) throw err;
+            api.logger.warn(`[GuardClaw S0] Detection error (non-fatal): ${msg}`);
+          }
+        }
+      }
 
       // ── S3 fast path: rule-based pre-check ──────────────────────────
       // Rules are synchronous and deterministic. When they detect S3 we

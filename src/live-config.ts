@@ -10,16 +10,19 @@
  */
 
 import { readFileSync, watch, type FSWatcher } from "node:fs";
-import type { PrivacyConfig } from "./types.js";
-import { defaultPrivacyConfig } from "./config-schema.js";
+import type { PrivacyConfig, InjectionConfig } from "./types.js";
+import { defaultPrivacyConfig, defaultInjectionConfig } from "./config-schema.js";
 
 let liveConfig: PrivacyConfig = { ...defaultPrivacyConfig } as PrivacyConfig;
+let liveInjectionConfig: InjectionConfig = { ...defaultInjectionConfig };
 let configWatcher: FSWatcher | null = null;
 
 /** Initialize live config from the plugin's startup config snapshot. */
 export function initLiveConfig(pluginConfig: Record<string, unknown> | undefined): void {
   const userConfig = (pluginConfig?.privacy ?? {}) as PrivacyConfig;
   liveConfig = mergeConfig(userConfig);
+  const userInjection = (pluginConfig?.injection ?? {}) as InjectionConfig;
+  liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
 }
 
 /**
@@ -40,6 +43,8 @@ export function watchConfigFile(
           const raw = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
           const privacy = (raw.privacy ?? {}) as PrivacyConfig;
           liveConfig = mergeConfig(privacy);
+          const injection = (raw.injection ?? {}) as InjectionConfig;
+          liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
           logger.info("[GuardClaw] guardclaw.json changed — config hot-reloaded");
         } catch { /* ignore parse errors from partial writes */ }
       }, 300);
@@ -50,6 +55,11 @@ export function watchConfigFile(
 /** Get the current live config (mutable, always up-to-date). */
 export function getLiveConfig(): PrivacyConfig {
   return liveConfig;
+}
+
+/** Get the current live injection config (mutable, always up-to-date). */
+export function getLiveInjectionConfig(): InjectionConfig {
+  return liveInjectionConfig;
 }
 
 /** Hot-update the live config. Called from Dashboard save handler. */

@@ -22,7 +22,10 @@ import { tokenSaverRouter } from "./src/routers/token-saver.js";
 import { TokenStatsCollector, setGlobalCollector } from "./src/token-stats.js";
 import { initLiveConfig, watchConfigFile } from "./src/live-config.js";
 import { initDashboard, statsHttpHandler } from "./src/stats-dashboard.js";
-import type { PrivacyConfig, PipelineConfig, RouterRegistration } from "./src/types.js";
+import { initInjectionConfig } from "./src/injection/index.js";
+import { runDebertaClassifier } from "./src/injection/deberta.js";
+import { defaultInjectionConfig } from "./src/config-schema.js";
+import type { PrivacyConfig, PipelineConfig, RouterRegistration, InjectionConfig } from "./src/types.js";
 import type { ProxyHandle } from "./src/privacy-proxy.js";
 import { resolveDefaultBaseUrl } from "./src/utils.js";
 
@@ -392,6 +395,15 @@ const plugin = {
     // ── Step 5: Initialize live config & token stats ──
     initLiveConfig(resolvedPluginConfig);
     watchConfigFile(GUARDCLAW_CONFIG_PATH, api.logger);
+
+    // ── Step 5b: Initialize S0 injection config & warm up model ──
+    const userInjection = (resolvedPluginConfig.injection ?? {}) as InjectionConfig;
+    const injectionConfig: InjectionConfig = { ...defaultInjectionConfig, ...userInjection };
+    initInjectionConfig(injectionConfig);
+    if (injectionConfig.enabled !== false && !injectionConfig.heuristics_only) {
+      runDebertaClassifier('test').catch(() => {});
+    }
+    api.logger.info(`[GuardClaw] S0 injection detection initialized (heuristics_only=${injectionConfig.heuristics_only ?? false})`);
 
     const statsPath = join(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
     const collector = new TokenStatsCollector(statsPath);
