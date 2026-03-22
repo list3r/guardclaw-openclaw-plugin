@@ -45,12 +45,12 @@ import {
 } from "./chunk-WPXZDJXK.js";
 
 // index.ts
-import { join as join6 } from "path";
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
+import { join as join5 } from "path";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
 
 // src/hooks.ts
 import * as fs3 from "fs";
-import * as path4 from "path";
+import * as path3 from "path";
 
 // src/guard-agent.ts
 function isGuardAgentConfigured(config) {
@@ -137,15 +137,15 @@ import * as fs from "fs";
 import * as path from "path";
 
 // src/utils.ts
-function normalizePath(path5) {
-  if (path5.startsWith("~/")) {
+function normalizePath(path4) {
+  if (path4.startsWith("~/")) {
     const home = process.env.HOME || process.env.USERPROFILE || "~";
-    return path5.replace("~", home);
+    return path4.replace("~", home);
   }
-  return path5;
+  return path4;
 }
-function matchesPathPattern(path5, patterns) {
-  const normalizedPath = normalizePath(path5);
+function matchesPathPattern(path4, patterns) {
+  const normalizedPath = normalizePath(path4);
   for (const pattern of patterns) {
     const normalizedPattern = normalizePath(pattern);
     if (normalizedPath === normalizedPattern) {
@@ -1047,29 +1047,29 @@ function checkToolParams(params, config) {
     return { level: "S1" };
   }
   const s3Paths = config.rules?.tools?.S3?.paths ?? [];
-  for (const path5 of paths) {
-    if (matchesPathPattern(path5, s3Paths)) {
+  for (const path4 of paths) {
+    if (matchesPathPattern(path4, s3Paths)) {
       return {
         level: "S3",
-        reason: `S3 path detected: ${path5}`
+        reason: `S3 path detected: ${path4}`
       };
     }
   }
   const s2Paths = config.rules?.tools?.S2?.paths ?? [];
-  for (const path5 of paths) {
-    if (matchesPathPattern(path5, s2Paths)) {
+  for (const path4 of paths) {
+    if (matchesPathPattern(path4, s2Paths)) {
       return {
         level: "S2",
-        reason: `S2 path detected: ${path5}`
+        reason: `S2 path detected: ${path4}`
       };
     }
   }
-  for (const path5 of paths) {
-    const lowerPath = path5.toLowerCase();
+  for (const path4 of paths) {
+    const lowerPath = path4.toLowerCase();
     if (lowerPath.endsWith(".pem") || lowerPath.endsWith(".key") || lowerPath.endsWith(".p12") || lowerPath.endsWith(".pfx") || lowerPath.includes("id_rsa") || lowerPath.includes("id_dsa") || lowerPath.includes("id_ecdsa") || lowerPath.includes("id_ed25519")) {
       return {
         level: "S3",
-        reason: `Sensitive file extension detected: ${path5}`
+        reason: `Sensitive file extension detected: ${path4}`
       };
     }
   }
@@ -2010,60 +2010,31 @@ function runHeuristics(content) {
 }
 
 // src/injection/deberta.ts
-import { spawn } from "child_process";
-import * as path3 from "path";
-import { existsSync as existsSync3 } from "fs";
-import { fileURLToPath as fileURLToPath2 } from "url";
-var __filename = fileURLToPath2(import.meta.url);
-var __dirname = path3.dirname(__filename);
-var CLASSIFIER_SCRIPT = path3.join(__dirname, "../scripts/injection_classifier.py");
-var VENV_PYTHON = path3.join(__dirname, "../.venv/bin/python3");
-var PYTHON_BIN = existsSync3(VENV_PYTHON) ? VENV_PYTHON : "python3";
+var ENDPOINT = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
 var TIMEOUT_MS = 5e3;
 async function runDebertaClassifier(content) {
-  return new Promise((resolve2) => {
-    let resolved = false;
-    const proc = spawn(PYTHON_BIN, [CLASSIFIER_SCRIPT], {
-      timeout: TIMEOUT_MS
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+      signal: controller.signal
     });
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (data) => {
-      stdout += data;
-    });
-    proc.stderr.on("data", (data) => {
-      stderr += data;
-    });
-    proc.on("close", (code) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      if (code !== 0) {
-        resolve2({ label: 0, score: 0, injection: false, error: stderr || "Process failed" });
-        return;
-      }
-      try {
-        const result = JSON.parse(stdout);
-        resolve2(result);
-      } catch {
-        resolve2({ label: 0, score: 0, injection: false, error: "Invalid JSON response" });
-      }
-    });
-    proc.on("error", (err) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      resolve2({ label: 0, score: 0, injection: false, error: err.message });
-    });
-    proc.stdin.write(content);
-    proc.stdin.end();
-    const timer = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      proc.kill();
-      resolve2({ label: 0, score: 0, injection: false, error: "Timeout" });
-    }, TIMEOUT_MS + 1e3);
-  });
+    clearTimeout(timer);
+    if (!res.ok) {
+      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") {
+      return { label: 0, score: 0, injection: false, error: "Timeout" };
+    }
+    return { label: 0, score: 0, injection: false, error: err.message ?? "Unknown error" };
+  }
 }
 
 // src/injection/sanitiser.ts
@@ -3158,7 +3129,7 @@ function isMemoryWritePath(writePath) {
 }
 async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, isGuardSession = false) {
   const rel = writePath.replace(/^\.\//, "");
-  const absPath = path4.isAbsolute(writePath) ? writePath : path4.resolve(workspaceDir, rel);
+  const absPath = path3.isAbsolute(writePath) ? writePath : path3.resolve(workspaceDir, rel);
   let content;
   try {
     content = await fs3.promises.readFile(absPath, "utf-8");
@@ -3174,8 +3145,8 @@ async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, i
   } else {
     return;
   }
-  const fullAbsPath = path4.resolve(workspaceDir, fullRelPath);
-  await fs3.promises.mkdir(path4.dirname(fullAbsPath), { recursive: true });
+  const fullAbsPath = path3.resolve(workspaceDir, fullRelPath);
+  await fs3.promises.mkdir(path3.dirname(fullAbsPath), { recursive: true });
   const fullContent = isGuardSession ? `${GUARD_SECTION_BEGIN}
 ${content}
 ${GUARD_SECTION_END}` : content;
@@ -3594,11 +3565,11 @@ var tokenSaverRouter = {
 
 // src/stats-dashboard.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2 } from "fs";
-import { join as join5 } from "path";
+import { join as join4 } from "path";
 
 // src/presets.ts
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { join as join4 } from "path";
+import { join as join3 } from "path";
 var BUILTIN_PRESETS = [
   {
     id: "vllm-qwen35",
@@ -3627,9 +3598,9 @@ var BUILTIN_PRESETS = [
     defaultModel: "minimax/MiniMax-M2.5-highspeed"
   }
 ];
-var OPENCLAW_DIR = join4(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH = join4(OPENCLAW_DIR, "guardclaw.json");
-var OPENCLAW_CONFIG_PATH = join4(OPENCLAW_DIR, "openclaw.json");
+var OPENCLAW_DIR = join3(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH = join3(OPENCLAW_DIR, "guardclaw.json");
+var OPENCLAW_CONFIG_PATH = join3(OPENCLAW_DIR, "openclaw.json");
 function readConfig() {
   try {
     return JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8"));
@@ -3926,10 +3897,10 @@ function createConfigurableRouter(id) {
 }
 
 // src/stats-dashboard.ts
-var GUARDCLAW_CONFIG_PATH2 = join5(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+var GUARDCLAW_CONFIG_PATH2 = join4(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
 function saveGuardClawConfig(privacy) {
   try {
-    const dir = join5(process.env.HOME ?? "/tmp", ".openclaw");
+    const dir = join4(process.env.HOME ?? "/tmp", ".openclaw");
     mkdirSync2(dir, { recursive: true });
     let existing = {};
     try {
@@ -6687,9 +6658,9 @@ if (LANG !== 'en') setLang(LANG);
 }
 
 // index.ts
-var OPENCLAW_DIR2 = join6(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH3 = join6(OPENCLAW_DIR2, "guardclaw.json");
-var LEGACY_DASHBOARD_PATH = join6(OPENCLAW_DIR2, "guardclaw-dashboard.json");
+var OPENCLAW_DIR2 = join5(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH3 = join5(OPENCLAW_DIR2, "guardclaw.json");
+var LEGACY_DASHBOARD_PATH = join5(OPENCLAW_DIR2, "guardclaw-dashboard.json");
 function loadGuardClawConfigFile() {
   try {
     return JSON.parse(readFileSync3(GUARDCLAW_CONFIG_PATH3, "utf-8"));
@@ -6717,11 +6688,11 @@ function getPrivacyConfig3(pluginConfig) {
 }
 function readApiKeyFromAuthProfiles(providerName) {
   const authPaths = [
-    join6(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
+    join5(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
   ];
   for (const authPath of authPaths) {
     try {
-      if (!existsSync4(authPath)) continue;
+      if (!existsSync3(authPath)) continue;
       const data = JSON.parse(readFileSync3(authPath, "utf-8"));
       const lastGoodKey = data.lastGood?.[providerName];
       if (lastGoodKey && data.profiles?.[lastGoodKey]?.key) {
@@ -6975,7 +6946,7 @@ var plugin = {
       });
     }
     api.logger.info(`[GuardClaw] S0 injection detection initialized (heuristics_only=${injectionConfig.heuristics_only ?? false})`);
-    const statsPath = join6(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
+    const statsPath = join5(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
     const collector = new TokenStatsCollector(statsPath);
     setGlobalCollector(collector);
     collector.load().then(() => {

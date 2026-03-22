@@ -1,18 +1,9 @@
-import { spawn } from 'node:child_process';
-import * as path from 'node:path';
-import { existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+/**
+ * DeBERTa prompt injection classifier client.
+ * Calls FastAPI server at http://127.0.0.1:8404/classify
+ */
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// From dist/ → ../scripts/injection_classifier.py
-const CLASSIFIER_SCRIPT = path.join(__dirname, '../scripts/injection_classifier.py');
-
-// Use venv python if available (set up via: python3 -m venv .venv && pip install torch transformers)
-const VENV_PYTHON = path.join(__dirname, '../.venv/bin/python3');
-const PYTHON_BIN = existsSync(VENV_PYTHON) ? VENV_PYTHON : 'python3';
-
+const ENDPOINT = process.env.GUARDCLAW_DEBERTA_URL ?? 'http://127.0.0.1:8404/classify';
 const TIMEOUT_MS = 5000;
 
 export interface DebertaResult {
@@ -23,52 +14,30 @@ export interface DebertaResult {
 }
 
 export async function runDebertaClassifier(content: string): Promise<DebertaResult> {
-  return new Promise((resolve) => {
-    let resolved = false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-    const proc = spawn(PYTHON_BIN, [CLASSIFIER_SCRIPT], {
-      timeout: TIMEOUT_MS,
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      signal: controller.signal,
     });
 
-    let stdout = '';
-    let stderr = '';
+    clearTimeout(timer);
 
-    proc.stdout.on('data', (data) => { stdout += data; });
-    proc.stderr.on('data', (data) => { stderr += data; });
+    if (!res.ok) {
+      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
+    }
 
-    proc.on('close', (code) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      if (code !== 0) {
-        resolve({ label: 0, score: 0, injection: false, error: stderr || 'Process failed' });
-        return;
-      }
-      try {
-        const result = JSON.parse(stdout) as DebertaResult;
-        resolve(result);
-      } catch {
-        resolve({ label: 0, score: 0, injection: false, error: 'Invalid JSON response' });
-      }
-    });
-
-    proc.on('error', (err) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      resolve({ label: 0, score: 0, injection: false, error: err.message });
-    });
-
-    // Send content to stdin
-    proc.stdin.write(content);
-    proc.stdin.end();
-
-    // Fallback timeout
-    const timer = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      proc.kill();
-      resolve({ label: 0, score: 0, injection: false, error: 'Timeout' });
-    }, TIMEOUT_MS + 1000);
-  });
+    const data = await res.json() as DebertaResult;
+    return data;
+  } catch (err: any) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      return { label: 0, score: 0, injection: false, error: 'Timeout' };
+    }
+    return { label: 0, score: 0, injection: false, error: err.message ?? 'Unknown error' };
+  }
 }
