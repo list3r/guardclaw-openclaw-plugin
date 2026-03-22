@@ -40,7 +40,7 @@ import {
   updateLiveConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-K5KG73QH.js";
+} from "./chunk-7OOOFMI5.js";
 
 // index.ts
 import { join as join5 } from "path";
@@ -1934,6 +1934,26 @@ function isToolAllowlisted(toolName) {
   return allowlist.includes(toolName);
 }
 var _cachedWorkspaceDir;
+var GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-stats.json";
+var GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
+var GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+async function updateGuardclawStats(level) {
+  try {
+    let stats = { s1Count: 0, s2Count: 0, s3Count: 0, totalMessages: 0, s3Policy: "local-only", lastUpdated: null };
+    try {
+      const raw = await fs3.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+      Object.assign(stats, JSON.parse(raw));
+    } catch {
+    }
+    if (level === "S1") stats.s1Count = stats.s1Count + 1;
+    else if (level === "S2") stats.s2Count = stats.s2Count + 1;
+    else if (level === "S3") stats.s3Count = stats.s3Count + 1;
+    stats.totalMessages = stats.totalMessages + 1;
+    stats.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
+    await fs3.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+  } catch {
+  }
+}
 function registerHooks(api) {
   const privacyCfgInit = getLiveConfig();
   const sessionBaseDir = privacyCfgInit.session?.baseDir;
@@ -1942,6 +1962,30 @@ function registerHooks(api) {
     api.logger.error(`[GuardClaw] Failed to initialize memory directories: ${String(err)}`);
   });
   getDefaultSessionManager(sessionBaseDir);
+  setInterval(async () => {
+    try {
+      await fs3.promises.access(GUARDCLAW_PENDING_CONFIG_PATH);
+      const pendingRaw = await fs3.promises.readFile(GUARDCLAW_PENDING_CONFIG_PATH, "utf8");
+      const pending = JSON.parse(pendingRaw);
+      const s3Policy = pending.s3Policy;
+      if (!s3Policy) return;
+      const cfgRaw = await fs3.promises.readFile(GUARDCLAW_JSON_PATH, "utf8");
+      const cfg = JSON.parse(cfgRaw);
+      if (!cfg.privacy) cfg.privacy = {};
+      cfg.privacy.s3Policy = s3Policy;
+      await fs3.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+      await fs3.promises.unlink(GUARDCLAW_PENDING_CONFIG_PATH);
+      api.logger.info(`[GuardClaw] s3Policy updated to: ${s3Policy}`);
+      try {
+        const statsRaw = await fs3.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+        const stats = JSON.parse(statsRaw);
+        stats.s3Policy = s3Policy;
+        await fs3.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+      } catch {
+      }
+    } catch {
+    }
+  }, 5e3);
   api.on("before_model_resolve", async (event, ctx) => {
     try {
       const { prompt } = event;
@@ -1968,7 +2012,21 @@ function registerHooks(api) {
       );
       if (rulePreCheck.level === "S3") {
         recordDetection(sessionKey, "S3", "onUserMessage", rulePreCheck.reason);
+        updateGuardclawStats("S3").catch(() => {
+        });
         trackSessionLevel(sessionKey, "S3");
+        const s3Policy = privacyConfig.s3Policy ?? "local-only";
+        if (s3Policy === "redact-and-forward") {
+          api.logger.warn(`[GuardClaw] S3 redact-and-forward mode \u2014 aggressively redacting before cloud`);
+          stashDetection(sessionKey, {
+            level: "S2",
+            // treat as S2 so desensitization pipeline runs
+            reason: `s3-redact-forward: ${rulePreCheck.reason}`,
+            originalPrompt: msgStr,
+            timestamp: Date.now()
+          });
+          return;
+        }
         setActiveLocalRouting(sessionKey);
         stashDetection(sessionKey, {
           level: "S3",
@@ -1999,6 +2057,8 @@ function registerHooks(api) {
         getPipelineConfig()
       );
       recordDetection(sessionKey, decision.level, "onUserMessage", decision.reason);
+      updateGuardclawStats(decision.level).catch(() => {
+      });
       api.logger.info(`[GuardClaw] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`);
       if (decision.level === "S1" && decision.action === "passthrough") {
         return;
@@ -2252,6 +2312,8 @@ ${GUARDCLAW_S2_CLOSE}`
             privacyConfig
           );
           recordDetection(sessionKey, ruleResult.level, "onToolCallProposed", ruleResult.reason);
+          updateGuardclawStats(ruleResult.level).catch(() => {
+          });
           if (ruleResult.level === "S3") {
             trackSessionLevel(sessionKey, "S3");
             return { block: true, blockReason: `GuardClaw: ${isSpawn ? "subagent task" : "A2A message"} blocked \u2014 S3 (${ruleResult.reason ?? "sensitive"})` };
@@ -2268,6 +2330,8 @@ ${GUARDCLAW_S2_CLOSE}`
           if (blocked) {
             api.logger.warn(`[GuardClaw] BLOCKED high-risk exec command: ${command.slice(0, 80)}`);
             recordDetection(sessionKey, "S3", "onToolCallProposed", `high-risk exec: ${blocked}`);
+            updateGuardclawStats("S3").catch(() => {
+            });
             trackSessionLevel(sessionKey, "S3");
             return { block: true, blockReason: `GuardClaw: exec command blocked \u2014 likely to output secrets (${blocked}). Use a local model session for this operation.` };
           }
@@ -2298,6 +2362,8 @@ ${GUARDCLAW_S2_CLOSE}`
           reason = ruleResult.reason;
         }
         recordDetection(sessionKey, level, "onToolCallProposed", reason);
+        updateGuardclawStats(level).catch(() => {
+        });
         if (level === "S3") {
           trackSessionLevel(sessionKey, "S3");
           return { block: true, blockReason: `GuardClaw: tool "${toolName}" blocked \u2014 S3 (${reason ?? "sensitive"})` };
@@ -2386,6 +2452,8 @@ ${GUARDCLAW_S2_CLOSE}`
         trackSessionLevel(sessionKey, ruleCheck.level);
         markSessionAsPrivate(sessionKey, effectiveLevel);
         recordDetection(sessionKey, ruleCheck.level, "onToolCallExecuted", ruleCheck.reason);
+        updateGuardclawStats(ruleCheck.level).catch(() => {
+        });
         if (ruleCheck.level === "S3") {
           api.logger.warn(
             `[GuardClaw] S3 detected in tool result AFTER cloud model already active \u2014 degrading to S2 (PII redaction). tool=${ctx.toolName ?? "unknown"}, reason=${ruleCheck.reason ?? "rule-match"}`
@@ -2429,6 +2497,8 @@ ${GUARDCLAW_S2_CLOSE}`
             markSessionAsPrivate(sessionKey, llmEffective);
           }
           recordDetection(sessionKey, llmResult.level, "onToolCallExecuted", llmResult.reason);
+          updateGuardclawStats(llmResult.level).catch(() => {
+          });
           if (llmResult.level === "S3") {
             api.logger.warn(
               `[GuardClaw] LLM elevated tool result to S3 \u2014 PII redacted before reaching cloud model. tool=${ctx.toolName ?? "unknown"}, reason=${llmResult.reason ?? "semantic"}`
@@ -2612,10 +2682,19 @@ ${GUARDCLAW_S2_CLOSE}`
   });
   api.on("message_sending", async (event, ctx) => {
     try {
-      const { content } = event;
+      const { content, to } = event;
       if (!content?.trim()) return;
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
+      const explicitOperators = privacyConfig.operatorPassthrough ?? [];
+      if (explicitOperators.length > 0 && to && explicitOperators.includes(to)) {
+        api.logger.info(`[GuardClaw] Operator passthrough \u2014 skipping redaction for trusted recipient: ${to}`);
+        return;
+      }
+      if (to && (to.startsWith("channel:") || to.startsWith("#") || to === "channel")) {
+        api.logger.info(`[GuardClaw] Channel message \u2014 skipping outbound redaction for: ${to}`);
+        return;
+      }
       const pipeline = getGlobalPipeline();
       if (!pipeline) return;
       const sessionKey = ctx.sessionKey ?? "";
@@ -2752,6 +2831,8 @@ function isHighRiskExecCommand(command) {
 function shouldSkipMessage(msg) {
   if (msg.includes("[REDACTED:") || msg.startsWith("[SYSTEM]")) return true;
   if (/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(msg)) return true;
+  if (msg.includes("conversation_label") && msg.includes("sender_id")) return true;
+  if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata")) return true;
   return false;
 }
 function extractMessageText(msg) {
@@ -4045,6 +4126,7 @@ function dashboardHtml() {
   .field{margin-bottom:16px}
   .field label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
   .field input,.field select{width:100%;padding:10px 14px;background:var(--bg-input);border:1px solid transparent;border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;outline:none;transition:all .15s}
+  .field input[type=radio]{width:auto;padding:0;background:transparent;border:none;border-radius:0;flex-shrink:0;cursor:pointer;accent-color:var(--accent,#4f9cf9)}
   .field select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236e6e80' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;padding-right:36px}
   .field input:hover,.field select:hover{background:#eaecf1}
   .field input:focus,.field select:focus{background:#fff;border-color:transparent;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
@@ -4478,6 +4560,33 @@ function dashboardHtml() {
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+
+        <!-- S3 Policy -->
+        <div class="subsection">
+          <h4 data-i18n="priv.s3policy">S3 Policy \u2014 Confidential Content Handling</h4>
+          <div class="hint" style="margin-bottom:12px" data-i18n="priv.s3policy_hint">Controls what happens when S3 (confidential) content is detected.</div>
+          <div class="field">
+            <div style="display:flex;flex-direction:column;gap:10px;">
+              <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+                <input type="radio" name="s3policy" id="s3policy-local" value="local-only" style="margin-top:3px;" onchange="document.getElementById('s3policy-warning').style.display='none'">
+                <div>
+                  <div style="font-weight:600;" data-i18n="priv.s3policy_local">Local Only (default)</div>
+                  <div class="hint" data-i18n="priv.s3policy_local_hint">S3 content stays on device. Routes to local guard agent for reasoning. Requires 64 GB+ or distributed setup.</div>
+                </div>
+              </label>
+              <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+                <input type="radio" name="s3policy" id="s3policy-redact" value="redact-and-forward" style="margin-top:3px;" onchange="document.getElementById('s3policy-warning').style.display='block'">
+                <div>
+                  <div style="font-weight:600;" data-i18n="priv.s3policy_redact">Redact &amp; Forward \u26A0\uFE0F</div>
+                  <div class="hint" data-i18n="priv.s3policy_redact_hint">Strips all credentials &amp; secrets locally, then forwards sanitised content to cloud. Works on 16 GB standalone. Security depends on redaction quality.</div>
+                </div>
+              </label>
+            </div>
+          </div>
+          <div id="s3policy-warning" style="display:none;margin-top:10px;padding:10px 14px;background:rgba(255,160,0,0.12);border:1px solid rgba(255,160,0,0.4);border-radius:6px;font-size:12px;color:#ffb347;">
+            \u26A0\uFE0F <strong>Redact &amp; Forward</strong> sends sanitised S3 content to your cloud provider. Security depends on redaction quality. Centrase recommends testing with your data before enabling in production. <a href="https://github.com/list3r/guardclaw-openclaw-plugin#s3-policy" target="_blank" style="color:#ffb347;">Learn more</a>
           </div>
         </div>
 
@@ -5441,6 +5550,13 @@ async function loadConfig() {
     document.getElementById('cfg-s2policy').value = p.s2Policy || 'proxy';
     document.getElementById('cfg-proxyport').value = p.proxyPort || '';
 
+    // s3Policy radio
+    var s3pol = p.s3Policy || 'local-only';
+    var s3Radio = document.querySelector('input[name="s3policy"][value="' + s3pol + '"]');
+    if (s3Radio) s3Radio.checked = true;
+    var s3warn = document.getElementById('s3policy-warning');
+    if (s3warn) s3warn.style.display = (s3pol === 'redact-and-forward') ? 'block' : 'none';
+
     document.getElementById('cfg-sess-isolate').checked = sess.isolateGuardHistory !== false;
     document.getElementById('cfg-sess-basedir').value = sess.baseDir || '';
 
@@ -5884,8 +6000,11 @@ async function runRouterTest(routerId) {
 
 async function savePrivacyRouter() {
   try {
+    var s3PolicyEl = document.querySelector('input[name="s3policy"]:checked');
+    var s3Policy = s3PolicyEl ? s3PolicyEl.value : 'local-only';
     var payload = {
       privacy: {
+        s3Policy: s3Policy,
         checkpoints: {
           onUserMessage: _checkpoints.um.length ? _checkpoints.um : undefined,
           onToolCallProposed: _checkpoints.tcp.length ? _checkpoints.tcp : undefined,

@@ -1468,16 +1468,71 @@ async function callLocalModel(systemPrompt, userContent, config) {
     }
   );
 }
+function preRedactCredentials(content) {
+  let out = content;
+  out = out.replace(/\bAKIA[A-Z0-9]{16}\b/g, "[REDACTED:CREDENTIAL]");
+  out = out.replace(/\bASIA[A-Z0-9]{16}\b/g, "[REDACTED:CREDENTIAL]");
+  out = out.replace(/(aws_secret_access_key\s*[=:]\s*)\S+/gi, "$1[REDACTED:CREDENTIAL]");
+  out = out.replace(/(AWS_SECRET_ACCESS_KEY\s*[=:]\s*)\S+/gi, "$1[REDACTED:CREDENTIAL]");
+  out = out.replace(/redis:\/\/[^@\s]*:[^@\s]+@/gi, "redis://[REDACTED:CREDENTIAL]@");
+  out = out.replace(/((?:postgres|postgresql|mysql|mongodb(?:\+srv)?|amqp|smtp|ftp|ftps):\/\/[^:\s]*:)[^@\s]+(@)/gi, "$1[REDACTED:CREDENTIAL]$2");
+  out = out.replace(/(pg_dump|psql)(\s+\S+)*\s+-W\s+(\S+)/gi, (m, cmd, mid, pw) => m.replace(pw, "[REDACTED:CREDENTIAL]"));
+  out = out.replace(/\b(password|passwd|passphrase|pass|pwd)\s*[:=]\s*(\S+)/gi, "$1: [REDACTED:PASSWORD]");
+  out = out.replace(/\b(client\s+secret|private\s+token|access\s+token|api\s+key|auth\s+token|service\s+account\s+key|signing\s+key|master\s+key|deploy\s+key|session\s+secret|webhook\s+secret|app\s+secret|shared\s+secret)\s*[:=]\s*(\S+)/gi, "$1: [REDACTED:CREDENTIAL]");
+  out = out.replace(/\b(password|passphrase|secret)\s+(is|was|set to|=|:)\s+(\S+)/gi, "$1 $2 [REDACTED:PASSWORD]");
+  out = out.replace(/\bsecret\s+([A-Za-z0-9+/]{16,})\b/g, "secret [REDACTED:SECRET]");
+  out = out.replace(/\b(key|token|secret|credential)\s+\(([A-Za-z0-9+/\-_]{12,})\)/gi, "$1 ([REDACTED:CREDENTIAL])");
+  out = out.replace(/(password|passphrase).*?\bset to\s+(\S+)/gi, (m, kw, val) => m.replace(val, "[REDACTED:PASSWORD]"));
+  out = out.replace(/(#\s*(?:password|pass|passwd)\s*[:=]\s*)(\S+)/gi, "$1[REDACTED:PASSWORD]");
+  out = out.replace(/(curl\s+.*?-u\s+)([^:\s]+):(\S+)/gi, "$1$2:[REDACTED:CREDENTIAL]");
+  out = out.replace(/(sshpass\s+-p\s+)(\S+)/gi, "$1[REDACTED:CREDENTIAL]");
+  out = out.replace(/(heroku\s+auth:token\s*\n)(\S+)/gi, "$1[REDACTED:TOKEN]");
+  out = out.replace(
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gi,
+    "[REDACTED:PRIVATE_KEY]"
+  );
+  out = out.replace(/\bgh[posr]_[A-Za-z0-9]{36,}\b/g, "[REDACTED:TOKEN]");
+  out = out.replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "[REDACTED:TOKEN]");
+  out = out.replace(/\bsk_(live|test)_[A-Za-z0-9]{24,}\b/g, "[REDACTED:TOKEN]");
+  out = out.replace(/\bsk-[A-Za-z0-9\-_]{20,}\b/g, "[REDACTED:TOKEN]");
+  out = out.replace(/\bxox[bpoa]-[A-Za-z0-9\-]{10,}\b/g, "[REDACTED:TOKEN]");
+  out = out.replace(/\bey[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\b/g, "[REDACTED:TOKEN]");
+  out = out.replace(/(Authorization:\s*Bearer\s+)\S+/gi, "$1[REDACTED:TOKEN]");
+  out = out.replace(
+    /\b(API_KEY|SECRET_KEY|SECRET|PRIVATE_KEY|ACCESS_TOKEN|AUTH_TOKEN|JWT_SECRET|MASTER_KEY|SIGNING_KEY|ENCRYPTION_KEY|NEXTAUTH_SECRET|RAILS_MASTER_KEY|APP_SECRET|CLIENT_SECRET|WEBHOOK_SECRET|SENDGRID_API_KEY|DATADOG_API_KEY|FIREBASE_[A-Z_]+_KEY)\s*=\s*\S+/g,
+    (m, varname) => `${varname}=[REDACTED:CREDENTIAL]`
+  );
+  out = out.replace(
+    /\b[A-Z][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_PASS|_PWD|_AUTH|_CREDENTIAL|_APIKEY)\s*=\s*\S+/g,
+    (m) => m.replace(/=\S+$/, "=[REDACTED:CREDENTIAL]")
+  );
+  out = out.replace(/(grep\s+[A-Z_]*(?:SECRET|PASSWORD|TOKEN|KEY|PASS|PWD)=)(\S+)/gi, "$1[REDACTED:CREDENTIAL]");
+  out = out.replace(/(scp\s+.*?\s+\S+:)([^@\s]+)(@\S+)/gi, "$1[REDACTED:CREDENTIAL]$3");
+  out = out.replace(
+    /\b([a-zA-Z0-9._-]{2,32}):([\S]{8,})(?=\s*[@()\s,]|$)/g,
+    (m, user, pass) => {
+      const hasSpecial = /[^a-zA-Z0-9]/.test(pass);
+      const hasMixedDigits = /[A-Za-z]/.test(pass) && /\d/.test(pass);
+      const isLong = pass.length >= 16;
+      if (hasSpecial || hasMixedDigits || isLong) {
+        return `${user}:[REDACTED:CREDENTIAL]`;
+      }
+      return m;
+    }
+  );
+  return out;
+}
 async function desensitizeWithLocalModel(content, config, sessionKey) {
   if (!config.localModel?.enabled) {
     return { desensitized: content, wasModelUsed: false, failed: true };
   }
+  const preRedacted = preRedactCredentials(content);
   try {
     const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
     const model = config.localModel?.model ?? "openbmb/minicpm4.1";
     const providerType = config.localModel?.type ?? "openai-compatible";
     const customModule = config.localModel?.module;
-    const piiItems = await extractPiiWithModel(endpoint, model, content, {
+    const piiItems = await extractPiiWithModel(endpoint, model, preRedacted, {
       apiKey: config.localModel?.apiKey,
       providerType,
       customModule,
@@ -1485,9 +1540,9 @@ async function desensitizeWithLocalModel(content, config, sessionKey) {
       provider: config.localModel?.provider
     });
     if (piiItems.length === 0) {
-      return { desensitized: content, wasModelUsed: true };
+      return { desensitized: preRedacted, wasModelUsed: true };
     }
-    let redacted = content;
+    let redacted = preRedacted;
     const sorted = [...piiItems].sort((a, b) => b.value.length - a.value.length);
     for (const item of sorted) {
       if (!item.value || item.value.length < 2) continue;
@@ -1497,7 +1552,7 @@ async function desensitizeWithLocalModel(content, config, sessionKey) {
     return { desensitized: redacted, wasModelUsed: true };
   } catch (err) {
     console.error("[GuardClaw] Local model desensitization failed:", err);
-    return { desensitized: content, wasModelUsed: false, failed: true };
+    return { desensitized: preRedacted, wasModelUsed: false, failed: true };
   }
 }
 function mapPiiTypeToTag(type) {
@@ -1535,7 +1590,15 @@ function mapPiiTypeToTag(type) {
     TIME: "[REDACTED:TIME]",
     DATE: "[REDACTED:DATE]",
     SALARY: "[REDACTED:SALARY]",
-    AMOUNT: "[REDACTED:AMOUNT]"
+    AMOUNT: "[REDACTED:AMOUNT]",
+    // Credential types
+    AWS_KEY: "[REDACTED:CREDENTIAL]",
+    PRIVATE_KEY: "[REDACTED:PRIVATE_KEY]",
+    CONNECTION_STRING: "[REDACTED:CREDENTIAL]",
+    ENV_VAR: "[REDACTED:CREDENTIAL]",
+    CREDENTIAL: "[REDACTED:CREDENTIAL]",
+    MFA_CODE: "[REDACTED:SECRET]",
+    CERT: "[REDACTED:CREDENTIAL]"
   };
   return mapping[t] ?? `[REDACTED:${t}]`;
 }

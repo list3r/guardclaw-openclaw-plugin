@@ -492,9 +492,133 @@ async function callLocalModel(
 }
 
 /**
+ * Deterministic regex pre-pass for high-confidence credential patterns.
+ * Runs BEFORE the LLM to catch patterns the model misses in unusual phrasings.
+ *
+ * Strategy: conservative — only replace things we're sure are secrets.
+ * False negatives (missed secrets) are worse than false positives (over-redaction).
+ */
+export function preRedactCredentials(content: string): string {
+  let out = content;
+
+  // AWS access keys (AKIA/ASIA prefix, 20 chars alphanumeric)
+  // Catches: bare keys, export KEY=AKIA..., "key is AKIA...", key=AKIA...
+  out = out.replace(/\bAKIA[A-Z0-9]{16}\b/g, "[REDACTED:CREDENTIAL]");
+  out = out.replace(/\bASIA[A-Z0-9]{16}\b/g, "[REDACTED:CREDENTIAL]");
+
+  // AWS secret access key (40-char base64-ish after label)
+  out = out.replace(/(aws_secret_access_key\s*[=:]\s*)\S+/gi, "$1[REDACTED:CREDENTIAL]");
+  out = out.replace(/(AWS_SECRET_ACCESS_KEY\s*[=:]\s*)\S+/gi, "$1[REDACTED:CREDENTIAL]");
+
+  // Redis URL: redis://:password@host or redis://user:password@host
+  out = out.replace(/redis:\/\/[^@\s]*:[^@\s]+@/gi, "redis://[REDACTED:CREDENTIAL]@");
+
+  // Generic URL credentials: proto://user:pass@host
+  out = out.replace(/((?:postgres|postgresql|mysql|mongodb(?:\+srv)?|amqp|smtp|ftp|ftps):\/\/[^:\s]*:)[^@\s]+(@)/gi, "$1[REDACTED:CREDENTIAL]$2");
+
+  // pg_dump / psql -W password (positional arg after -W flag)
+  out = out.replace(/(pg_dump|psql)(\s+\S+)*\s+-W\s+(\S+)/gi, (m, cmd, mid, pw) => m.replace(pw, "[REDACTED:CREDENTIAL]"));
+
+  // password/passwd/passphrase/pass/pwd followed by colon, equals, or space-value
+  // "password: X", "passphrase: X", "password=X", "pass: X", "passwd: X"
+  out = out.replace(/\b(password|passwd|passphrase|pass|pwd)\s*[:=]\s*(\S+)/gi, "$1: [REDACTED:PASSWORD]");
+
+  // Multi-word credential labels followed by colon
+  // "client secret: X", "private token: X", "access token: X", "api key: X", etc.
+  out = out.replace(/\b(client\s+secret|private\s+token|access\s+token|api\s+key|auth\s+token|service\s+account\s+key|signing\s+key|master\s+key|deploy\s+key|session\s+secret|webhook\s+secret|app\s+secret|shared\s+secret)\s*[:=]\s*(\S+)/gi, "$1: [REDACTED:CREDENTIAL]");
+
+  // "password is/was/set to X" — verb phrase
+  out = out.replace(/\b(password|passphrase|secret)\s+(is|was|set to|=|:)\s+(\S+)/gi, "$1 $2 [REDACTED:PASSWORD]");
+
+  // "secret <high-entropy-value>" — noun directly before a 16+ char alphanumeric value
+  // Catches: "validates using secret Xk9mP2vQ..." with no verb
+  out = out.replace(/\bsecret\s+([A-Za-z0-9+/]{16,})\b/g, "secret [REDACTED:SECRET]");
+
+  // "key (<value>)" or "key (<value>)" — token value in parentheses after key/secret/token noun
+  out = out.replace(/\b(key|token|secret|credential)\s+\(([A-Za-z0-9+/\-_]{12,})\)/gi, "$1 ([REDACTED:CREDENTIAL])");
+
+  // "set to X for the account" — often follows a password context
+  out = out.replace(/(password|passphrase).*?\bset to\s+(\S+)/gi, (m, kw, val) => m.replace(val, "[REDACTED:PASSWORD]"));
+
+  // "# password: X" or "# pass: X" in comments
+  out = out.replace(/(#\s*(?:password|pass|passwd)\s*[:=]\s*)(\S+)/gi, "$1[REDACTED:PASSWORD]");
+
+  // curl -u user:password or -u :password basic auth
+  out = out.replace(/(curl\s+.*?-u\s+)([^:\s]+):(\S+)/gi, "$1$2:[REDACTED:CREDENTIAL]");
+
+  // sshpass -p <password>
+  out = out.replace(/(sshpass\s+-p\s+)(\S+)/gi, "$1[REDACTED:CREDENTIAL]");
+
+  // heroku auth:token output — standalone token value on its own line after a command
+  // Catches: "heroku auth:token\n<token>"
+  out = out.replace(/(heroku\s+auth:token\s*\n)(\S+)/gi, "$1[REDACTED:TOKEN]");
+
+  // Private key PEM blocks — replace entire block content
+  out = out.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gi,
+    "[REDACTED:PRIVATE_KEY]");
+
+  // GitHub tokens (ghp_, gho_, ghs_, ghr_)
+  out = out.replace(/\bgh[posr]_[A-Za-z0-9]{36,}\b/g, "[REDACTED:TOKEN]");
+
+  // npm tokens
+  out = out.replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "[REDACTED:TOKEN]");
+
+  // Stripe keys
+  out = out.replace(/\bsk_(live|test)_[A-Za-z0-9]{24,}\b/g, "[REDACTED:TOKEN]");
+
+  // Generic sk- prefixed keys (OpenAI, Anthropic, etc.)
+  out = out.replace(/\bsk-[A-Za-z0-9\-_]{20,}\b/g, "[REDACTED:TOKEN]");
+
+  // Slack tokens
+  out = out.replace(/\bxox[bpoa]-[A-Za-z0-9\-]{10,}\b/g, "[REDACTED:TOKEN]");
+
+  // JWT tokens (3 base64url segments separated by dots)
+  out = out.replace(/\bey[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\b/g, "[REDACTED:TOKEN]");
+
+  // Bearer tokens
+  out = out.replace(/(Authorization:\s*Bearer\s+)\S+/gi, "$1[REDACTED:TOKEN]");
+
+  // Generic env var assignments — known names
+  out = out.replace(/\b(API_KEY|SECRET_KEY|SECRET|PRIVATE_KEY|ACCESS_TOKEN|AUTH_TOKEN|JWT_SECRET|MASTER_KEY|SIGNING_KEY|ENCRYPTION_KEY|NEXTAUTH_SECRET|RAILS_MASTER_KEY|APP_SECRET|CLIENT_SECRET|WEBHOOK_SECRET|SENDGRID_API_KEY|DATADOG_API_KEY|FIREBASE_[A-Z_]+_KEY)\s*=\s*\S+/g,
+    (m, varname) => `${varname}=[REDACTED:CREDENTIAL]`);
+
+  // Broad env var suffix pattern — any var ending in _KEY, _SECRET, _TOKEN, _PASSWORD, _PASS, _PWD, _AUTH, _CREDENTIAL
+  // Catches vendor-specific names: TWILIO_AUTH_TOKEN, PUSHER_APP_SECRET, STRIPE_SECRET_KEY, etc.
+  out = out.replace(/\b[A-Z][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_PASS|_PWD|_AUTH|_CREDENTIAL|_APIKEY)\s*=\s*\S+/g,
+    (m) => m.replace(/=\S+$/, "=[REDACTED:CREDENTIAL]"));
+
+  // grep/awk with secret value as search term — e.g. grep SECRET=value
+  // Catches: kubectl exec pod -- env | grep SECRET=actualvalue
+  out = out.replace(/(grep\s+[A-Z_]*(?:SECRET|PASSWORD|TOKEN|KEY|PASS|PWD)=)(\S+)/gi, "$1[REDACTED:CREDENTIAL]");
+
+  // SCP user:pass@host — scp doesn't use -p flag, password is in the path
+  // Format: user:password@host:/path
+  out = out.replace(/(scp\s+.*?\s+\S+:)([^@\s]+)(@\S+)/gi, "$1[REDACTED:CREDENTIAL]$3");
+
+  // Generic user:password pattern — freeform credential pairs
+  // Catches: "user:P@ss123 (staging)", "deploy:&!secret@host", etc.
+  // User part: alphanumeric/dots/dashes. Pass part: 8+ chars, any non-whitespace/non-slash
+  out = out.replace(/\b([a-zA-Z0-9._-]{2,32}):([\S]{8,})(?=\s*[@()\s,]|$)/g,
+    (m, user, pass) => {
+      // Only replace if pass looks like a credential — not a plain word or version string
+      // Credential signals: has special char, OR mixed case+digits, OR 16+ chars
+      const hasSpecial = /[^a-zA-Z0-9]/.test(pass);
+      const hasMixedDigits = /[A-Za-z]/.test(pass) && /\d/.test(pass);
+      const isLong = pass.length >= 16;
+      if (hasSpecial || hasMixedDigits || isLong) {
+        return `${user}:[REDACTED:CREDENTIAL]`;
+      }
+      return m;
+    });
+
+  return out;
+}
+
+/**
  * Two-step desensitization using a local model:
- *   Step 1: Model identifies PII items as a JSON array
- *   Step 2: Programmatic string replacement using the model's output
+ *   Step 1: Deterministic regex pre-pass (catches high-confidence patterns)
+ *   Step 2: Model identifies remaining PII items as a JSON array
+ *   Step 3: Programmatic string replacement using the model's output
  *
  * Falls back to rule-based redaction if the local model is unavailable.
  */
@@ -507,13 +631,22 @@ export async function desensitizeWithLocalModel(
     return { desensitized: content, wasModelUsed: false, failed: true };
   }
 
+  // ── Stage 1: Deterministic regex pre-pass ─────────────────────────────────
+  // Strip high-confidence credential patterns before the LLM sees them.
+  // This catches cases the LLM misses in unusual phrasings (AKIA keys,
+  // Redis URLs, pg_dump args, password colon-variants, etc.)
+  const preRedacted = preRedactCredentials(content);
+
   try {
     const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
     const model = config.localModel?.model ?? "openbmb/minicpm4.1";
     const providerType = config.localModel?.type ?? "openai-compatible";
     const customModule = config.localModel?.module;
 
-    const piiItems = await extractPiiWithModel(endpoint, model, content, {
+    // ── Stage 2: LLM PII extraction on pre-redacted content ─────────────────
+    // Send pre-redacted content to LLM — credentials already stripped by regex,
+    // LLM focuses on remaining PII (names, emails, phones, addresses, etc.)
+    const piiItems = await extractPiiWithModel(endpoint, model, preRedacted, {
       apiKey: config.localModel?.apiKey,
       providerType,
       customModule,
@@ -522,11 +655,11 @@ export async function desensitizeWithLocalModel(
     });
 
     if (piiItems.length === 0) {
-      return { desensitized: content, wasModelUsed: true };
+      return { desensitized: preRedacted, wasModelUsed: true };
     }
 
-    // Step 2: Programmatic replacement
-    let redacted = content;
+    // ── Stage 3: Programmatic replacement of LLM-identified items ────────────
+    let redacted = preRedacted;
     // Sort by value length descending to avoid partial replacements
     const sorted = [...piiItems].sort((a, b) => b.value.length - a.value.length);
     for (const item of sorted) {
@@ -539,7 +672,8 @@ export async function desensitizeWithLocalModel(
     return { desensitized: redacted, wasModelUsed: true };
   } catch (err) {
     console.error("[GuardClaw] Local model desensitization failed:", err);
-    return { desensitized: content, wasModelUsed: false, failed: true };
+    // On LLM failure, return pre-redacted content (regex pass still applied)
+    return { desensitized: preRedacted, wasModelUsed: false, failed: true };
   }
 }
 
@@ -580,6 +714,14 @@ function mapPiiTypeToTag(type: string): string {
     DATE: "[REDACTED:DATE]",
     SALARY: "[REDACTED:SALARY]",
     AMOUNT: "[REDACTED:AMOUNT]",
+    // Credential types
+    AWS_KEY: "[REDACTED:CREDENTIAL]",
+    PRIVATE_KEY: "[REDACTED:PRIVATE_KEY]",
+    CONNECTION_STRING: "[REDACTED:CREDENTIAL]",
+    ENV_VAR: "[REDACTED:CREDENTIAL]",
+    CREDENTIAL: "[REDACTED:CREDENTIAL]",
+    MFA_CODE: "[REDACTED:SECRET]",
+    CERT: "[REDACTED:CREDENTIAL]",
   };
   return mapping[t] ?? `[REDACTED:${t}]`;
 }

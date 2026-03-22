@@ -612,6 +612,7 @@ function dashboardHtml(): string {
   .field{margin-bottom:16px}
   .field label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
   .field input,.field select{width:100%;padding:10px 14px;background:var(--bg-input);border:1px solid transparent;border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;outline:none;transition:all .15s}
+  .field input[type=radio]{width:auto;padding:0;background:transparent;border:none;border-radius:0;flex-shrink:0;cursor:pointer;accent-color:var(--accent,#4f9cf9)}
   .field select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236e6e80' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;padding-right:36px}
   .field input:hover,.field select:hover{background:#eaecf1}
   .field input:focus,.field select:focus{background:#fff;border-color:transparent;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
@@ -1045,6 +1046,33 @@ function dashboardHtml(): string {
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+
+        <!-- S3 Policy -->
+        <div class="subsection">
+          <h4 data-i18n="priv.s3policy">S3 Policy — Confidential Content Handling</h4>
+          <div class="hint" style="margin-bottom:12px" data-i18n="priv.s3policy_hint">Controls what happens when S3 (confidential) content is detected.</div>
+          <div class="field">
+            <div style="display:flex;flex-direction:column;gap:10px;">
+              <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+                <input type="radio" name="s3policy" id="s3policy-local" value="local-only" style="margin-top:3px;" onchange="document.getElementById('s3policy-warning').style.display='none'">
+                <div>
+                  <div style="font-weight:600;" data-i18n="priv.s3policy_local">Local Only (default)</div>
+                  <div class="hint" data-i18n="priv.s3policy_local_hint">S3 content stays on device. Routes to local guard agent for reasoning. Requires 64 GB+ or distributed setup.</div>
+                </div>
+              </label>
+              <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+                <input type="radio" name="s3policy" id="s3policy-redact" value="redact-and-forward" style="margin-top:3px;" onchange="document.getElementById('s3policy-warning').style.display='block'">
+                <div>
+                  <div style="font-weight:600;" data-i18n="priv.s3policy_redact">Redact &amp; Forward ⚠️</div>
+                  <div class="hint" data-i18n="priv.s3policy_redact_hint">Strips all credentials &amp; secrets locally, then forwards sanitised content to cloud. Works on 16 GB standalone. Security depends on redaction quality.</div>
+                </div>
+              </label>
+            </div>
+          </div>
+          <div id="s3policy-warning" style="display:none;margin-top:10px;padding:10px 14px;background:rgba(255,160,0,0.12);border:1px solid rgba(255,160,0,0.4);border-radius:6px;font-size:12px;color:#ffb347;">
+            ⚠️ <strong>Redact &amp; Forward</strong> sends sanitised S3 content to your cloud provider. Security depends on redaction quality. Centrase recommends testing with your data before enabling in production. <a href="https://github.com/list3r/guardclaw-openclaw-plugin#s3-policy" target="_blank" style="color:#ffb347;">Learn more</a>
           </div>
         </div>
 
@@ -2008,6 +2036,13 @@ async function loadConfig() {
     document.getElementById('cfg-s2policy').value = p.s2Policy || 'proxy';
     document.getElementById('cfg-proxyport').value = p.proxyPort || '';
 
+    // s3Policy radio
+    var s3pol = p.s3Policy || 'local-only';
+    var s3Radio = document.querySelector('input[name="s3policy"][value="' + s3pol + '"]');
+    if (s3Radio) s3Radio.checked = true;
+    var s3warn = document.getElementById('s3policy-warning');
+    if (s3warn) s3warn.style.display = (s3pol === 'redact-and-forward') ? 'block' : 'none';
+
     document.getElementById('cfg-sess-isolate').checked = sess.isolateGuardHistory !== false;
     document.getElementById('cfg-sess-basedir').value = sess.baseDir || '';
 
@@ -2451,8 +2486,11 @@ async function runRouterTest(routerId) {
 
 async function savePrivacyRouter() {
   try {
+    var s3PolicyEl = document.querySelector('input[name="s3policy"]:checked');
+    var s3Policy = s3PolicyEl ? s3PolicyEl.value : 'local-only';
     var payload = {
       privacy: {
+        s3Policy: s3Policy,
         checkpoints: {
           onUserMessage: _checkpoints.um.length ? _checkpoints.um : undefined,
           onToolCallProposed: _checkpoints.tcp.length ? _checkpoints.tcp : undefined,

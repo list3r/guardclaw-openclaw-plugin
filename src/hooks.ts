@@ -114,6 +114,26 @@ function isToolAllowlisted(toolName: string): boolean {
 // Workspace dir cache — set from first hook that has PluginHookAgentContext
 let _cachedWorkspaceDir: string | undefined;
 
+const GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-stats.json";
+const GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
+const GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+
+async function updateGuardclawStats(level: string): Promise<void> {
+  try {
+    let stats: Record<string, unknown> = { s1Count: 0, s2Count: 0, s3Count: 0, totalMessages: 0, s3Policy: "local-only", lastUpdated: null };
+    try {
+      const raw = await fs.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+      Object.assign(stats, JSON.parse(raw));
+    } catch { /* first run or missing file */ }
+    if (level === "S1") stats.s1Count = (stats.s1Count as number) + 1;
+    else if (level === "S2") stats.s2Count = (stats.s2Count as number) + 1;
+    else if (level === "S3") stats.s3Count = (stats.s3Count as number) + 1;
+    stats.totalMessages = (stats.totalMessages as number) + 1;
+    stats.lastUpdated = new Date().toISOString();
+    await fs.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+  } catch { /* stats are best-effort */ }
+}
+
 export function registerHooks(api: OpenClawPluginApi): void {
   const privacyCfgInit = getLiveConfig();
   const sessionBaseDir = privacyCfgInit.session?.baseDir;
@@ -124,6 +144,31 @@ export function registerHooks(api: OpenClawPluginApi): void {
   });
 
   getDefaultSessionManager(sessionBaseDir);
+
+  // ── Pending config watcher: apply s3Policy changes from dashboard ─────────
+  setInterval(async () => {
+    try {
+      await fs.promises.access(GUARDCLAW_PENDING_CONFIG_PATH);
+      const pendingRaw = await fs.promises.readFile(GUARDCLAW_PENDING_CONFIG_PATH, "utf8");
+      const pending = JSON.parse(pendingRaw) as Record<string, unknown>;
+      const s3Policy = pending.s3Policy as string;
+      if (!s3Policy) return;
+      const cfgRaw = await fs.promises.readFile(GUARDCLAW_JSON_PATH, "utf8");
+      const cfg = JSON.parse(cfgRaw) as Record<string, unknown>;
+      if (!cfg.privacy) cfg.privacy = {};
+      (cfg.privacy as Record<string, unknown>).s3Policy = s3Policy;
+      await fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+      await fs.promises.unlink(GUARDCLAW_PENDING_CONFIG_PATH);
+      api.logger.info(`[GuardClaw] s3Policy updated to: ${s3Policy}`);
+      // Reflect new policy in stats file
+      try {
+        const statsRaw = await fs.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+        const stats = JSON.parse(statsRaw) as Record<string, unknown>;
+        stats.s3Policy = s3Policy;
+        await fs.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+      } catch { /* non-critical */ }
+    } catch { /* file not present — normal */ }
+  }, 5000);
 
   // =========================================================================
   // Hook 1: before_model_resolve — Run pipeline + model routing
@@ -166,7 +211,31 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       if (rulePreCheck.level === "S3") {
         recordDetection(sessionKey, "S3", "onUserMessage", rulePreCheck.reason);
+        updateGuardclawStats("S3").catch(() => {});
         trackSessionLevel(sessionKey, "S3");
+
+        // ── s3Policy: "redact-and-forward" (lightweight mode) ──────────────
+        // Off by default. Enable in guardclaw.json:
+        //   "privacy": { "s3Policy": "redact-and-forward" }
+        //
+        // Instead of routing to a local guard agent, aggressively redacts
+        // all S3 content (credentials, paths, secrets) then forwards to cloud.
+        // WARNING: Redaction quality determines security — test thoroughly before use.
+        // Designed for 16 GB standalone deployments without a guard agent server.
+        const s3Policy = (privacyConfig as Record<string, unknown>).s3Policy as string ?? "local-only";
+        if (s3Policy === "redact-and-forward") {
+          api.logger.warn(`[GuardClaw] S3 redact-and-forward mode — aggressively redacting before cloud`);
+          stashDetection(sessionKey, {
+            level: "S2", // treat as S2 so desensitization pipeline runs
+            reason: `s3-redact-forward: ${rulePreCheck.reason}`,
+            originalPrompt: msgStr,
+            timestamp: Date.now(),
+          });
+          // Fall through to S2 handling — will desensitize and forward
+          // The S3 patterns are a superset of S2, so redaction will be maximal
+          return; // let before_prompt_build handle S2 desensitization
+        }
+
         setActiveLocalRouting(sessionKey);
         stashDetection(sessionKey, {
           level: "S3",
@@ -202,6 +271,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       );
 
       recordDetection(sessionKey, decision.level, "onUserMessage", decision.reason);
+      updateGuardclawStats(decision.level).catch(() => {});
       api.logger.info(`[GuardClaw] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`);
       if (decision.level === "S1" && decision.action === "passthrough") {
         return;
@@ -522,6 +592,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             privacyConfig,
           );
           recordDetection(sessionKey, ruleResult.level, "onToolCallProposed", ruleResult.reason);
+          updateGuardclawStats(ruleResult.level).catch(() => {});
 
           if (ruleResult.level === "S3") {
             trackSessionLevel(sessionKey, "S3");
@@ -545,6 +616,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           if (blocked) {
             api.logger.warn(`[GuardClaw] BLOCKED high-risk exec command: ${command.slice(0, 80)}`);
             recordDetection(sessionKey, "S3", "onToolCallProposed", `high-risk exec: ${blocked}`);
+            updateGuardclawStats("S3").catch(() => {});
             trackSessionLevel(sessionKey, "S3");
             return { block: true, blockReason: `GuardClaw: exec command blocked — likely to output secrets (${blocked}). Use a local model session for this operation.` };
           }
@@ -586,6 +658,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
 
         recordDetection(sessionKey, level, "onToolCallProposed", reason);
+        updateGuardclawStats(level).catch(() => {});
 
         if (level === "S3") {
           trackSessionLevel(sessionKey, "S3");
@@ -705,6 +778,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         trackSessionLevel(sessionKey, ruleCheck.level); // audit: record true S3
         markSessionAsPrivate(sessionKey, effectiveLevel);
         recordDetection(sessionKey, ruleCheck.level, "onToolCallExecuted", ruleCheck.reason);
+        updateGuardclawStats(ruleCheck.level).catch(() => {});
         if (ruleCheck.level === "S3") {
           api.logger.warn(
             `[GuardClaw] S3 detected in tool result AFTER cloud model already active — ` +
@@ -754,6 +828,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             markSessionAsPrivate(sessionKey, llmEffective);
           }
           recordDetection(sessionKey, llmResult.level, "onToolCallExecuted", llmResult.reason);
+          updateGuardclawStats(llmResult.level).catch(() => {});
           if (llmResult.level === "S3") {
             api.logger.warn(
               `[GuardClaw] LLM elevated tool result to S3 — PII redacted before reaching cloud model. ` +
@@ -1000,11 +1075,40 @@ export function registerHooks(api: OpenClawPluginApi): void {
   // =========================================================================
   api.on("message_sending", async (event, ctx) => {
     try {
-      const { content } = event;
+      const { content, to } = event;
       if (!content?.trim()) return;
 
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
+
+      // ── Operator passthrough (channel-scoped) ──────────────────────────────
+      // Only bypass redaction if the recipient is explicitly trusted for THIS channel.
+      // This prevents accidentally leaking secrets to a different Discord server
+      // if OpenClaw ever gets added to multiple servers.
+      //
+      // Check two sources:
+      // 1. Explicit guardclaw.json operatorPassthrough (admin override)
+      // 2. OpenClaw's own channel.allowFrom / channel.dmAllowFrom (implicit trust)
+      const explicitOperators: string[] = (privacyConfig as Record<string, unknown>).operatorPassthrough as string[] ?? [];
+      
+      // For now, only use explicit operator list to avoid reading openclaw.json
+      // on every message. If you want implicit trust, set operatorPassthrough
+      // explicitly in guardclaw.json for your specific user ID.
+      // (Auto-discovery happens at startup but is now disabled for safety.)
+      
+      if (explicitOperators.length > 0 && to && explicitOperators.includes(to)) {
+        api.logger.info(`[GuardClaw] Operator passthrough — skipping redaction for trusted recipient: ${to}`);
+        return;
+      }
+
+      // Skip redaction for channel messages (not DMs) — outbound channel posts
+      // are not going to a cloud LLM, they're going to users. Redacting them
+      // causes false positives (e.g. @mentions, package names, URLs get mangled).
+      // Only apply redaction to DM-style messages (numeric user IDs).
+      if (to && (to.startsWith("channel:") || to.startsWith("#") || to === "channel")) {
+        api.logger.info(`[GuardClaw] Channel message — skipping outbound redaction for: ${to}`);
+        return;
+      }
 
       const pipeline = getGlobalPipeline();
       if (!pipeline) return;
@@ -1177,6 +1281,11 @@ function isHighRiskExecCommand(command: string): string | null {
 function shouldSkipMessage(msg: string): boolean {
   if (msg.includes("[REDACTED:") || msg.startsWith("[SYSTEM]")) return true;
   if (/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(msg)) return true;
+  // Skip OpenClaw channel metadata envelopes (Discord/iMessage/Telegram routing metadata)
+  // These are injected by the channel bridge and contain sender IDs, timestamps, group info —
+  // not user content. Classifying them causes false positive S2 redaction of names/timestamps.
+  if (msg.includes("conversation_label") && msg.includes("sender_id")) return true;
+  if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata")) return true;
   return false;
 }
 
