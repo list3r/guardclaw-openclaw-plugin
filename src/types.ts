@@ -126,6 +126,8 @@ export type InjectionConfig = {
   exempt_sources?: string[];
   /** Discord user IDs exempt from scanning */
   exempt_senders?: string[];
+  /** Discord user IDs that are permanently banned (auto-blocked before detection) */
+  banned_senders?: string[];
 };
 
 export type RedactionOptions = {

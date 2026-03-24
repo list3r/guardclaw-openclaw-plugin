@@ -5,6 +5,7 @@ import {
   addCorrection,
   callChatCompletion,
   clearActiveLocalRouting,
+  clearLastSenderId,
   clearSessionState,
   consumeDetection,
   defaultInjectionConfig,
@@ -19,6 +20,7 @@ import {
   getGlobalCollector,
   getLastReplyLoopSummary,
   getLastReplyModelOrigin,
+  getLastSenderId,
   getLastTurnTokens,
   getLiveConfig,
   getLiveInjectionConfig,
@@ -37,19 +39,21 @@ import {
   resetTurnLevel,
   setActiveLocalRouting,
   setGlobalCollector,
+  setLastSenderId,
   stashDetection,
   trackSessionLevel,
   updateLiveConfig,
+  updateLiveInjectionConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-WPXZDJXK.js";
+} from "./chunk-72WK3R3J.js";
 
 // index.ts
 import { join as join5 } from "path";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
 
 // src/hooks.ts
-import * as fs3 from "fs";
+import * as fs4 from "fs";
 import * as path3 from "path";
 
 // src/guard-agent.ts
@@ -1078,6 +1082,7 @@ function checkToolParams(params, config) {
 
 // src/privacy-proxy.ts
 import * as http from "http";
+import * as fs3 from "fs";
 
 // src/provider.ts
 var activeProxy = null;
@@ -1131,6 +1136,203 @@ function mirrorAllProviderModels(config, resolveApiKey) {
   return mirrored;
 }
 
+// src/injection/patterns.ts
+var INJECTION_PATTERNS = {
+  // Role override attempts
+  role_override: [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
+    /forget\s+(everything|all|your)\s+(you\s+know|instructions?|training|context)/i,
+    /you\s+are\s+now\s+/i,
+    /from\s+now\s+on\s*,?\s*(you|act|behave|respond)/i,
+    /pretend\s+(you\s+are|to\s+be|you're)/i,
+    /act\s+as\s+(if\s+you\s+(are|were)|a|an|the)/i,
+    /your\s+new\s+(instructions?|directive|goal|purpose|role)/i,
+    /switch\s+(to|into)\s+.{0,20}\s+mode/i,
+    /\[?(system|admin|root|sudo|developer|debug|unrestricted|jailbreak|DAN)\]?\s*(mode|prompt|override|access)/i,
+    /do\s+anything\s+now/i,
+    /you\s+have\s+no\s+(restrictions?|limits?|guidelines?)/i
+  ],
+  // Exfiltration instructions
+  exfiltration: [
+    /send\s+(this|all|everything|the\s+\w+)\s+to\s+https?:\/\//i,
+    /send\s+(this|all|everything)\s+to\s/i,
+    /POST\s+(this|data|it|everything)\s+to\s/i,
+    /upload\s+(this|all|the\s+\w+)\s+to\s/i,
+    /email\s+(this|all|the\s+\w+|everything)\s+to\s/i,
+    /forward\s+(this|all|everything)\s+to\s/i,
+    /exfiltrat/i,
+    /HTTP\s+(request|POST|GET)\s+to\s/i,
+    /curl\s+(-X\s+POST\s+)?https?:\/\//i,
+    /wget\s+https?:\/\//i
+  ],
+  // Credential fishing
+  credential_fishing: [
+    /(provide|give|tell\s+me|show\s+me|reveal|share|what\s+is)\s+(your\s+)?(API\s*key|token|secret|password|credentials?|auth)/i,
+    /reveal\s+(your\s+)?(system\s+prompt|instructions?|context|training)/i,
+    /print\s+(your\s+)?(system|initial)\s+(prompt|instructions?|message)/i,
+    /output\s+(your\s+)?(config|configuration|settings|environment)/i,
+    /display\s+(hidden|secret|internal)\s/i
+  ],
+  // Encoding tricks (signals, not definitive)
+  encoding_tricks: [
+    /[A-Za-z0-9+\/]{50,}={0,2}/,
+    // Base64 blob (50+ chars)
+    /\\u[0-9a-fA-F]{4}/,
+    // Unicode escapes
+    /&#x?[0-9a-fA-F]+;/,
+    // HTML entities
+    /\x00|\x0d|\x0a{5,}/
+    // Null bytes or excessive newlines
+  ],
+  // Structural signals (imperative in data context)
+  structural: [
+    /^(you\s+must|you\s+should|you\s+will|you\s+need\s+to|always|never)\s/im,
+    /^(do\s+not|don't|stop|halt|cease|terminate)\s/im,
+    /\[\s*(INST|SYSTEM|ASSISTANT|USER)\s*\]/i,
+    // Role tags in content
+    /<\|?(im_start|im_end|system|user|assistant)\|?>/i
+    // ChatML tags
+  ]
+};
+var PATTERN_WEIGHTS = {
+  role_override: 40,
+  exfiltration: 35,
+  credential_fishing: 30,
+  encoding_tricks: 15,
+  structural: 20
+};
+
+// src/injection/heuristics.ts
+function runHeuristics(content) {
+  const matches = [];
+  const matchedPatterns = [];
+  let score = 0;
+  for (const [category, patterns] of Object.entries(INJECTION_PATTERNS)) {
+    for (const pattern of patterns) {
+      const match = content.match(pattern);
+      if (match) {
+        if (!matches.includes(category)) {
+          matches.push(category);
+          score += PATTERN_WEIGHTS[category] || 10;
+        }
+        matchedPatterns.push({
+          category,
+          pattern: pattern.toString(),
+          match: match[0].slice(0, 100)
+        });
+      }
+    }
+  }
+  score = Math.min(score, 100);
+  return { score, matches, matchedPatterns };
+}
+
+// src/injection/deberta.ts
+var ENDPOINT = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
+var TIMEOUT_MS = 5e3;
+async function runDebertaClassifier(content) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") {
+      return { label: 0, score: 0, injection: false, error: "Timeout" };
+    }
+    return { label: 0, score: 0, injection: false, error: err.message ?? "Unknown error" };
+  }
+}
+
+// src/injection/sanitiser.ts
+var REDACTION_MARKER = "[CONTENT REDACTED \u2014 POTENTIAL INJECTION]";
+function sanitiseContent(content, matchedPatterns) {
+  let sanitised = content;
+  const sorted = [...matchedPatterns].filter((p) => p.match.length > 0).sort((a, b) => b.match.length - a.match.length);
+  for (const { match } of sorted) {
+    const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(escaped, "gi");
+    sanitised = sanitised.replace(regex, REDACTION_MARKER);
+  }
+  const escapedMarker = REDACTION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  sanitised = sanitised.replace(
+    new RegExp(`(${escapedMarker}\\s*)+`, "g"),
+    REDACTION_MARKER + "\n"
+  );
+  return sanitised.trim();
+}
+
+// src/injection/index.ts
+var DEFAULT_BLOCK_THRESHOLD = 70;
+var DEFAULT_SANITISE_THRESHOLD = 30;
+var SECURITY_CHANNEL = "1483608914774986943";
+function formatBlockAlert(result, source, preview) {
+  return `\u{1F6E1}\uFE0F **GuardClaw S0 \u2014 Injection Blocked**
+> **Source:** ${source}
+> **Score:** ${result.score}/100
+> **Patterns:** ${result.matches.join(", ")}
+> **Preview:** \`${preview.slice(0, 100)}${preview.length > 100 ? "..." : ""}\`
+>
+> Content blocked and not passed to model. Review in guardclaw-injections.log`;
+}
+var _injectionConfig = {};
+function initInjectionConfig(config) {
+  _injectionConfig = config;
+}
+async function detectInjection(content, source, config) {
+  const cfg = config ?? _injectionConfig;
+  if (cfg.exempt_sources?.includes(source)) {
+    return { pass: true, score: 0, action: "pass", matches: [] };
+  }
+  const blockThreshold = cfg.block_threshold ?? DEFAULT_BLOCK_THRESHOLD;
+  const sanitiseThreshold = cfg.sanitise_threshold ?? DEFAULT_SANITISE_THRESHOLD;
+  const heuristic = runHeuristics(content);
+  let finalScore = heuristic.score;
+  let debertaResult = null;
+  if (!cfg.heuristics_only && heuristic.score >= 20 && heuristic.score <= 80) {
+    debertaResult = await runDebertaClassifier(content);
+    if (!debertaResult.error) {
+      if (debertaResult.injection) {
+        finalScore = Math.max(finalScore, 70 + debertaResult.score * 30);
+      } else if (debertaResult.score > 0.7 && debertaResult.label === 0) {
+        finalScore = Math.min(finalScore, 25);
+      }
+    }
+  }
+  let action;
+  if (finalScore < sanitiseThreshold) {
+    action = "pass";
+  } else if (finalScore < blockThreshold) {
+    action = "sanitise";
+  } else {
+    action = "block";
+  }
+  let sanitised;
+  if (action === "sanitise") {
+    sanitised = sanitiseContent(content, heuristic.matchedPatterns);
+  }
+  return {
+    pass: action === "pass",
+    score: Math.round(finalScore),
+    action,
+    sanitised,
+    matches: heuristic.matches,
+    blocked_reason: action === "block" ? `Injection detected (score ${Math.round(finalScore)}): ${heuristic.matches.join(", ")}` : void 0
+  };
+}
+
 // src/privacy-proxy.ts
 var GUARDCLAW_S2_OPEN = "<guardclaw-s2>";
 var GUARDCLAW_S2_CLOSE = "</guardclaw-s2>";
@@ -1158,6 +1360,24 @@ var _providerCleanupInterval = setInterval(cleanupStaleProviderTargets, 6e4);
 if (typeof _providerCleanupInterval === "object" && "unref" in _providerCleanupInterval) {
   _providerCleanupInterval.unref();
 }
+var GUARDCLAW_INJECTIONS_PATH = "/Users/centraseai/.openclaw/guardclaw-injections.json";
+var GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+async function appendProxyInjectionLog(entry) {
+  try {
+    let entries = [];
+    try {
+      const raw = await fs3.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
+      entries = JSON.parse(raw);
+      if (!Array.isArray(entries)) entries = [];
+    } catch {
+    }
+    entries.push(entry);
+    if (entries.length > 200) entries = entries.slice(entries.length - 200);
+    await fs3.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
+  } catch {
+  }
+}
+var proxyInjectionAttemptCounts = /* @__PURE__ */ new Map();
 var defaultProviderTarget = null;
 function setDefaultProviderTarget(target) {
   defaultProviderTarget = target;
@@ -1480,6 +1700,103 @@ async function startPrivacyProxy(port, logger) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: `Invalid JSON: ${String(parseErr)}`, type: "invalid_request" } }));
         return;
+      }
+      const injectionCfg = getLiveInjectionConfig();
+      if (injectionCfg.enabled !== false) {
+        const proxyMessages = parsed.messages;
+        log.info(`[GuardClaw S0] messages=${proxyMessages ? proxyMessages.length : "undefined"} keys=${Object.keys(parsed).join(",")}`);
+        const lastUserMsg = proxyMessages?.slice().reverse().find((m) => String(m.role ?? "") === "user");
+        log.info(`[GuardClaw S0] lastUserMsg role=${lastUserMsg?.role} contentType=${typeof lastUserMsg?.content}`);
+        let userContent = "";
+        if (lastUserMsg) {
+          if (typeof lastUserMsg.content === "string") {
+            userContent = lastUserMsg.content;
+          } else if (Array.isArray(lastUserMsg.content)) {
+            userContent = lastUserMsg.content.map((p) => {
+              if (typeof p === "string") return p;
+              if (p && typeof p === "object") {
+                const block = p;
+                if (typeof block.text === "string") return block.text;
+                if (typeof block.content === "string") return block.content;
+              }
+              return "";
+            }).join("");
+          }
+        }
+        log.info(`[GuardClaw S0] userContent length=${userContent.length} first80=${userContent.slice(0, 80).replace(/\n/g, "\\n")}`);
+        let proxySenderId = req.headers["x-guardclaw-sender-id"];
+        if (!proxySenderId && userContent) {
+          const m = userContent.match(/"sender_id"\s*:\s*"(\d+)"/);
+          if (m) proxySenderId = m[1];
+        }
+        if (proxySenderId && (injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
+          log.warn(`[GuardClaw S0] BANNED sender blocked in proxy: senderId=${proxySenderId}`);
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: `GuardClaw S0: Sender ${proxySenderId} is banned`, type: "forbidden" } }));
+          return;
+        }
+        const isExemptSender = proxySenderId && (injectionCfg.exempt_senders ?? []).includes(proxySenderId);
+        if (userContent && !isExemptSender) {
+          const proxyInjResult = await detectInjection(userContent, "user_message", injectionCfg);
+          const proxySessionKey = req.headers["x-guardclaw-session"] ?? "proxy";
+          log.info(`[GuardClaw S0] detection result: action=${proxyInjResult.action} score=${proxyInjResult.score} matches=${proxyInjResult.matches.join(",")}`);
+          if (proxyInjResult.action === "block") {
+            log.warn(`[GuardClaw S0] BLOCKED in proxy session=${proxySessionKey} score=${proxyInjResult.score} patterns=${proxyInjResult.matches.join(",")}`);
+            await appendProxyInjectionLog({
+              ts: (/* @__PURE__ */ new Date()).toISOString(),
+              session: proxySessionKey,
+              senderId: proxySenderId,
+              action: "block",
+              score: proxyInjResult.score,
+              patterns: proxyInjResult.matches,
+              source: "proxy",
+              preview: userContent.slice(0, 80)
+            });
+            if (proxySenderId) {
+              const attempts = (proxyInjectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
+              proxyInjectionAttemptCounts.set(proxySenderId, attempts);
+              if (attempts >= 2 && !(injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
+                log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
+                const newBanned = [...injectionCfg.banned_senders ?? [], proxySenderId];
+                updateLiveInjectionConfig({ banned_senders: newBanned });
+                fs3.promises.readFile(GUARDCLAW_JSON_PATH, "utf8").then((raw) => {
+                  const cfg = JSON.parse(raw);
+                  if (!cfg.privacy) cfg.privacy = {};
+                  const privacy = cfg.privacy;
+                  if (!privacy.injection) privacy.injection = {};
+                  privacy.injection.banned_senders = newBanned;
+                  return fs3.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+                }).catch(() => {
+                });
+              }
+            }
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: `GuardClaw S0: ${proxyInjResult.blocked_reason ?? "Prompt injection detected"}`, type: "forbidden" } }));
+            return;
+          } else if (proxyInjResult.action === "sanitise" && proxyInjResult.sanitised !== userContent && lastUserMsg) {
+            log.warn(`[GuardClaw S0] SANITISED in proxy session=${proxySessionKey}`);
+            await appendProxyInjectionLog({
+              ts: (/* @__PURE__ */ new Date()).toISOString(),
+              session: proxySessionKey,
+              senderId: proxySenderId,
+              action: "sanitise",
+              score: proxyInjResult.score,
+              patterns: proxyInjResult.matches,
+              source: "proxy",
+              preview: userContent.slice(0, 80)
+            });
+            if (typeof lastUserMsg.content === "string") {
+              lastUserMsg.content = proxyInjResult.sanitised;
+            } else if (Array.isArray(lastUserMsg.content)) {
+              for (const part of lastUserMsg.content) {
+                if (typeof part.text === "string") {
+                  part.text = proxyInjResult.sanitised;
+                  break;
+                }
+              }
+            }
+          }
+        }
       }
       const hadOpenAiMarkers = stripPiiMarkers(parsed.messages ?? []);
       const hadGoogleMarkers = stripPiiMarkersGoogleContents(parsed.contents);
@@ -1917,203 +2234,6 @@ function getGlobalPipeline() {
   return globalPipeline;
 }
 
-// src/injection/patterns.ts
-var INJECTION_PATTERNS = {
-  // Role override attempts
-  role_override: [
-    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
-    /forget\s+(everything|all|your)\s+(you\s+know|instructions?|training|context)/i,
-    /you\s+are\s+now\s+/i,
-    /from\s+now\s+on\s*,?\s*(you|act|behave|respond)/i,
-    /pretend\s+(you\s+are|to\s+be|you're)/i,
-    /act\s+as\s+(if\s+you\s+(are|were)|a|an|the)/i,
-    /your\s+new\s+(instructions?|directive|goal|purpose|role)/i,
-    /switch\s+(to|into)\s+.{0,20}\s+mode/i,
-    /\[?(system|admin|root|sudo|developer|debug|unrestricted|jailbreak|DAN)\]?\s*(mode|prompt|override|access)/i,
-    /do\s+anything\s+now/i,
-    /you\s+have\s+no\s+(restrictions?|limits?|guidelines?)/i
-  ],
-  // Exfiltration instructions
-  exfiltration: [
-    /send\s+(this|all|everything|the\s+\w+)\s+to\s+https?:\/\//i,
-    /send\s+(this|all|everything)\s+to\s/i,
-    /POST\s+(this|data|it|everything)\s+to\s/i,
-    /upload\s+(this|all|the\s+\w+)\s+to\s/i,
-    /email\s+(this|all|the\s+\w+|everything)\s+to\s/i,
-    /forward\s+(this|all|everything)\s+to\s/i,
-    /exfiltrat/i,
-    /HTTP\s+(request|POST|GET)\s+to\s/i,
-    /curl\s+(-X\s+POST\s+)?https?:\/\//i,
-    /wget\s+https?:\/\//i
-  ],
-  // Credential fishing
-  credential_fishing: [
-    /(provide|give|tell\s+me|show\s+me|reveal|share|what\s+is)\s+(your\s+)?(API\s*key|token|secret|password|credentials?|auth)/i,
-    /reveal\s+(your\s+)?(system\s+prompt|instructions?|context|training)/i,
-    /print\s+(your\s+)?(system|initial)\s+(prompt|instructions?|message)/i,
-    /output\s+(your\s+)?(config|configuration|settings|environment)/i,
-    /display\s+(hidden|secret|internal)\s/i
-  ],
-  // Encoding tricks (signals, not definitive)
-  encoding_tricks: [
-    /[A-Za-z0-9+\/]{50,}={0,2}/,
-    // Base64 blob (50+ chars)
-    /\\u[0-9a-fA-F]{4}/,
-    // Unicode escapes
-    /&#x?[0-9a-fA-F]+;/,
-    // HTML entities
-    /\x00|\x0d|\x0a{5,}/
-    // Null bytes or excessive newlines
-  ],
-  // Structural signals (imperative in data context)
-  structural: [
-    /^(you\s+must|you\s+should|you\s+will|you\s+need\s+to|always|never)\s/im,
-    /^(do\s+not|don't|stop|halt|cease|terminate)\s/im,
-    /\[\s*(INST|SYSTEM|ASSISTANT|USER)\s*\]/i,
-    // Role tags in content
-    /<\|?(im_start|im_end|system|user|assistant)\|?>/i
-    // ChatML tags
-  ]
-};
-var PATTERN_WEIGHTS = {
-  role_override: 40,
-  exfiltration: 35,
-  credential_fishing: 30,
-  encoding_tricks: 15,
-  structural: 20
-};
-
-// src/injection/heuristics.ts
-function runHeuristics(content) {
-  const matches = [];
-  const matchedPatterns = [];
-  let score = 0;
-  for (const [category, patterns] of Object.entries(INJECTION_PATTERNS)) {
-    for (const pattern of patterns) {
-      const match = content.match(pattern);
-      if (match) {
-        if (!matches.includes(category)) {
-          matches.push(category);
-          score += PATTERN_WEIGHTS[category] || 10;
-        }
-        matchedPatterns.push({
-          category,
-          pattern: pattern.toString(),
-          match: match[0].slice(0, 100)
-        });
-      }
-    }
-  }
-  score = Math.min(score, 100);
-  return { score, matches, matchedPatterns };
-}
-
-// src/injection/deberta.ts
-var ENDPOINT = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
-var TIMEOUT_MS = 5e3;
-async function runDebertaClassifier(content) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    if (!res.ok) {
-      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
-    }
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") {
-      return { label: 0, score: 0, injection: false, error: "Timeout" };
-    }
-    return { label: 0, score: 0, injection: false, error: err.message ?? "Unknown error" };
-  }
-}
-
-// src/injection/sanitiser.ts
-var REDACTION_MARKER = "[CONTENT REDACTED \u2014 POTENTIAL INJECTION]";
-function sanitiseContent(content, matchedPatterns) {
-  let sanitised = content;
-  const sorted = [...matchedPatterns].filter((p) => p.match.length > 0).sort((a, b) => b.match.length - a.match.length);
-  for (const { match } of sorted) {
-    const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const regex = new RegExp(escaped, "gi");
-    sanitised = sanitised.replace(regex, REDACTION_MARKER);
-  }
-  const escapedMarker = REDACTION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  sanitised = sanitised.replace(
-    new RegExp(`(${escapedMarker}\\s*)+`, "g"),
-    REDACTION_MARKER + "\n"
-  );
-  return sanitised.trim();
-}
-
-// src/injection/index.ts
-var DEFAULT_BLOCK_THRESHOLD = 70;
-var DEFAULT_SANITISE_THRESHOLD = 30;
-var SECURITY_CHANNEL = "1483608914774986943";
-function formatBlockAlert(result, source, preview) {
-  return `\u{1F6E1}\uFE0F **GuardClaw S0 \u2014 Injection Blocked**
-> **Source:** ${source}
-> **Score:** ${result.score}/100
-> **Patterns:** ${result.matches.join(", ")}
-> **Preview:** \`${preview.slice(0, 100)}${preview.length > 100 ? "..." : ""}\`
->
-> Content blocked and not passed to model. Review in guardclaw-injections.log`;
-}
-var _injectionConfig = {};
-function initInjectionConfig(config) {
-  _injectionConfig = config;
-}
-async function detectInjection(content, source, config) {
-  const cfg = config ?? _injectionConfig;
-  if (cfg.exempt_sources?.includes(source)) {
-    return { pass: true, score: 0, action: "pass", matches: [] };
-  }
-  const blockThreshold = cfg.block_threshold ?? DEFAULT_BLOCK_THRESHOLD;
-  const sanitiseThreshold = cfg.sanitise_threshold ?? DEFAULT_SANITISE_THRESHOLD;
-  const heuristic = runHeuristics(content);
-  let finalScore = heuristic.score;
-  let debertaResult = null;
-  if (!cfg.heuristics_only && heuristic.score >= 20 && heuristic.score <= 80) {
-    debertaResult = await runDebertaClassifier(content);
-    if (!debertaResult.error) {
-      if (debertaResult.injection) {
-        finalScore = Math.max(finalScore, 70 + debertaResult.score * 30);
-      } else if (debertaResult.score > 0.7 && debertaResult.label === 0) {
-        finalScore = Math.min(finalScore, 25);
-      }
-    }
-  }
-  let action;
-  if (finalScore < sanitiseThreshold) {
-    action = "pass";
-  } else if (finalScore < blockThreshold) {
-    action = "sanitise";
-  } else {
-    action = "block";
-  }
-  let sanitised;
-  if (action === "sanitise") {
-    sanitised = sanitiseContent(content, heuristic.matchedPatterns);
-  }
-  return {
-    pass: action === "pass",
-    score: Math.round(finalScore),
-    action,
-    sanitised,
-    matches: heuristic.matches,
-    blocked_reason: action === "block" ? `Injection detected (score ${Math.round(finalScore)}): ${heuristic.matches.join(", ")}` : void 0
-  };
-}
-
 // src/hooks.ts
 function getPipelineConfig() {
   return { privacy: getLiveConfig() };
@@ -2133,14 +2253,48 @@ function isToolAllowlisted(toolName) {
   return allowlist.includes(toolName);
 }
 var _cachedWorkspaceDir;
-var GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-stats.json";
+var GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/guardclaw-stats.json";
+var GUARDCLAW_INJECTIONS_PATH2 = "/Users/centraseai/.openclaw/guardclaw-injections.json";
 var GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
-var GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+var GUARDCLAW_JSON_PATH2 = "/Users/centraseai/.openclaw/guardclaw.json";
+var injectionAttemptCounts = /* @__PURE__ */ new Map();
+async function appendInjectionLog(entry) {
+  try {
+    let entries = [];
+    try {
+      const raw = await fs4.promises.readFile(GUARDCLAW_INJECTIONS_PATH2, "utf8");
+      entries = JSON.parse(raw);
+      if (!Array.isArray(entries)) entries = [];
+    } catch {
+    }
+    entries.push(entry);
+    if (entries.length > 200) entries = entries.slice(entries.length - 200);
+    await fs4.promises.writeFile(GUARDCLAW_INJECTIONS_PATH2, JSON.stringify(entries, null, 2));
+  } catch {
+  }
+}
+async function updateS0Stats(action) {
+  try {
+    let stats = { s1Count: 0, s2Count: 0, s3Count: 0, totalMessages: 0, s3Policy: "local-only", lastUpdated: null };
+    try {
+      const raw = await fs4.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+      Object.assign(stats, JSON.parse(raw));
+    } catch {
+    }
+    if (!stats.s0 || typeof stats.s0 !== "object") stats.s0 = { blocked: 0, sanitised: 0, total: 0 };
+    const s0 = stats.s0;
+    if (action === "block") s0.blocked = (s0.blocked ?? 0) + 1;
+    else s0.sanitised = (s0.sanitised ?? 0) + 1;
+    s0.total = (s0.total ?? 0) + 1;
+    await fs4.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+  } catch {
+  }
+}
 async function updateGuardclawStats(level) {
   try {
     let stats = { s1Count: 0, s2Count: 0, s3Count: 0, totalMessages: 0, s3Policy: "local-only", lastUpdated: null };
     try {
-      const raw = await fs3.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+      const raw = await fs4.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
       Object.assign(stats, JSON.parse(raw));
     } catch {
     }
@@ -2149,7 +2303,7 @@ async function updateGuardclawStats(level) {
     else if (level === "S3") stats.s3Count = stats.s3Count + 1;
     stats.totalMessages = stats.totalMessages + 1;
     stats.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
-    await fs3.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+    await fs4.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
   } catch {
   }
 }
@@ -2163,23 +2317,23 @@ function registerHooks(api) {
   getDefaultSessionManager(sessionBaseDir);
   setInterval(async () => {
     try {
-      await fs3.promises.access(GUARDCLAW_PENDING_CONFIG_PATH);
-      const pendingRaw = await fs3.promises.readFile(GUARDCLAW_PENDING_CONFIG_PATH, "utf8");
+      await fs4.promises.access(GUARDCLAW_PENDING_CONFIG_PATH);
+      const pendingRaw = await fs4.promises.readFile(GUARDCLAW_PENDING_CONFIG_PATH, "utf8");
       const pending = JSON.parse(pendingRaw);
       const s3Policy = pending.s3Policy;
       if (!s3Policy) return;
-      const cfgRaw = await fs3.promises.readFile(GUARDCLAW_JSON_PATH, "utf8");
+      const cfgRaw = await fs4.promises.readFile(GUARDCLAW_JSON_PATH2, "utf8");
       const cfg = JSON.parse(cfgRaw);
       if (!cfg.privacy) cfg.privacy = {};
       cfg.privacy.s3Policy = s3Policy;
-      await fs3.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
-      await fs3.promises.unlink(GUARDCLAW_PENDING_CONFIG_PATH);
+      await fs4.promises.writeFile(GUARDCLAW_JSON_PATH2, JSON.stringify(cfg, null, 2));
+      await fs4.promises.unlink(GUARDCLAW_PENDING_CONFIG_PATH);
       api.logger.info(`[GuardClaw] s3Policy updated to: ${s3Policy}`);
       try {
-        const statsRaw = await fs3.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+        const statsRaw = await fs4.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
         const stats = JSON.parse(statsRaw);
         stats.s3Policy = s3Policy;
-        await fs3.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+        await fs4.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
       } catch {
       }
     } catch {
@@ -2207,32 +2361,96 @@ function registerHooks(api) {
       if (shouldSkipMessage(msgStr)) return;
       const injectionCfg = getLiveInjectionConfig();
       if (injectionCfg.enabled !== false) {
-        const senderId = ctx.senderId;
+        let senderId = ctx.senderId;
+        if (!senderId && ctx.channelId) {
+          senderId = getLastSenderId(ctx.channelId);
+          clearLastSenderId(ctx.channelId);
+        }
+        if (!senderId) {
+          const senderMatch = msgStr.match(/"sender_id"\s*:\s*"(\d+)"/);
+          if (senderMatch) senderId = senderMatch[1];
+        }
+        const isBannedSender = senderId && (injectionCfg.banned_senders ?? []).includes(senderId);
+        if (isBannedSender) {
+          api.logger.warn(`[GuardClaw S0] BANNED sender blocked: senderId=${senderId} session=${sessionKey}`);
+          recordDetection(sessionKey, "S0", "onUserMessage", `Banned sender: ${senderId}`);
+          throw new Error(`[GuardClaw S0] Message blocked: Sender ${senderId} is banned`);
+        }
         const isExemptSender = senderId && (injectionCfg.exempt_senders ?? []).includes(senderId);
         if (!isExemptSender) {
-          try {
-            const injResult = await detectInjection(msgStr, "user_message", injectionCfg);
-            if (injResult.action === "block") {
-              api.logger.warn(
-                `[GuardClaw S0] BLOCKED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
-              );
-              const alertChannel = injectionCfg.alert_channel ?? SECURITY_CHANNEL;
-              const alertMsg = formatBlockAlert(injResult, "user_message", msgStr);
-              void api.discord?.sendMessage?.(alertChannel, alertMsg)?.catch?.(() => {
-              });
-              throw new Error(
-                `[GuardClaw S0] Message blocked: ${injResult.blocked_reason ?? "Prompt injection detected"}`
-              );
-            } else if (injResult.action === "sanitise" && injResult.sanitised) {
-              api.logger.warn(
-                `[GuardClaw S0] SANITISED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
-              );
-              event.prompt = injResult.sanitised;
+          const userContent = extractUserContent(msgStr);
+          if (!userContent) {
+            api.logger.debug?.(`[GuardClaw S0] Skipping injection check \u2014 no user content extracted`);
+          } else {
+            try {
+              const injResult = await detectInjection(userContent, "user_message", injectionCfg);
+              if (injResult.action === "block") {
+                api.logger.warn(
+                  `[GuardClaw S0] BLOCKED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
+                );
+                await appendInjectionLog({
+                  ts: (/* @__PURE__ */ new Date()).toISOString(),
+                  session: sessionKey,
+                  senderId,
+                  action: "block",
+                  score: injResult.score,
+                  patterns: injResult.matches,
+                  source: "user_message",
+                  preview: msgStr.slice(0, 80)
+                });
+                void updateS0Stats("block");
+                if (senderId) {
+                  const attempts = (injectionAttemptCounts.get(senderId) ?? 0) + 1;
+                  injectionAttemptCounts.set(senderId, attempts);
+                  if (attempts >= 2) {
+                    api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
+                    const currentBanned = injectionCfg.banned_senders ?? [];
+                    if (!currentBanned.includes(senderId)) {
+                      const newBanned = [...currentBanned, senderId];
+                      updateLiveInjectionConfig({ banned_senders: newBanned });
+                      fs4.promises.readFile(GUARDCLAW_JSON_PATH2, "utf8").then((raw) => {
+                        const cfg = JSON.parse(raw);
+                        if (!cfg.privacy) cfg.privacy = {};
+                        const privacy = cfg.privacy;
+                        if (!privacy.injection) privacy.injection = {};
+                        privacy.injection.banned_senders = newBanned;
+                        return fs4.promises.writeFile(GUARDCLAW_JSON_PATH2, JSON.stringify(cfg, null, 2));
+                      }).catch(() => {
+                      });
+                    }
+                  }
+                }
+                recordDetection(sessionKey, "S0", "onUserMessage", injResult.blocked_reason ?? "Prompt injection detected");
+                const alertChannel = injectionCfg.alert_channel ?? SECURITY_CHANNEL;
+                const alertMsg = formatBlockAlert(injResult, "user_message", msgStr);
+                void api.discord?.sendMessage?.(alertChannel, alertMsg)?.catch?.(() => {
+                });
+                throw new Error(
+                  `[GuardClaw S0] Message blocked: ${injResult.blocked_reason ?? "Prompt injection detected"}`
+                );
+              } else if (injResult.action === "sanitise" && injResult.sanitised) {
+                api.logger.warn(
+                  `[GuardClaw S0] SANITISED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
+                );
+                await appendInjectionLog({
+                  ts: (/* @__PURE__ */ new Date()).toISOString(),
+                  session: sessionKey,
+                  action: "sanitise",
+                  score: injResult.score,
+                  patterns: injResult.matches,
+                  source: "user_message",
+                  preview: msgStr.slice(0, 80)
+                });
+                void updateS0Stats("sanitise");
+                recordDetection(sessionKey, "S0", "onUserMessage", `Injection sanitised (score ${Math.round(injResult.score)})`);
+                event.prompt = injResult.sanitised;
+              }
+            } catch (err) {
+              const msg = String(err);
+              api.logger.warn(`[GuardClaw S0] CATCH: ${msg}`);
+              if (msg.includes("[GuardClaw S0] Message blocked")) throw err;
+              api.logger.warn(`[GuardClaw S0] Detection error (non-fatal): ${msg}`);
             }
-          } catch (err) {
-            const msg = String(err);
-            if (msg.includes("[GuardClaw S0] Message blocked")) throw err;
-            api.logger.warn(`[GuardClaw S0] Detection error (non-fatal): ${msg}`);
           }
         }
       }
@@ -2992,11 +3210,18 @@ ${GUARDCLAW_S2_CLOSE}`
       api.logger.error(`[GuardClaw] Error in before_agent_start hook: ${String(err)}`);
     }
   });
-  api.on("message_received", async (event, _ctx) => {
+  api.on("message_received", async (event, ctx) => {
     try {
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
       api.logger.info?.(`[GuardClaw] Message received from ${event.from ?? "unknown"}`);
+      const msgText = String(event.message ?? event.content ?? "");
+      const envelopeMatch = msgText.match(/"sender_id"\s*:\s*"(\d+)"/);
+      const senderId = envelopeMatch?.[1] ?? event.metadata?.senderId ?? (typeof event.from === "string" && /^\d+$/.test(event.from) ? event.from : void 0);
+      if (senderId && ctx.channelId) {
+        setLastSenderId(ctx.channelId, senderId);
+        api.logger.debug?.(`[GuardClaw S0] Stashed senderId=${senderId} for channel=${ctx.channelId}`);
+      }
     } catch {
     }
   });
@@ -3061,9 +3286,31 @@ function isHighRiskExecCommand(command) {
 function shouldSkipMessage(msg) {
   if (msg.includes("[REDACTED:") || msg.startsWith("[SYSTEM]")) return true;
   if (/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(msg)) return true;
-  if (msg.includes("conversation_label") && msg.includes("sender_id")) return true;
-  if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata")) return true;
+  if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata") && !extractUserContent(msg)) return true;
   return false;
+}
+function extractUserContent(msg) {
+  if (!msg.includes("conversation_label") && !msg.includes("sender_id")) {
+    return msg;
+  }
+  const lastJsonBlockEnd = msg.lastIndexOf("```\n\n");
+  if (lastJsonBlockEnd !== -1) {
+    const afterBlock = msg.slice(lastJsonBlockEnd + 5).trim();
+    if (afterBlock.length > 0) return afterBlock;
+  }
+  const senderBlockMatch = msg.match(/```\s*\n\s*\n([^`]+)$/);
+  if (senderBlockMatch && senderBlockMatch[1].trim()) {
+    return senderBlockMatch[1].trim();
+  }
+  const paragraphs = msg.split(/\n\n+/);
+  for (let i = paragraphs.length - 1; i >= 0; i--) {
+    const p = paragraphs[i].trim();
+    if (p.startsWith("```") || p.startsWith("{") || p.startsWith("[Thread") || p.includes("conversation_label") || p.includes("sender_id") || p.startsWith("Conversation info") || p.startsWith("Sender")) {
+      continue;
+    }
+    if (p.length > 0) return p;
+  }
+  return "";
 }
 function extractMessageText(msg) {
   if (typeof msg === "string") return msg;
@@ -3132,7 +3379,7 @@ async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, i
   const absPath = path3.isAbsolute(writePath) ? writePath : path3.resolve(workspaceDir, rel);
   let content;
   try {
-    content = await fs3.promises.readFile(absPath, "utf-8");
+    content = await fs4.promises.readFile(absPath, "utf-8");
   } catch {
     return;
   }
@@ -3146,15 +3393,15 @@ async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, i
     return;
   }
   const fullAbsPath = path3.resolve(workspaceDir, fullRelPath);
-  await fs3.promises.mkdir(path3.dirname(fullAbsPath), { recursive: true });
+  await fs4.promises.mkdir(path3.dirname(fullAbsPath), { recursive: true });
   const fullContent = isGuardSession ? `${GUARD_SECTION_BEGIN}
 ${content}
 ${GUARD_SECTION_END}` : content;
-  await fs3.promises.writeFile(fullAbsPath, fullContent, "utf-8");
+  await fs4.promises.writeFile(fullAbsPath, fullContent, "utf-8");
   const memMgr = getDefaultMemoryManager();
   const redacted = await memMgr.redactContentPublic(content, privacyConfig);
   if (redacted !== content) {
-    await fs3.promises.writeFile(absPath, redacted, "utf-8");
+    await fs4.promises.writeFile(absPath, redacted, "utf-8");
     logger.info(`[GuardClaw] Memory dual-write: ${rel} \u2192 ${fullRelPath} (redacted clean copy)`);
   } else {
     logger.info(`[GuardClaw] Memory dual-write: ${rel} \u2192 ${fullRelPath} (no PII found)`);
@@ -3898,6 +4145,13 @@ function createConfigurableRouter(id) {
 
 // src/stats-dashboard.ts
 var GUARDCLAW_CONFIG_PATH2 = join4(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+var CENTRASE_LOGO_B64 = (() => {
+  try {
+    return readFileSync2("/Users/centraseai/.openclaw/workspace/reference/centrase/brand/Centrase_Logo_dark_bg.png").toString("base64");
+  } catch {
+    return "";
+  }
+})();
 function saveGuardClawConfig(privacy) {
   try {
     const dir = join4(process.env.HOME ?? "/tmp", ".openclaw");
@@ -4285,6 +4539,41 @@ async function statsHttpHandler(req, res) {
     json(res, result, result.ok ? 200 : 400);
     return true;
   }
+  if (req.method === "GET" && sub === "/api/banned") {
+    try {
+      const raw = readFileSync2(GUARDCLAW_CONFIG_PATH2, "utf-8");
+      const cfg = JSON.parse(raw);
+      const banned = cfg.injection?.banned_senders ?? [];
+      json(res, { banned });
+    } catch {
+      json(res, { banned: [] });
+    }
+    return true;
+  }
+  if (req.method === "POST" && sub === "/api/unban") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      if (!body.senderId) {
+        json(res, { error: "senderId required" }, 400);
+        return true;
+      }
+      let cfg = {};
+      try {
+        cfg = JSON.parse(readFileSync2(GUARDCLAW_CONFIG_PATH2, "utf-8"));
+      } catch {
+      }
+      if (!cfg.injection) cfg.injection = {};
+      const inj = cfg.injection;
+      const banned = inj.banned_senders ?? [];
+      inj.banned_senders = banned.filter((id) => id !== body.senderId);
+      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), "utf-8");
+      updateLiveInjectionConfig({ banned_senders: inj.banned_senders });
+      json(res, { ok: true });
+    } catch (err) {
+      json(res, { error: String(err) }, 400);
+    }
+    return true;
+  }
   return false;
 }
 function dashboardHtml() {
@@ -4296,11 +4585,14 @@ function dashboardHtml() {
 <title>GuardClaw Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  :root{--bg-body:#ffffff;--bg-surface:#f9f9fa;--bg-card:#ffffff;--bg-input:#eff1f5;--text-primary:#1a1a1a;--text-secondary:#6e6e80;--text-tertiary:#9ca3af;--border-subtle:#e5e5e5;--accent:#2563eb;--accent-hover:#1d4ed8;--radius-sm:6px;--radius-md:12px;--radius-lg:16px;--shadow-sm:0 1px 2px 0 rgba(0,0,0,.05);--shadow-card:0 2px 8px rgba(0,0,0,.04);--shadow-float:0 10px 15px -3px rgba(0,0,0,.08),0 4px 6px -2px rgba(0,0,0,.04);--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;--font-mono:'JetBrains Mono','SFMono-Regular',ui-monospace,monospace}
+  :root{--bg-body:#3D4246;--bg-surface:#353a3e;--bg-card:#2a2e32;--bg-input:#3a3f44;--text-primary:#f0f0f0;--text-secondary:#a8b0b8;--text-tertiary:#6b7280;--border-subtle:#4a5058;--accent:#8DC63F;--accent-hover:#7ab032;--accent2:#006837;--radius-sm:6px;--radius-md:12px;--radius-lg:16px;--shadow-sm:0 1px 2px 0 rgba(0,0,0,.2);--shadow-card:0 2px 8px rgba(0,0,0,.2);--shadow-float:0 10px 15px -3px rgba(0,0,0,.3),0 4px 6px -2px rgba(0,0,0,.2);--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;--font-mono:'JetBrains Mono','SFMono-Regular',ui-monospace,monospace}
   *{margin:0;padding:0;box-sizing:border-box}
   body{font-family:var(--font-sans);background:var(--bg-surface);color:var(--text-primary);min-height:100vh;-webkit-font-smoothing:antialiased;line-height:1.6}
 
-  .header{padding:12px 24px;background:rgba(255,255,255,.85);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+  .header{padding:12px 24px;background:#2a2e32;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:2px solid var(--accent2);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+  .header-logo{height:36px;width:auto;display:block}
+  .header-brand{display:flex;flex-direction:column;gap:1px}
+  .header-subtitle{font-size:11px;font-weight:600;color:#fff;letter-spacing:.08em;text-transform:uppercase;opacity:.85}
   .header-left{display:flex;align-items:center;gap:14px}
   .header h1{font-size:18px;font-weight:700;letter-spacing:-.01em;color:var(--text-primary)}
   .header-right{display:flex;align-items:center;gap:14px;font-size:12px;color:var(--text-tertiary)}
@@ -4324,11 +4616,11 @@ function dashboardHtml() {
   .card-label{font-size:11px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-bottom:6px}
   .card-value{font-size:24px;font-weight:700;letter-spacing:-.02em;color:var(--text-primary)}
   .card-sub{font-size:11px;color:var(--text-tertiary);margin-top:4px}
-  .card.cloud .card-value{color:#2563eb}
-  .card.local .card-value{color:#059669}
-  .card.proxy .card-value{color:#d97706}
-  .card.privacy .card-value{color:#7c3aed}
-  .card.cost .card-value{color:#dc2626}
+  .card.cloud .card-value{color:#3b82f6}
+  .card.local .card-value{color:#8DC63F}
+  .card.proxy .card-value{color:#f59e0b}
+  .card.privacy .card-value{color:#a78bfa}
+  .card.cost .card-value{color:#ef4444}
 
   .chart-wrap{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:16px 18px;margin-bottom:20px;box-shadow:var(--shadow-sm)}
   .chart-wrap h3{font-size:12px;color:var(--text-secondary);font-weight:600;margin-bottom:10px}
@@ -4338,15 +4630,16 @@ function dashboardHtml() {
   .data-table th{background:var(--bg-surface);color:var(--text-secondary);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
   .data-table th:first-child,.data-table td:first-child{text-align:left}
   .data-table tr:not(:last-child) td{border-bottom:1px solid var(--border-subtle)}
-  .data-table tbody tr:hover{background:rgba(37,99,235,.02)}
+  .data-table tbody tr:hover{background:rgba(141,198,63,.05)}
   #detections-panel .data-table th,#detections-panel .data-table td{text-align:left}
 
   .info-bar{display:flex;gap:24px;padding:14px 0;font-size:12px;color:var(--text-tertiary)}
 
   .level-tag{display:inline-block;font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px}
-  .level-S1{background:rgba(37,99,235,.08);color:#2563eb}
-  .level-S2{background:rgba(217,119,6,.08);color:#d97706}
-  .level-S3{background:rgba(5,150,105,.08);color:#059669}
+  .level-S0{background:rgba(239,68,68,.15);color:#ef4444}
+  .level-S1{background:rgba(59,130,246,.15);color:#3b82f6}
+  .level-S2{background:rgba(245,158,11,.15);color:#f59e0b}
+  .level-S3{background:rgba(141,198,63,.15);color:#8DC63F}
   .checkpoint-tag{font-size:11px;padding:3px 8px;border-radius:99px;background:var(--bg-input);color:var(--text-secondary);font-weight:500}
   .session-key{font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)}
 
@@ -4354,7 +4647,7 @@ function dashboardHtml() {
 
   .filter-bar{display:flex;gap:8px;margin-bottom:18px}
   .filter-btn{padding:7px 16px;border-radius:99px;border:1px solid var(--border-subtle);background:var(--bg-card);color:var(--text-secondary);cursor:pointer;font-size:12px;font-weight:500;transition:all .15s}
-  .filter-btn.active{background:var(--text-primary);color:#fff;border-color:var(--text-primary)}
+  .filter-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
   .filter-btn:hover{border-color:#d1d5db;color:var(--text-primary)}
 
   .config-section{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:18px 20px;margin-bottom:14px;box-shadow:var(--shadow-sm)}
@@ -4365,7 +4658,7 @@ function dashboardHtml() {
   .field input[type=radio]{width:auto;padding:0;background:transparent;border:none;border-radius:0;flex-shrink:0;cursor:pointer;accent-color:var(--accent,#4f9cf9)}
   .field select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236e6e80' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;padding-right:36px}
   .field input:hover,.field select:hover{background:#eaecf1}
-  .field input:focus,.field select:focus{background:#fff;border-color:transparent;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .field input:focus,.field select:focus{background:#3a3f44;border-color:var(--accent);box-shadow:0 0 0 3px rgba(141,198,63,.2)}
 
   .tag-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;min-height:32px}
   .tag{background:var(--bg-input);color:var(--text-primary);padding:5px 12px;border-radius:99px;font-size:12px;font-weight:500;display:flex;align-items:center;gap:6px;border:1px solid var(--border-subtle)}
@@ -4375,15 +4668,15 @@ function dashboardHtml() {
   .add-row input{flex:1;min-width:0}
 
   .btn{padding:10px 20px;border-radius:var(--radius-sm);border:none;cursor:pointer;font-size:13px;font-weight:500;transition:all .15s;white-space:nowrap;flex-shrink:0}
-  .btn-primary{background:var(--text-primary);color:#fff}
-  .btn-primary:hover{background:#333}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-primary:hover{background:var(--accent-hover)}
   .btn-sm{padding:8px 16px;font-size:12px}
   .btn-outline{background:var(--bg-card);border:1px solid var(--border-subtle);color:var(--text-primary)}
   .btn-outline:hover{border-color:#d1d5db;background:var(--bg-surface)}
   .save-bar{display:flex;justify-content:flex-end;gap:10px;padding-top:14px;margin-top:10px}
 
   .badge{display:inline-block;font-size:10px;padding:3px 8px;border-radius:99px;margin-left:8px;vertical-align:middle;font-weight:600}
-  .badge-hot{background:rgba(5,150,105,.1);color:#059669}
+  .badge-hot{background:rgba(141,198,63,.15);color:#8DC63F}
 
   .toast{position:fixed;bottom:24px;right:24px;background:var(--text-primary);color:#fff;padding:14px 22px;border-radius:var(--radius-md);font-size:13px;font-weight:500;display:none;z-index:100;box-shadow:0 12px 40px rgba(0,0,0,.15)}
   .toast.error{background:#dc2626}
@@ -4404,7 +4697,7 @@ function dashboardHtml() {
 
   .chip-group{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
   .chip{padding:7px 14px;border-radius:99px;font-size:12px;cursor:pointer;border:1px solid var(--border-subtle);background:var(--bg-card);color:var(--text-secondary);font-weight:500;transition:all .15s}
-  .chip.active{background:var(--text-primary);color:#fff;border-color:var(--text-primary)}
+  .chip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
   .chip:hover{border-color:#d1d5db;color:var(--text-primary)}
 
   .router-card{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:16px;margin-bottom:10px;transition:border-color .15s}
@@ -4422,7 +4715,7 @@ function dashboardHtml() {
 
   .prompt-editor{width:100%;min-height:200px;padding:16px 18px;background:var(--bg-input);border:1px solid transparent;border-radius:var(--radius-md);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;line-height:1.6;resize:vertical;outline:none;tab-size:2;transition:all .15s}
   .prompt-editor:hover{background:#eaecf1}
-  .prompt-editor:focus{background:#fff;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .prompt-editor:focus{background:#3a3f44;box-shadow:0 0 0 3px rgba(141,198,63,.2)}
   .prompt-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
   .prompt-header h4{font-size:13px;color:var(--text-primary);font-weight:600}
   .prompt-actions{display:flex;gap:6px}
@@ -4431,7 +4724,7 @@ function dashboardHtml() {
   .test-panel{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:18px 20px;margin-bottom:14px;box-shadow:var(--shadow-sm)}
   .test-input{width:100%;min-height:80px;padding:14px 16px;background:var(--bg-input);border:1px solid transparent;border-radius:var(--radius-md);color:var(--text-primary);font-size:13px;resize:vertical;outline:none;transition:all .15s}
   .test-input:hover{background:#eaecf1}
-  .test-input:focus{background:#fff;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .test-input:focus{background:#3a3f44;box-shadow:0 0 0 3px rgba(141,198,63,.2)}
   .test-result{margin-top:18px;padding:18px 20px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle);display:none}
   .test-result.visible{display:block}
   .test-result-row{display:flex;justify-content:space-between;padding:10px 0;font-size:13px;border-bottom:1px solid var(--border-subtle)}
@@ -4485,15 +4778,18 @@ function dashboardHtml() {
 
   ::-webkit-scrollbar{width:6px;height:6px}
   ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:3px}
-  ::-webkit-scrollbar-thumb:hover{background:#9ca3af}
+  ::-webkit-scrollbar-thumb{background:#4a5058;border-radius:3px}
+  ::-webkit-scrollbar-thumb:hover{background:#6b7280}
 </style>
 </head>
 <body>
 
 <div class="header">
   <div class="header-left">
-    <h1 data-i18n="header.title">GuardClaw Dashboard</h1>
+    <img class="header-logo" src="data:image/png;base64,${CENTRASE_LOGO_B64}" alt="Centrase">
+    <div class="header-brand">
+      <span class="header-subtitle">GuardClaw</span>
+    </div>
   </div>
   <div class="header-right">
     <span class="status-dot warn" id="status-dot"></span>
@@ -4510,6 +4806,7 @@ function dashboardHtml() {
   <div class="tab" data-tab="detections" data-i18n="tab.detections">Detection Log</div>
   <div class="tab" data-tab="rules"><span data-i18n="tab.rules">Router Rules</span> <span class="badge badge-hot">live</span></div>
   <div class="tab" data-tab="config"><span data-i18n="tab.config">Configuration</span> <span class="badge badge-hot">live</span></div>
+  <div class="tab" data-tab="banned">Banned Senders</div>
 </div>
 
 <!-- Overview -->
@@ -4572,6 +4869,7 @@ function dashboardHtml() {
 <div id="detections-panel" class="panel">
   <div class="filter-bar">
     <button class="filter-btn active" onclick="filterDetections('all',this)" data-i18n="det.all">All</button>
+    <button class="filter-btn" onclick="filterDetections('S0',this)">S0</button>
     <button class="filter-btn" onclick="filterDetections('S1',this)">S1</button>
     <button class="filter-btn" onclick="filterDetections('S2',this)">S2</button>
     <button class="filter-btn" onclick="filterDetections('S3',this)">S3</button>
@@ -4580,6 +4878,18 @@ function dashboardHtml() {
     <thead><tr><th data-i18n="det.time">Time</th><th data-i18n="det.session">Session</th><th data-i18n="det.level">Level</th><th data-i18n="det.checkpoint">Checkpoint</th><th data-i18n="det.reason">Reason</th></tr></thead>
     <tbody id="detections-body"><tr><td colspan="5" class="empty-state" data-i18n="det.empty">No detections yet</td></tr></tbody>
   </table>
+</div>
+
+<!-- Banned Senders -->
+<div id="banned-panel" class="panel">
+  <div class="config-section">
+    <h3 style="color:#ef4444">Banned Senders</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Senders that have been automatically banned after 2+ injection attempts. They are blocked immediately before any detection runs.</p>
+    <table class="data-table" id="banned-table">
+      <thead><tr><th>Sender ID</th><th style="text-align:right">Action</th></tr></thead>
+      <tbody id="banned-body"><tr><td colspan="2" class="empty-state">No banned senders</td></tr></tbody>
+    </table>
+  </div>
 </div>
 
 <!-- Router Rules -->
@@ -6058,6 +6368,45 @@ function refreshAll() {
   refreshStats();
   refreshSessions();
   refreshDetections();
+  refreshBanned();
+}
+
+// \u2500\u2500 Banned Senders \u2500\u2500
+
+async function refreshBanned() {
+  try {
+    var data = await fetch(BASE + '/banned').then(function(r) { return r.json(); });
+    var tbody = document.getElementById('banned-body');
+    if (!tbody) return;
+    var banned = data.banned || [];
+    if (banned.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="2" class="empty-state">No banned senders</td></tr>';
+      return;
+    }
+    tbody.innerHTML = banned.map(function(id) {
+      return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
+        '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="unbanSender(\\'' + escHtml(id) + '\\')">Unban</button></td></tr>';
+    }).join('');
+  } catch (e) { /* non-critical */ }
+}
+
+async function unbanSender(senderId) {
+  try {
+    var res = await fetch(BASE + '/unban', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ senderId: senderId }),
+    });
+    var result = await res.json();
+    if (result.ok) {
+      showToast('Unbanned: ' + senderId);
+      refreshBanned();
+    } else {
+      showToast('Unban failed: ' + (result.error || 'unknown'), true);
+    }
+  } catch (e) {
+    showToast('Unban failed: ' + e.message, true);
+  }
 }
 
 // \u2500\u2500 Prompt Editors \u2500\u2500

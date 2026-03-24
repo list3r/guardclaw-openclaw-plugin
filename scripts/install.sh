@@ -2,21 +2,34 @@
 set -euo pipefail
 
 # GuardClaw Install Script
-# Usage: bash scripts/install.sh [--install-dir /path] [--no-restart]
+# Usage: bash scripts/install.sh [--install-dir /path] [--no-restart] [--recover]
 #
-# Default install dir: /opt/guardclaw
+# Default install dir: ~/guardclaw-plugin (safe from OpenClaw updates)
 # The script expects to be run from the cloned repo root:
-#   git clone https://github.com/list3r/guardclaw-openclaw-plugin /opt/guardclaw
-#   cd /opt/guardclaw && bash scripts/install.sh
+#   git clone https://github.com/list3r/guardclaw-openclaw-plugin ~/guardclaw-plugin
+#   cd ~/guardclaw-plugin && bash scripts/install.sh
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/guardclaw}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/guardclaw-plugin}"
 RESTART_GATEWAY=true
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --install-dir) INSTALL_DIR="$2"; shift 2 ;;
     --no-restart) RESTART_GATEWAY=false; shift ;;
-    --help) echo "Usage: bash scripts/install.sh [--install-dir /path] [--no-restart]"; exit 0 ;;
+    --recover)
+      # Shortcut: run the recovery script instead
+      SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      exec bash "$SCRIPT_DIR/recover.sh"
+      ;;
+    --help)
+      echo "Usage: bash scripts/install.sh [--install-dir /path] [--no-restart] [--recover]"
+      echo ""
+      echo "Options:"
+      echo "  --install-dir DIR   Install location (default: ~/guardclaw-plugin)"
+      echo "  --no-restart        Skip gateway restart after install"
+      echo "  --recover           Fix broken state after an OpenClaw update"
+      exit 0
+      ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done

@@ -9,7 +9,8 @@ var guardClawConfigSchema = Type.Object({
       sanitise_threshold: Type.Optional(Type.Number()),
       alert_channel: Type.Optional(Type.String()),
       exempt_sources: Type.Optional(Type.Array(Type.String())),
-      exempt_senders: Type.Optional(Type.Array(Type.String()))
+      exempt_senders: Type.Optional(Type.Array(Type.String())),
+      banned_senders: Type.Optional(Type.Array(Type.String()))
     })
   ),
   privacy: Type.Optional(
@@ -225,7 +226,8 @@ var defaultInjectionConfig = {
   sanitise_threshold: 30,
   alert_channel: "1483608914774986943",
   exempt_sources: [],
-  exempt_senders: ["1317396442993922061"]
+  exempt_senders: ["1317396442993922061"],
+  banned_senders: []
 };
 
 // src/live-config.ts
@@ -268,6 +270,9 @@ function getLiveInjectionConfig() {
 }
 function updateLiveConfig(patch) {
   liveConfig = mergeConfig({ ...liveConfig, ...patch });
+}
+function updateLiveInjectionConfig(patch) {
+  liveInjectionConfig = { ...liveInjectionConfig, ...patch };
 }
 function mergeConfig(userConfig) {
   return {
@@ -508,6 +513,16 @@ function clearActiveLocalRouting(sessionKey) {
 }
 function isActiveLocalRouting(sessionKey) {
   return activeLocalRouting.has(sessionKey);
+}
+var pendingSenderIds = /* @__PURE__ */ new Map();
+function setLastSenderId(channelId, senderId) {
+  if (channelId && senderId) pendingSenderIds.set(channelId, senderId);
+}
+function getLastSenderId(channelId) {
+  return pendingSenderIds.get(channelId);
+}
+function clearLastSenderId(channelId) {
+  pendingSenderIds.delete(channelId);
 }
 function getHigherLevel(a, b) {
   const order = { S1: 1, S2: 2, S3: 3 };
@@ -1784,11 +1799,15 @@ export {
   setActiveLocalRouting,
   clearActiveLocalRouting,
   isActiveLocalRouting,
+  setLastSenderId,
+  getLastSenderId,
+  clearLastSenderId,
   initLiveConfig,
   watchConfigFile,
   getLiveConfig,
   getLiveInjectionConfig,
   updateLiveConfig,
+  updateLiveInjectionConfig,
   TokenStatsCollector,
   setGlobalCollector,
   getGlobalCollector,

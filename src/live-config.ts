@@ -67,6 +67,11 @@ export function updateLiveConfig(patch: Partial<PrivacyConfig>): void {
   liveConfig = mergeConfig({ ...liveConfig, ...patch });
 }
 
+/** Hot-update the live injection config. Called after auto-ban. */
+export function updateLiveInjectionConfig(patch: Partial<InjectionConfig>): void {
+  liveInjectionConfig = { ...liveInjectionConfig, ...patch };
+}
+
 function mergeConfig(userConfig: PrivacyConfig): PrivacyConfig {
   return {
     ...defaultPrivacyConfig,

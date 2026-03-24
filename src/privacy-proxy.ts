@@ -16,9 +16,11 @@
  */
 
 import * as http from "node:http";
+import * as fs from "node:fs";
 import { redactSensitiveInfo } from "./utils.js";
-import { getLiveConfig } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig } from "./live-config.js";
 import { getProviderForModel } from "./provider.js";
+import { detectInjection } from "./injection/index.js";
 
 // ── Marker protocol ──
 
@@ -64,6 +66,38 @@ const _providerCleanupInterval = setInterval(cleanupStaleProviderTargets, 60_000
 if (typeof _providerCleanupInterval === "object" && "unref" in _providerCleanupInterval) {
   (_providerCleanupInterval as NodeJS.Timeout).unref();
 }
+
+// ── Injection detection support ──
+
+const GUARDCLAW_INJECTIONS_PATH = "/Users/centraseai/.openclaw/guardclaw-injections.json";
+const GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+
+interface ProxyInjectionEntry {
+  ts: string;
+  session: string;
+  senderId?: string;
+  action: "block" | "sanitise";
+  score: number;
+  patterns: string[];
+  source: string;
+  preview: string;
+}
+
+async function appendProxyInjectionLog(entry: ProxyInjectionEntry): Promise<void> {
+  try {
+    let entries: ProxyInjectionEntry[] = [];
+    try {
+      const raw = await fs.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
+      entries = JSON.parse(raw) as ProxyInjectionEntry[];
+      if (!Array.isArray(entries)) entries = [];
+    } catch { /* first run or missing file */ }
+    entries.push(entry);
+    if (entries.length > 200) entries = entries.slice(entries.length - 200);
+    await fs.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
+  } catch { /* best-effort */ }
+}
+
+const proxyInjectionAttemptCounts = new Map<string, number>();
 
 /**
  * Fallback: read from a global default set during plugin registration.
@@ -543,6 +577,112 @@ export async function startPrivacyProxy(
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: `Invalid JSON: ${String(parseErr)}`, type: "invalid_request" } }));
         return;
+      }
+
+      // S0: Prompt injection detection — runs on raw user content before S2 marker stripping
+      const injectionCfg = getLiveInjectionConfig();
+      if (injectionCfg.enabled !== false) {
+        const proxyMessages = parsed.messages as Array<Record<string, unknown>> | undefined;
+        log.info(`[GuardClaw S0] messages=${proxyMessages ? proxyMessages.length : 'undefined'} keys=${Object.keys(parsed).join(',')}`);
+        const lastUserMsg = proxyMessages?.slice().reverse().find(m => String(m.role ?? "") === "user");
+        log.info(`[GuardClaw S0] lastUserMsg role=${lastUserMsg?.role} contentType=${typeof lastUserMsg?.content}`);
+        let userContent = "";
+        if (lastUserMsg) {
+          if (typeof lastUserMsg.content === "string") {
+            userContent = lastUserMsg.content;
+          } else if (Array.isArray(lastUserMsg.content)) {
+            // Anthropic content blocks: [{type:"text", text:"..."}, {type:"tool_use",...}]
+            // Also handle: [{type:"text", content:"..."}, plain strings, nested arrays
+            userContent = (lastUserMsg.content as Array<unknown>)
+              .map(p => {
+                if (typeof p === "string") return p;
+                if (p && typeof p === "object") {
+                  const block = p as Record<string, unknown>;
+                  if (typeof block.text === "string") return block.text;
+                  if (typeof block.content === "string") return block.content;
+                }
+                return "";
+              })
+              .join("");
+          }
+        }
+        log.info(`[GuardClaw S0] userContent length=${userContent.length} first80=${userContent.slice(0, 80).replace(/\n/g, "\\n")}`);
+
+        // Extract senderId: try header, then Discord envelope in content
+        let proxySenderId = req.headers["x-guardclaw-sender-id"] as string | undefined;
+        if (!proxySenderId && userContent) {
+          const m = userContent.match(/"sender_id"\s*:\s*"(\d+)"/);
+          if (m) proxySenderId = m[1];
+        }
+
+        // Auto-ban: block immediately if sender is already banned
+        if (proxySenderId && (injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
+          log.warn(`[GuardClaw S0] BANNED sender blocked in proxy: senderId=${proxySenderId}`);
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: `GuardClaw S0: Sender ${proxySenderId} is banned`, type: "forbidden" } }));
+          return;
+        }
+
+        const isExemptSender = proxySenderId && (injectionCfg.exempt_senders ?? []).includes(proxySenderId);
+        if (userContent && !isExemptSender) {
+          const proxyInjResult = await detectInjection(userContent, 'user_message', injectionCfg);
+          const proxySessionKey = req.headers["x-guardclaw-session"] as string | undefined ?? "proxy";
+          log.info(`[GuardClaw S0] detection result: action=${proxyInjResult.action} score=${proxyInjResult.score} matches=${proxyInjResult.matches.join(',')}`);
+          if (proxyInjResult.action === 'block') {
+            log.warn(`[GuardClaw S0] BLOCKED in proxy session=${proxySessionKey} score=${proxyInjResult.score} patterns=${proxyInjResult.matches.join(',')}`);
+            await appendProxyInjectionLog({
+              ts: new Date().toISOString(),
+              session: proxySessionKey,
+              senderId: proxySenderId,
+              action: 'block',
+              score: proxyInjResult.score,
+              patterns: proxyInjResult.matches,
+              source: 'proxy',
+              preview: userContent.slice(0, 80),
+            });
+            if (proxySenderId) {
+              const attempts = (proxyInjectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
+              proxyInjectionAttemptCounts.set(proxySenderId, attempts);
+              if (attempts >= 2 && !(injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
+                log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
+                const newBanned = [...(injectionCfg.banned_senders ?? []), proxySenderId];
+                updateLiveInjectionConfig({ banned_senders: newBanned });
+                fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8')
+                  .then((raw) => {
+                    const cfg = JSON.parse(raw) as Record<string, unknown>;
+                    if (!cfg.privacy) cfg.privacy = {};
+                    const privacy = cfg.privacy as Record<string, unknown>;
+                    if (!privacy.injection) privacy.injection = {};
+                    (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
+                    return fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+                  })
+                  .catch(() => {});
+              }
+            }
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: `GuardClaw S0: ${proxyInjResult.blocked_reason ?? 'Prompt injection detected'}`, type: "forbidden" } }));
+            return;
+          } else if (proxyInjResult.action === 'sanitise' && proxyInjResult.sanitised !== userContent && lastUserMsg) {
+            log.warn(`[GuardClaw S0] SANITISED in proxy session=${proxySessionKey}`);
+            await appendProxyInjectionLog({
+              ts: new Date().toISOString(),
+              session: proxySessionKey,
+              senderId: proxySenderId,
+              action: 'sanitise',
+              score: proxyInjResult.score,
+              patterns: proxyInjResult.matches,
+              source: 'proxy',
+              preview: userContent.slice(0, 80),
+            });
+            if (typeof lastUserMsg.content === "string") {
+              lastUserMsg.content = proxyInjResult.sanitised;
+            } else if (Array.isArray(lastUserMsg.content)) {
+              for (const part of lastUserMsg.content as Array<Record<string, unknown>>) {
+                if (typeof part.text === "string") { part.text = proxyInjResult.sanitised; break; }
+              }
+            }
+          }
+        }
       }
 
       // Step 1: Strip PII markers (supports both OpenAI and Google formats)

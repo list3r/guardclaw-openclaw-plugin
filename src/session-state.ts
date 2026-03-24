@@ -217,6 +217,27 @@ export function isActiveLocalRouting(sessionKey: string): boolean {
   return activeLocalRouting.has(sessionKey);
 }
 
+// ── Pending sender ID stash ──────────────────────────────────────────────
+// Stashes the Discord sender ID extracted in `message_received` (where the
+// raw envelope is still available) so `before_model_resolve` can look it up
+// after the envelope has been stripped from `prompt`.
+// Keyed by channelId (platform name, e.g. "discord") — the only key that is
+// present in both the message hook context and the agent hook context.
+
+const pendingSenderIds = new Map<string, string>();
+
+export function setLastSenderId(channelId: string, senderId: string): void {
+  if (channelId && senderId) pendingSenderIds.set(channelId, senderId);
+}
+
+export function getLastSenderId(channelId: string): string | undefined {
+  return pendingSenderIds.get(channelId);
+}
+
+export function clearLastSenderId(channelId: string): void {
+  pendingSenderIds.delete(channelId);
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 function getHigherLevel(a: SensitivityLevel, b: SensitivityLevel): SensitivityLevel {

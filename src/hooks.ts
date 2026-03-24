@@ -45,6 +45,9 @@ import {
   clearSessionState,
   isActiveLocalRouting,
   resetTurnLevel,
+  setLastSenderId,
+  getLastSenderId,
+  clearLastSenderId,
 } from "./session-state.js";
 import { detectByRules } from "./rules.js";
 import { isProtectedMemoryPath, redactSensitiveInfo, extractPathsFromParams, resolveDefaultBaseUrl } from "./utils.js";
@@ -55,7 +58,7 @@ import {
 } from "./privacy-proxy.js";
 import { getGlobalPipeline } from "./router-pipeline.js";
 import { getGlobalCollector } from "./token-stats.js";
-import { getLiveConfig, getLiveInjectionConfig } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig } from "./live-config.js";
 import { detectInjection, SECURITY_CHANNEL, formatBlockAlert } from "./injection/index.js";
 import { finalizeLoop } from "./loop-detection-level.js";
 import { recordFinalReply } from "./usage-intel.js";
@@ -115,9 +118,54 @@ function isToolAllowlisted(toolName: string): boolean {
 // Workspace dir cache — set from first hook that has PluginHookAgentContext
 let _cachedWorkspaceDir: string | undefined;
 
-const GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-stats.json";
+const GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/guardclaw-stats.json";
+const GUARDCLAW_INJECTIONS_PATH = "/Users/centraseai/.openclaw/guardclaw-injections.json";
 const GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
 const GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+
+// Injection attempt counter for auto-ban
+const injectionAttemptCounts = new Map<string, number>();
+
+interface InjectionEntry {
+  ts: string;
+  session: string;
+  senderId?: string;
+  action: "block" | "sanitise";
+  score: number;
+  patterns: string[];
+  source: string;
+  preview: string;
+}
+
+async function appendInjectionLog(entry: InjectionEntry): Promise<void> {
+  try {
+    let entries: InjectionEntry[] = [];
+    try {
+      const raw = await fs.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
+      entries = JSON.parse(raw) as InjectionEntry[];
+      if (!Array.isArray(entries)) entries = [];
+    } catch { /* first run or missing file */ }
+    entries.push(entry);
+    if (entries.length > 200) entries = entries.slice(entries.length - 200);
+    await fs.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
+  } catch { /* best-effort */ }
+}
+
+async function updateS0Stats(action: "block" | "sanitise"): Promise<void> {
+  try {
+    let stats: Record<string, unknown> = { s1Count: 0, s2Count: 0, s3Count: 0, totalMessages: 0, s3Policy: "local-only", lastUpdated: null };
+    try {
+      const raw = await fs.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+      Object.assign(stats, JSON.parse(raw));
+    } catch { /* first run */ }
+    if (!stats.s0 || typeof stats.s0 !== "object") stats.s0 = { blocked: 0, sanitised: 0, total: 0 };
+    const s0 = stats.s0 as Record<string, number>;
+    if (action === "block") s0.blocked = (s0.blocked ?? 0) + 1;
+    else s0.sanitised = (s0.sanitised ?? 0) + 1;
+    s0.total = (s0.total ?? 0) + 1;
+    await fs.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+  } catch { /* best-effort */ }
+}
 
 async function updateGuardclawStats(level: string): Promise<void> {
   try {
@@ -203,17 +251,79 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // ── S0: Prompt injection detection (runs before S1/S2/S3 pipeline) ──
       const injectionCfg = getLiveInjectionConfig();
       if (injectionCfg.enabled !== false) {
-        // Check if sender is exempt
-        const senderId = (ctx as Record<string, unknown>).senderId as string | undefined;
+        // Extract senderId: prefer ctx.senderId, then the value stashed by
+        // message_received (before the Discord envelope was stripped from prompt),
+        // then fall back to regex on the raw prompt string (rarely succeeds now).
+        let senderId = (ctx as Record<string, unknown>).senderId as string | undefined;
+        if (!senderId && ctx.channelId) {
+          senderId = getLastSenderId(ctx.channelId);
+          clearLastSenderId(ctx.channelId);
+        }
+        if (!senderId) {
+          // Tertiary fallback: envelope may still be present in some edge cases
+          const senderMatch = msgStr.match(/"sender_id"\s*:\s*"(\d+)"/);
+          if (senderMatch) senderId = senderMatch[1];
+        }
+        // Check if sender is banned (auto-block immediately, no detection needed)
+        const isBannedSender = senderId && (injectionCfg.banned_senders ?? []).includes(senderId);
+        if (isBannedSender) {
+          api.logger.warn(`[GuardClaw S0] BANNED sender blocked: senderId=${senderId} session=${sessionKey}`);
+          recordDetection(sessionKey, 'S0', 'onUserMessage', `Banned sender: ${senderId}`);
+          throw new Error(`[GuardClaw S0] Message blocked: Sender ${senderId} is banned`);
+        }
+
         const isExemptSender = senderId && (injectionCfg.exempt_senders ?? []).includes(senderId);
 
         if (!isExemptSender) {
+          // Extract actual user content from OpenClaw envelope (Discord/iMessage/Telegram)
+          const userContent = extractUserContent(msgStr);
+          if (!userContent) {
+            // No user content found — skip injection detection for pure metadata
+            api.logger.debug?.(`[GuardClaw S0] Skipping injection check — no user content extracted`);
+          } else {
           try {
-            const injResult = await detectInjection(msgStr, 'user_message', injectionCfg);
+            const injResult = await detectInjection(userContent, 'user_message', injectionCfg);
             if (injResult.action === 'block') {
               api.logger.warn(
                 `[GuardClaw S0] BLOCKED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(',')}`,
               );
+              await appendInjectionLog({
+                ts: new Date().toISOString(),
+                session: sessionKey,
+                senderId: senderId,
+                action: 'block',
+                score: injResult.score,
+                patterns: injResult.matches,
+                source: 'user_message',
+                preview: msgStr.slice(0, 80),
+              });
+              void updateS0Stats('block');
+              // Auto-ban logic: track injection attempts per senderId
+              if (senderId) {
+                const attempts = (injectionAttemptCounts.get(senderId) ?? 0) + 1;
+                injectionAttemptCounts.set(senderId, attempts);
+                if (attempts >= 2) {
+                  api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
+                  const currentBanned = injectionCfg.banned_senders ?? [];
+                  if (!currentBanned.includes(senderId)) {
+                    const newBanned = [...currentBanned, senderId];
+                    updateLiveInjectionConfig({ banned_senders: newBanned });
+                    // Persist to guardclaw.json (path: privacy.injection.banned_senders)
+                    fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8')
+                      .then((raw) => {
+                        const cfg = JSON.parse(raw) as Record<string, unknown>;
+                        if (!cfg.privacy) cfg.privacy = {};
+                        const privacy = cfg.privacy as Record<string, unknown>;
+                        if (!privacy.injection) privacy.injection = {};
+                        (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
+                        return fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+                      })
+                      .catch(() => {});
+                  }
+                }
+              }
+              // Record in session state so dashboard /api/detections picks it up
+              recordDetection(sessionKey, 'S0', 'onUserMessage', injResult.blocked_reason ?? 'Prompt injection detected');
               // Send alert to Discord security channel (best-effort, fire-and-forget)
               const alertChannel = injectionCfg.alert_channel ?? SECURITY_CHANNEL;
               const alertMsg = formatBlockAlert(injResult, 'user_message', msgStr);
@@ -227,17 +337,31 @@ export function registerHooks(api: OpenClawPluginApi): void {
               api.logger.warn(
                 `[GuardClaw S0] SANITISED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(',')}`,
               );
+              await appendInjectionLog({
+                ts: new Date().toISOString(),
+                session: sessionKey,
+                action: 'sanitise',
+                score: injResult.score,
+                patterns: injResult.matches,
+                source: 'user_message',
+                preview: msgStr.slice(0, 80),
+              });
+              void updateS0Stats('sanitise');
+              // Record in session state so dashboard /api/detections picks it up
+              recordDetection(sessionKey, 'S0', 'onUserMessage', `Injection sanitised (score ${Math.round(injResult.score)})`);
               // Replace the prompt with sanitised content for the rest of the pipeline
               (event as unknown as Record<string, unknown>).prompt = injResult.sanitised;
             }
           } catch (err) {
             // Re-throw block errors; swallow other S0 errors (non-fatal)
             const msg = String(err);
+            api.logger.warn(`[GuardClaw S0] CATCH: ${msg}`);
             if (msg.includes('[GuardClaw S0] Message blocked')) throw err;
             api.logger.warn(`[GuardClaw S0] Detection error (non-fatal): ${msg}`);
           }
-        }
-      }
+          } // close else (userContent found)
+        } // close !isExemptSender
+      } // close injection enabled
 
       // ── S3 fast path: rule-based pre-check ──────────────────────────
       // Rules are synchronous and deterministic. When they detect S3 we
@@ -1233,13 +1357,30 @@ export function registerHooks(api: OpenClawPluginApi): void {
   });
 
   // =========================================================================
-  // Hook 13: message_received — Observational logging
+  // Hook 13: message_received — Stash sender ID + observational logging
   // =========================================================================
-  api.on("message_received", async (event, _ctx) => {
+  api.on("message_received", async (event, ctx) => {
     try {
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
       api.logger.info?.(`[GuardClaw] Message received from ${event.from ?? "unknown"}`);
+
+      // Stash the sender ID now, while the raw envelope is still accessible.
+      // before_model_resolve fires next but by then the Discord envelope JSON
+      // has been stripped from `prompt`, so sender_id would be MISSING.
+      const msgText = String((event as unknown as Record<string, unknown>).message ?? (event as unknown as Record<string, unknown>).content ?? "");
+      // 1. Parse from raw Discord envelope JSON in message text (most reliable)
+      const envelopeMatch = msgText.match(/"sender_id"\s*:\s*"(\d+)"/);
+      // 2. Fallback: event.metadata?.senderId
+      // 3. Fallback: event.from if it's a numeric snowflake
+      const senderId =
+        envelopeMatch?.[1] ??
+        (event.metadata?.senderId as string | undefined) ??
+        (typeof event.from === "string" && /^\d+$/.test(event.from) ? event.from : undefined);
+      if (senderId && ctx.channelId) {
+        setLastSenderId(ctx.channelId, senderId);
+        api.logger.debug?.(`[GuardClaw S0] Stashed senderId=${senderId} for channel=${ctx.channelId}`);
+      }
     } catch { /* observational only */ }
   });
 
@@ -1321,12 +1462,50 @@ function isHighRiskExecCommand(command: string): string | null {
 function shouldSkipMessage(msg: string): boolean {
   if (msg.includes("[REDACTED:") || msg.startsWith("[SYSTEM]")) return true;
   if (/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(msg)) return true;
-  // Skip OpenClaw channel metadata envelopes (Discord/iMessage/Telegram routing metadata)
-  // These are injected by the channel bridge and contain sender IDs, timestamps, group info —
-  // not user content. Classifying them causes false positive S2 redaction of names/timestamps.
-  if (msg.includes("conversation_label") && msg.includes("sender_id")) return true;
-  if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata")) return true;
+  // Skip pure system events with no user content
+  if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata") && !extractUserContent(msg)) return true;
   return false;
+}
+
+/**
+ * Extract the actual user message content from OpenClaw envelope format.
+ * OpenClaw wraps Discord/iMessage/Telegram messages with JSON metadata blocks.
+ * This extracts just the user's text for injection detection.
+ */
+function extractUserContent(msg: string): string {
+  // If no envelope markers, return as-is
+  if (!msg.includes("conversation_label") && !msg.includes("sender_id")) {
+    return msg;
+  }
+  
+  // Pattern 1: Content after the last ```json...``` block
+  // Messages have structure: [Thread starter...]\n\nConversation info:\n```json\n{...}\n```\n\nSender:\n```json\n{...}\n```\n\n<actual message>
+  const lastJsonBlockEnd = msg.lastIndexOf("```\n\n");
+  if (lastJsonBlockEnd !== -1) {
+    const afterBlock = msg.slice(lastJsonBlockEnd + 5).trim();
+    if (afterBlock.length > 0) return afterBlock;
+  }
+  
+  // Pattern 2: Content after Sender metadata block (alternate format)
+  const senderBlockMatch = msg.match(/```\s*\n\s*\n([^`]+)$/);
+  if (senderBlockMatch && senderBlockMatch[1].trim()) {
+    return senderBlockMatch[1].trim();
+  }
+  
+  // Pattern 3: Just find the last non-JSON paragraph
+  const paragraphs = msg.split(/\n\n+/);
+  for (let i = paragraphs.length - 1; i >= 0; i--) {
+    const p = paragraphs[i].trim();
+    // Skip JSON blocks, metadata markers, thread starters
+    if (p.startsWith("```") || p.startsWith("{") || p.startsWith("[Thread") || 
+        p.includes("conversation_label") || p.includes("sender_id") ||
+        p.startsWith("Conversation info") || p.startsWith("Sender")) {
+      continue;
+    }
+    if (p.length > 0) return p;
+  }
+  
+  return "";
 }
 
 /**

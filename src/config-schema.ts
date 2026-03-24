@@ -16,6 +16,7 @@ export const guardClawConfigSchema = Type.Object({
       alert_channel: Type.Optional(Type.String()),
       exempt_sources: Type.Optional(Type.Array(Type.String())),
       exempt_senders: Type.Optional(Type.Array(Type.String())),
+      banned_senders: Type.Optional(Type.Array(Type.String())),
     }),
   ),
   privacy: Type.Optional(
@@ -245,4 +246,5 @@ export const defaultInjectionConfig = {
   alert_channel: "1483608914774986943",
   exempt_sources: [] as string[],
   exempt_senders: ["1317396442993922061"],
+  banned_senders: [] as string[],
 };

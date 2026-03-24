@@ -23,7 +23,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RouterPipeline } from "./router-pipeline.js";
-import { getLiveConfig, updateLiveConfig } from "./live-config.js";
+import { getLiveConfig, updateLiveConfig, updateLiveInjectionConfig } from "./live-config.js";
 import { DEFAULT_DETECTION_SYSTEM_PROMPT, DEFAULT_PII_EXTRACTION_PROMPT } from "./local-model.js";
 import {
   addCorrection,
@@ -50,6 +50,12 @@ import {
 } from "./usage-intel.js";
 
 const GUARDCLAW_CONFIG_PATH = join(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+
+const CENTRASE_LOGO_B64 = (() => {
+  try {
+    return readFileSync('/Users/centraseai/.openclaw/workspace/reference/centrase/brand/Centrase_Logo_dark_bg.png').toString('base64');
+  } catch { return ''; }
+})();
 
 function saveGuardClawConfig(privacy: Record<string, unknown>): void {
   try {
@@ -532,6 +538,42 @@ export async function statsHttpHandler(
     return true;
   }
 
+  if (req.method === "GET" && sub === "/api/banned") {
+    try {
+      const raw = readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8");
+      const cfg = JSON.parse(raw) as Record<string, unknown>;
+      const banned = ((cfg.injection as Record<string, unknown> | undefined)?.banned_senders ?? []) as string[];
+      json(res, { banned });
+    } catch {
+      json(res, { banned: [] });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && sub === "/api/unban") {
+    try {
+      const body = JSON.parse(await readBody(req)) as { senderId: string };
+      if (!body.senderId) {
+        json(res, { error: "senderId required" }, 400);
+        return true;
+      }
+      let cfg: Record<string, unknown> = {};
+      try {
+        cfg = JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8")) as Record<string, unknown>;
+      } catch { /* file may not exist */ }
+      if (!cfg.injection) cfg.injection = {};
+      const inj = cfg.injection as Record<string, unknown>;
+      const banned = (inj.banned_senders ?? []) as string[];
+      inj.banned_senders = banned.filter((id) => id !== body.senderId);
+      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
+      updateLiveInjectionConfig({ banned_senders: inj.banned_senders as string[] });
+      json(res, { ok: true });
+    } catch (err) {
+      json(res, { error: String(err) }, 400);
+    }
+    return true;
+  }
+
   return false;
 }
 
@@ -546,11 +588,14 @@ function dashboardHtml(): string {
 <title>GuardClaw Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  :root{--bg-body:#ffffff;--bg-surface:#f9f9fa;--bg-card:#ffffff;--bg-input:#eff1f5;--text-primary:#1a1a1a;--text-secondary:#6e6e80;--text-tertiary:#9ca3af;--border-subtle:#e5e5e5;--accent:#2563eb;--accent-hover:#1d4ed8;--radius-sm:6px;--radius-md:12px;--radius-lg:16px;--shadow-sm:0 1px 2px 0 rgba(0,0,0,.05);--shadow-card:0 2px 8px rgba(0,0,0,.04);--shadow-float:0 10px 15px -3px rgba(0,0,0,.08),0 4px 6px -2px rgba(0,0,0,.04);--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;--font-mono:'JetBrains Mono','SFMono-Regular',ui-monospace,monospace}
+  :root{--bg-body:#3D4246;--bg-surface:#353a3e;--bg-card:#2a2e32;--bg-input:#3a3f44;--text-primary:#f0f0f0;--text-secondary:#a8b0b8;--text-tertiary:#6b7280;--border-subtle:#4a5058;--accent:#8DC63F;--accent-hover:#7ab032;--accent2:#006837;--radius-sm:6px;--radius-md:12px;--radius-lg:16px;--shadow-sm:0 1px 2px 0 rgba(0,0,0,.2);--shadow-card:0 2px 8px rgba(0,0,0,.2);--shadow-float:0 10px 15px -3px rgba(0,0,0,.3),0 4px 6px -2px rgba(0,0,0,.2);--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;--font-mono:'JetBrains Mono','SFMono-Regular',ui-monospace,monospace}
   *{margin:0;padding:0;box-sizing:border-box}
   body{font-family:var(--font-sans);background:var(--bg-surface);color:var(--text-primary);min-height:100vh;-webkit-font-smoothing:antialiased;line-height:1.6}
 
-  .header{padding:12px 24px;background:rgba(255,255,255,.85);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+  .header{padding:12px 24px;background:#2a2e32;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:2px solid var(--accent2);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+  .header-logo{height:36px;width:auto;display:block}
+  .header-brand{display:flex;flex-direction:column;gap:1px}
+  .header-subtitle{font-size:11px;font-weight:600;color:#fff;letter-spacing:.08em;text-transform:uppercase;opacity:.85}
   .header-left{display:flex;align-items:center;gap:14px}
   .header h1{font-size:18px;font-weight:700;letter-spacing:-.01em;color:var(--text-primary)}
   .header-right{display:flex;align-items:center;gap:14px;font-size:12px;color:var(--text-tertiary)}
@@ -574,11 +619,11 @@ function dashboardHtml(): string {
   .card-label{font-size:11px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-bottom:6px}
   .card-value{font-size:24px;font-weight:700;letter-spacing:-.02em;color:var(--text-primary)}
   .card-sub{font-size:11px;color:var(--text-tertiary);margin-top:4px}
-  .card.cloud .card-value{color:#2563eb}
-  .card.local .card-value{color:#059669}
-  .card.proxy .card-value{color:#d97706}
-  .card.privacy .card-value{color:#7c3aed}
-  .card.cost .card-value{color:#dc2626}
+  .card.cloud .card-value{color:#3b82f6}
+  .card.local .card-value{color:#8DC63F}
+  .card.proxy .card-value{color:#f59e0b}
+  .card.privacy .card-value{color:#a78bfa}
+  .card.cost .card-value{color:#ef4444}
 
   .chart-wrap{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:16px 18px;margin-bottom:20px;box-shadow:var(--shadow-sm)}
   .chart-wrap h3{font-size:12px;color:var(--text-secondary);font-weight:600;margin-bottom:10px}
@@ -588,15 +633,16 @@ function dashboardHtml(): string {
   .data-table th{background:var(--bg-surface);color:var(--text-secondary);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
   .data-table th:first-child,.data-table td:first-child{text-align:left}
   .data-table tr:not(:last-child) td{border-bottom:1px solid var(--border-subtle)}
-  .data-table tbody tr:hover{background:rgba(37,99,235,.02)}
+  .data-table tbody tr:hover{background:rgba(141,198,63,.05)}
   #detections-panel .data-table th,#detections-panel .data-table td{text-align:left}
 
   .info-bar{display:flex;gap:24px;padding:14px 0;font-size:12px;color:var(--text-tertiary)}
 
   .level-tag{display:inline-block;font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px}
-  .level-S1{background:rgba(37,99,235,.08);color:#2563eb}
-  .level-S2{background:rgba(217,119,6,.08);color:#d97706}
-  .level-S3{background:rgba(5,150,105,.08);color:#059669}
+  .level-S0{background:rgba(239,68,68,.15);color:#ef4444}
+  .level-S1{background:rgba(59,130,246,.15);color:#3b82f6}
+  .level-S2{background:rgba(245,158,11,.15);color:#f59e0b}
+  .level-S3{background:rgba(141,198,63,.15);color:#8DC63F}
   .checkpoint-tag{font-size:11px;padding:3px 8px;border-radius:99px;background:var(--bg-input);color:var(--text-secondary);font-weight:500}
   .session-key{font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)}
 
@@ -604,7 +650,7 @@ function dashboardHtml(): string {
 
   .filter-bar{display:flex;gap:8px;margin-bottom:18px}
   .filter-btn{padding:7px 16px;border-radius:99px;border:1px solid var(--border-subtle);background:var(--bg-card);color:var(--text-secondary);cursor:pointer;font-size:12px;font-weight:500;transition:all .15s}
-  .filter-btn.active{background:var(--text-primary);color:#fff;border-color:var(--text-primary)}
+  .filter-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
   .filter-btn:hover{border-color:#d1d5db;color:var(--text-primary)}
 
   .config-section{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:18px 20px;margin-bottom:14px;box-shadow:var(--shadow-sm)}
@@ -615,7 +661,7 @@ function dashboardHtml(): string {
   .field input[type=radio]{width:auto;padding:0;background:transparent;border:none;border-radius:0;flex-shrink:0;cursor:pointer;accent-color:var(--accent,#4f9cf9)}
   .field select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236e6e80' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;padding-right:36px}
   .field input:hover,.field select:hover{background:#eaecf1}
-  .field input:focus,.field select:focus{background:#fff;border-color:transparent;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .field input:focus,.field select:focus{background:#3a3f44;border-color:var(--accent);box-shadow:0 0 0 3px rgba(141,198,63,.2)}
 
   .tag-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;min-height:32px}
   .tag{background:var(--bg-input);color:var(--text-primary);padding:5px 12px;border-radius:99px;font-size:12px;font-weight:500;display:flex;align-items:center;gap:6px;border:1px solid var(--border-subtle)}
@@ -625,15 +671,15 @@ function dashboardHtml(): string {
   .add-row input{flex:1;min-width:0}
 
   .btn{padding:10px 20px;border-radius:var(--radius-sm);border:none;cursor:pointer;font-size:13px;font-weight:500;transition:all .15s;white-space:nowrap;flex-shrink:0}
-  .btn-primary{background:var(--text-primary);color:#fff}
-  .btn-primary:hover{background:#333}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-primary:hover{background:var(--accent-hover)}
   .btn-sm{padding:8px 16px;font-size:12px}
   .btn-outline{background:var(--bg-card);border:1px solid var(--border-subtle);color:var(--text-primary)}
   .btn-outline:hover{border-color:#d1d5db;background:var(--bg-surface)}
   .save-bar{display:flex;justify-content:flex-end;gap:10px;padding-top:14px;margin-top:10px}
 
   .badge{display:inline-block;font-size:10px;padding:3px 8px;border-radius:99px;margin-left:8px;vertical-align:middle;font-weight:600}
-  .badge-hot{background:rgba(5,150,105,.1);color:#059669}
+  .badge-hot{background:rgba(141,198,63,.15);color:#8DC63F}
 
   .toast{position:fixed;bottom:24px;right:24px;background:var(--text-primary);color:#fff;padding:14px 22px;border-radius:var(--radius-md);font-size:13px;font-weight:500;display:none;z-index:100;box-shadow:0 12px 40px rgba(0,0,0,.15)}
   .toast.error{background:#dc2626}
@@ -654,7 +700,7 @@ function dashboardHtml(): string {
 
   .chip-group{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
   .chip{padding:7px 14px;border-radius:99px;font-size:12px;cursor:pointer;border:1px solid var(--border-subtle);background:var(--bg-card);color:var(--text-secondary);font-weight:500;transition:all .15s}
-  .chip.active{background:var(--text-primary);color:#fff;border-color:var(--text-primary)}
+  .chip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
   .chip:hover{border-color:#d1d5db;color:var(--text-primary)}
 
   .router-card{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:16px;margin-bottom:10px;transition:border-color .15s}
@@ -672,7 +718,7 @@ function dashboardHtml(): string {
 
   .prompt-editor{width:100%;min-height:200px;padding:16px 18px;background:var(--bg-input);border:1px solid transparent;border-radius:var(--radius-md);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;line-height:1.6;resize:vertical;outline:none;tab-size:2;transition:all .15s}
   .prompt-editor:hover{background:#eaecf1}
-  .prompt-editor:focus{background:#fff;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .prompt-editor:focus{background:#3a3f44;box-shadow:0 0 0 3px rgba(141,198,63,.2)}
   .prompt-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
   .prompt-header h4{font-size:13px;color:var(--text-primary);font-weight:600}
   .prompt-actions{display:flex;gap:6px}
@@ -681,7 +727,7 @@ function dashboardHtml(): string {
   .test-panel{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:18px 20px;margin-bottom:14px;box-shadow:var(--shadow-sm)}
   .test-input{width:100%;min-height:80px;padding:14px 16px;background:var(--bg-input);border:1px solid transparent;border-radius:var(--radius-md);color:var(--text-primary);font-size:13px;resize:vertical;outline:none;transition:all .15s}
   .test-input:hover{background:#eaecf1}
-  .test-input:focus{background:#fff;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .test-input:focus{background:#3a3f44;box-shadow:0 0 0 3px rgba(141,198,63,.2)}
   .test-result{margin-top:18px;padding:18px 20px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle);display:none}
   .test-result.visible{display:block}
   .test-result-row{display:flex;justify-content:space-between;padding:10px 0;font-size:13px;border-bottom:1px solid var(--border-subtle)}
@@ -735,15 +781,18 @@ function dashboardHtml(): string {
 
   ::-webkit-scrollbar{width:6px;height:6px}
   ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:3px}
-  ::-webkit-scrollbar-thumb:hover{background:#9ca3af}
+  ::-webkit-scrollbar-thumb{background:#4a5058;border-radius:3px}
+  ::-webkit-scrollbar-thumb:hover{background:#6b7280}
 </style>
 </head>
 <body>
 
 <div class="header">
   <div class="header-left">
-    <h1 data-i18n="header.title">GuardClaw Dashboard</h1>
+    <img class="header-logo" src="data:image/png;base64,${CENTRASE_LOGO_B64}" alt="Centrase">
+    <div class="header-brand">
+      <span class="header-subtitle">GuardClaw</span>
+    </div>
   </div>
   <div class="header-right">
     <span class="status-dot warn" id="status-dot"></span>
@@ -760,6 +809,7 @@ function dashboardHtml(): string {
   <div class="tab" data-tab="detections" data-i18n="tab.detections">Detection Log</div>
   <div class="tab" data-tab="rules"><span data-i18n="tab.rules">Router Rules</span> <span class="badge badge-hot">live</span></div>
   <div class="tab" data-tab="config"><span data-i18n="tab.config">Configuration</span> <span class="badge badge-hot">live</span></div>
+  <div class="tab" data-tab="banned">Banned Senders</div>
 </div>
 
 <!-- Overview -->
@@ -822,6 +872,7 @@ function dashboardHtml(): string {
 <div id="detections-panel" class="panel">
   <div class="filter-bar">
     <button class="filter-btn active" onclick="filterDetections('all',this)" data-i18n="det.all">All</button>
+    <button class="filter-btn" onclick="filterDetections('S0',this)">S0</button>
     <button class="filter-btn" onclick="filterDetections('S1',this)">S1</button>
     <button class="filter-btn" onclick="filterDetections('S2',this)">S2</button>
     <button class="filter-btn" onclick="filterDetections('S3',this)">S3</button>
@@ -830,6 +881,18 @@ function dashboardHtml(): string {
     <thead><tr><th data-i18n="det.time">Time</th><th data-i18n="det.session">Session</th><th data-i18n="det.level">Level</th><th data-i18n="det.checkpoint">Checkpoint</th><th data-i18n="det.reason">Reason</th></tr></thead>
     <tbody id="detections-body"><tr><td colspan="5" class="empty-state" data-i18n="det.empty">No detections yet</td></tr></tbody>
   </table>
+</div>
+
+<!-- Banned Senders -->
+<div id="banned-panel" class="panel">
+  <div class="config-section">
+    <h3 style="color:#ef4444">Banned Senders</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Senders that have been automatically banned after 2+ injection attempts. They are blocked immediately before any detection runs.</p>
+    <table class="data-table" id="banned-table">
+      <thead><tr><th>Sender ID</th><th style="text-align:right">Action</th></tr></thead>
+      <tbody id="banned-body"><tr><td colspan="2" class="empty-state">No banned senders</td></tr></tbody>
+    </table>
+  </div>
 </div>
 
 <!-- Router Rules -->
@@ -2308,6 +2371,45 @@ function refreshAll() {
   refreshStats();
   refreshSessions();
   refreshDetections();
+  refreshBanned();
+}
+
+// ── Banned Senders ──
+
+async function refreshBanned() {
+  try {
+    var data = await fetch(BASE + '/banned').then(function(r) { return r.json(); });
+    var tbody = document.getElementById('banned-body');
+    if (!tbody) return;
+    var banned = data.banned || [];
+    if (banned.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="2" class="empty-state">No banned senders</td></tr>';
+      return;
+    }
+    tbody.innerHTML = banned.map(function(id) {
+      return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
+        '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="unbanSender(\\'' + escHtml(id) + '\\')">Unban</button></td></tr>';
+    }).join('');
+  } catch (e) { /* non-critical */ }
+}
+
+async function unbanSender(senderId) {
+  try {
+    var res = await fetch(BASE + '/unban', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ senderId: senderId }),
+    });
+    var result = await res.json();
+    if (result.ok) {
+      showToast('Unbanned: ' + senderId);
+      refreshBanned();
+    } else {
+      showToast('Unban failed: ' + (result.error || 'unknown'), true);
+    }
+  } catch (e) {
+    showToast('Unban failed: ' + e.message, true);
+  }
 }
 
 // ── Prompt Editors ──
