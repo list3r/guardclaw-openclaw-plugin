@@ -99,17 +99,24 @@ GuardClaw uses a standalone config file: **`~/.openclaw/guardclaw.json`**
 
 Full schema with examples for all providers: [`config.example.json`](config.example.json)
 
-**Local model (detection + S3 processing):**
+**Local model (S1/S2 detection classifier):**
+
+> **Recommended:** `lfm2-8b-a1b` via [LM Studio](https://lmstudio.ai) — fast (~600ms), excellent JSON discipline, only ~4.3 GB VRAM. Do **not** use a reasoning model here (e.g. QwQ, DeepSeek-R1) — they break JSON parsing.
+
 ```json
 "localModel": {
   "enabled": true,
   "type": "openai-compatible",
-  "model": "qwen3.5:35b",
-  "endpoint": "http://localhost:11434"
+  "provider": "lmstudio",
+  "model": "lfm2-8b-a1b",
+  "endpoint": "http://localhost:1234"
 }
 ```
 
-**Guard agent (handles S3 locally):**
+**Guard agent (handles S3 content locally):**
+
+> **Recommended:** `qwen3.5:35b` via Ollama — strong reasoning for complex private content. Runs separately from the detection classifier, so VRAM is additive (~24 GB).
+
 ```json
 "guardAgent": {
   "id": "guard",
@@ -139,13 +146,17 @@ Full schema with examples for all providers: [`config.example.json`](config.exam
 
 ## Recommended Models
 
-| Role | Model | Notes |
-|------|-------|-------|
-| Detection classifier | LFM2-8B-A1B (MoE) | Best JSON discipline, ~30 token output, ~4.3 GB VRAM |
-| Embeddings (learning loop) | nomic-embed-text-v1.5 | 768-dim, fast, ~0.3 GB VRAM |
-| Guard agent (S3) | Qwen3.5:35B | Strong reasoning for financial/medical/legal tasks, ~20 GB VRAM |
+| Role | Model | Backend | Notes |
+|------|-------|---------|-------|
+| **S1/S2 Detection classifier** | `lfm2-8b-a1b` | LM Studio | ✅ Recommended. Fast (~600ms), strict JSON output, ~4.3 GB VRAM. Do not use reasoning models. |
+| **S3 Guard agent** | `qwen3.5:35b` | Ollama | Strong reasoning for private/confidential content. ~24 GB VRAM. |
+| Embeddings (learning loop) | `nomic-embed-text-v1.5` | Ollama | 768-dim, ~0.3 GB VRAM |
 
-All three run simultaneously on 32 GB+ VRAM (~25 GB total). Smaller guard agent alternatives (Llama 3.2:3B, Qwen2.5:7B) work for simple queries but degrade on multi-step private content.
+**Why separate models?**
+- Detection needs speed and JSON discipline — `lfm2-8b-a1b` is an MoE model with ~1B active parameters, purpose-built for classification tasks.
+- S3 guard agent needs reasoning depth — `qwen3.5:35b` handles complex private content (financial, medical, legal) that needs more than pattern matching.
+
+All three can run simultaneously on 32 GB+ unified memory. For 16 GB setups, see [s3Policy: redact-and-forward](#s3-policy) to skip the guard agent requirement.
 
 ---
 
