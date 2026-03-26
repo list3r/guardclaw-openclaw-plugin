@@ -304,11 +304,11 @@ openclaw gateway restart
 
 ## Attribution
 
-GuardClaw's S0 prompt injection detection layer is inspired by and builds upon
-[LLM Guard](https://github.com/protectai/llm-guard) by [Protect AI](https://protectai.com).
+**GuardClaw is built on [EdgeClaw](https://github.com/OpenBMB/EdgeClaw)**, the privacy extension developed by [OpenBMB](https://github.com/OpenBMB) / Tsinghua University researchers, licensed under MIT. The core plugin architecture, sensitivity detection pipeline, dual-track memory system, and privacy proxy originate from EdgeClaw. Centrase AI maintains this standalone package and has extended it with additional security hardening, prompt injection detection (S0 tier), a stats dashboard, guard session registry, and DeBERTa-based injection classification.
 
-LLM Guard is open source under the Apache 2.0 licence. We gratefully acknowledge
-their work in pioneering LLM security tooling.
+GuardClaw's S0 prompt injection detection layer also builds upon
+[LLM Guard](https://github.com/protectai/llm-guard) by [Protect AI](https://protectai.com),
+open source under the Apache 2.0 licence. We gratefully acknowledge their work in pioneering LLM security tooling.
 
 The injection classifier uses the
 [deberta-v3-base-prompt-injection-v2](https://huggingface.co/ProtectAI/deberta-v3-base-prompt-injection-v2)
