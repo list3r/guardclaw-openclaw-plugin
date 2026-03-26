@@ -235,10 +235,11 @@ import { readFileSync, watch } from "fs";
 var liveConfig = { ...defaultPrivacyConfig };
 var liveInjectionConfig = { ...defaultInjectionConfig };
 var configWatcher = null;
+var injectionAttemptCounts = /* @__PURE__ */ new Map();
 function initLiveConfig(pluginConfig) {
   const userConfig = pluginConfig?.privacy ?? {};
   liveConfig = mergeConfig(userConfig);
-  const userInjection = pluginConfig?.injection ?? {};
+  const userInjection = pluginConfig?.privacy?.injection ?? {};
   liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
 }
 function watchConfigFile(configPath, logger) {
@@ -252,7 +253,7 @@ function watchConfigFile(configPath, logger) {
           const raw = JSON.parse(readFileSync(configPath, "utf-8"));
           const privacy = raw.privacy ?? {};
           liveConfig = mergeConfig(privacy);
-          const injection = raw.injection ?? {};
+          const injection = raw.privacy?.injection ?? {};
           liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
           logger.info("[GuardClaw] guardclaw.json changed \u2014 config hot-reloaded");
         } catch {
@@ -1802,6 +1803,7 @@ export {
   setLastSenderId,
   getLastSenderId,
   clearLastSenderId,
+  injectionAttemptCounts,
   initLiveConfig,
   watchConfigFile,
   getLiveConfig,

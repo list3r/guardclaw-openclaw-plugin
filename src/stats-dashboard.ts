@@ -23,7 +23,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RouterPipeline } from "./router-pipeline.js";
-import { getLiveConfig, updateLiveConfig, updateLiveInjectionConfig } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveConfig, updateLiveInjectionConfig } from "./live-config.js";
 import { DEFAULT_DETECTION_SYSTEM_PROMPT, DEFAULT_PII_EXTRACTION_PROMPT } from "./local-model.js";
 import {
   addCorrection,
@@ -50,6 +50,7 @@ import {
 } from "./usage-intel.js";
 
 const GUARDCLAW_CONFIG_PATH = join(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+const GUARDCLAW_INJECTIONS_PATH = join(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-injections.json");
 
 const CENTRASE_LOGO_B64 = (() => {
   try {
@@ -216,8 +217,10 @@ export async function statsHttpHandler(
       reason?: string;
       timestamp: number;
     }> = [];
+    // S1/S2/S3 from in-memory session state
     states.forEach((state) => {
       for (const d of state.detectionHistory) {
+        if (d.level === "S0") continue; // S0 comes from the persistent injection log below
         events.push({
           sessionKey: state.sessionKey,
           level: d.level,
@@ -227,6 +230,23 @@ export async function statsHttpHandler(
         });
       }
     });
+    // S0 from persistent injection log — survives session end and restarts
+    try {
+      const raw = readFileSync(GUARDCLAW_INJECTIONS_PATH, "utf-8");
+      const injections = JSON.parse(raw) as Array<{
+        ts: string; session: string; action: string; score: number;
+        patterns: string[]; source: string; preview: string;
+      }>;
+      for (const entry of injections) {
+        events.push({
+          sessionKey: entry.session,
+          level: "S0",
+          checkpoint: "onUserMessage",
+          reason: `${entry.action} (score ${entry.score}) [${entry.source}]: ${entry.patterns.join(", ")} — "${entry.preview}"`,
+          timestamp: new Date(entry.ts).getTime(),
+        });
+      }
+    } catch { /* file may not exist yet */ }
     events.sort((a, b) => b.timestamp - a.timestamp);
     json(res, events.slice(0, 500));
     return true;
@@ -539,14 +559,10 @@ export async function statsHttpHandler(
   }
 
   if (req.method === "GET" && sub === "/api/banned") {
-    try {
-      const raw = readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8");
-      const cfg = JSON.parse(raw) as Record<string, unknown>;
-      const banned = ((cfg.injection as Record<string, unknown> | undefined)?.banned_senders ?? []) as string[];
-      json(res, { banned });
-    } catch {
-      json(res, { banned: [] });
-    }
+    // Read from in-memory live config — always reflects the current ban state including
+    // senders auto-banned this session before the async file write has completed.
+    const banned = getLiveInjectionConfig().banned_senders ?? [];
+    json(res, { banned });
     return true;
   }
 
@@ -557,16 +573,19 @@ export async function statsHttpHandler(
         json(res, { error: "senderId required" }, 400);
         return true;
       }
+      // Update in-memory live config immediately so the unban takes effect right away
+      const newBanned = (getLiveInjectionConfig().banned_senders ?? []).filter((id) => id !== body.senderId);
+      updateLiveInjectionConfig({ banned_senders: newBanned });
+      // Persist to guardclaw.json under the correct privacy.injection path
       let cfg: Record<string, unknown> = {};
       try {
         cfg = JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8")) as Record<string, unknown>;
       } catch { /* file may not exist */ }
-      if (!cfg.injection) cfg.injection = {};
-      const inj = cfg.injection as Record<string, unknown>;
-      const banned = (inj.banned_senders ?? []) as string[];
-      inj.banned_senders = banned.filter((id) => id !== body.senderId);
+      if (!cfg.privacy) cfg.privacy = {};
+      const priv = cfg.privacy as Record<string, unknown>;
+      if (!priv.injection) priv.injection = {};
+      (priv.injection as Record<string, unknown>).banned_senders = newBanned;
       writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
-      updateLiveInjectionConfig({ banned_senders: inj.banned_senders as string[] });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);

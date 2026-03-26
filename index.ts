@@ -397,7 +397,7 @@ const plugin = {
     watchConfigFile(GUARDCLAW_CONFIG_PATH, api.logger);
 
     // ── Step 5b: Initialize S0 injection config & warm up model ──
-    const userInjection = (resolvedPluginConfig.injection ?? {}) as InjectionConfig;
+    const userInjection = ((resolvedPluginConfig.privacy as Record<string, unknown>)?.injection ?? {}) as InjectionConfig;
     const injectionConfig: InjectionConfig = { ...defaultInjectionConfig, ...userInjection };
     initInjectionConfig(injectionConfig);
     if (injectionConfig.enabled !== false && !injectionConfig.heuristics_only) {

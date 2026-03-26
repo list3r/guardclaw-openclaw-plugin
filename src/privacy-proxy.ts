@@ -18,7 +18,7 @@
 import * as http from "node:http";
 import * as fs from "node:fs";
 import { redactSensitiveInfo } from "./utils.js";
-import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, injectionAttemptCounts } from "./live-config.js";
 import { getProviderForModel } from "./provider.js";
 import { detectInjection } from "./injection/index.js";
 
@@ -97,7 +97,7 @@ async function appendProxyInjectionLog(entry: ProxyInjectionEntry): Promise<void
   } catch { /* best-effort */ }
 }
 
-const proxyInjectionAttemptCounts = new Map<string, number>();
+// injectionAttemptCounts is imported from live-config.ts (shared with hooks.ts)
 
 /**
  * Fallback: read from a global default set during plugin registration.
@@ -641,8 +641,8 @@ export async function startPrivacyProxy(
               preview: userContent.slice(0, 80),
             });
             if (proxySenderId) {
-              const attempts = (proxyInjectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
-              proxyInjectionAttemptCounts.set(proxySenderId, attempts);
+              const attempts = (injectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
+              injectionAttemptCounts.set(proxySenderId, attempts);
               if (attempts >= 2 && !(injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
                 log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
                 const newBanned = [...(injectionCfg.banned_senders ?? []), proxySenderId];

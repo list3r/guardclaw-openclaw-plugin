@@ -27,6 +27,7 @@ import {
   getPendingDetection,
   guardClawConfigSchema,
   initLiveConfig,
+  injectionAttemptCounts,
   isActiveLocalRouting,
   isSessionMarkedPrivate,
   levelToNumeric,
@@ -46,7 +47,7 @@ import {
   updateLiveInjectionConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-72WK3R3J.js";
+} from "./chunk-LZUJTNNY.js";
 
 // index.ts
 import { join as join5 } from "path";
@@ -1377,7 +1378,6 @@ async function appendProxyInjectionLog(entry) {
   } catch {
   }
 }
-var proxyInjectionAttemptCounts = /* @__PURE__ */ new Map();
 var defaultProviderTarget = null;
 function setDefaultProviderTarget(target) {
   defaultProviderTarget = target;
@@ -1753,8 +1753,8 @@ async function startPrivacyProxy(port, logger) {
               preview: userContent.slice(0, 80)
             });
             if (proxySenderId) {
-              const attempts = (proxyInjectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
-              proxyInjectionAttemptCounts.set(proxySenderId, attempts);
+              const attempts = (injectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
+              injectionAttemptCounts.set(proxySenderId, attempts);
               if (attempts >= 2 && !(injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
                 log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
                 const newBanned = [...injectionCfg.banned_senders ?? [], proxySenderId];
@@ -2257,7 +2257,6 @@ var GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/guardclaw-stats.json";
 var GUARDCLAW_INJECTIONS_PATH2 = "/Users/centraseai/.openclaw/guardclaw-injections.json";
 var GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
 var GUARDCLAW_JSON_PATH2 = "/Users/centraseai/.openclaw/guardclaw.json";
-var injectionAttemptCounts = /* @__PURE__ */ new Map();
 async function appendInjectionLog(entry) {
   try {
     let entries = [];
@@ -4145,6 +4144,7 @@ function createConfigurableRouter(id) {
 
 // src/stats-dashboard.ts
 var GUARDCLAW_CONFIG_PATH2 = join4(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+var GUARDCLAW_INJECTIONS_PATH3 = join4(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-injections.json");
 var CENTRASE_LOGO_B64 = (() => {
   try {
     return readFileSync2("/Users/centraseai/.openclaw/workspace/reference/centrase/brand/Centrase_Logo_dark_bg.png").toString("base64");
@@ -4276,6 +4276,7 @@ async function statsHttpHandler(req, res) {
     const events = [];
     states.forEach((state) => {
       for (const d of state.detectionHistory) {
+        if (d.level === "S0") continue;
         events.push({
           sessionKey: state.sessionKey,
           level: d.level,
@@ -4285,6 +4286,20 @@ async function statsHttpHandler(req, res) {
         });
       }
     });
+    try {
+      const raw = readFileSync2(GUARDCLAW_INJECTIONS_PATH3, "utf-8");
+      const injections = JSON.parse(raw);
+      for (const entry of injections) {
+        events.push({
+          sessionKey: entry.session,
+          level: "S0",
+          checkpoint: "onUserMessage",
+          reason: `${entry.action} (score ${entry.score}) [${entry.source}]: ${entry.patterns.join(", ")} \u2014 "${entry.preview}"`,
+          timestamp: new Date(entry.ts).getTime()
+        });
+      }
+    } catch {
+    }
     events.sort((a, b) => b.timestamp - a.timestamp);
     json(res, events.slice(0, 500));
     return true;
@@ -4540,14 +4555,8 @@ async function statsHttpHandler(req, res) {
     return true;
   }
   if (req.method === "GET" && sub === "/api/banned") {
-    try {
-      const raw = readFileSync2(GUARDCLAW_CONFIG_PATH2, "utf-8");
-      const cfg = JSON.parse(raw);
-      const banned = cfg.injection?.banned_senders ?? [];
-      json(res, { banned });
-    } catch {
-      json(res, { banned: [] });
-    }
+    const banned = getLiveInjectionConfig().banned_senders ?? [];
+    json(res, { banned });
     return true;
   }
   if (req.method === "POST" && sub === "/api/unban") {
@@ -4557,17 +4566,18 @@ async function statsHttpHandler(req, res) {
         json(res, { error: "senderId required" }, 400);
         return true;
       }
+      const newBanned = (getLiveInjectionConfig().banned_senders ?? []).filter((id) => id !== body.senderId);
+      updateLiveInjectionConfig({ banned_senders: newBanned });
       let cfg = {};
       try {
         cfg = JSON.parse(readFileSync2(GUARDCLAW_CONFIG_PATH2, "utf-8"));
       } catch {
       }
-      if (!cfg.injection) cfg.injection = {};
-      const inj = cfg.injection;
-      const banned = inj.banned_senders ?? [];
-      inj.banned_senders = banned.filter((id) => id !== body.senderId);
+      if (!cfg.privacy) cfg.privacy = {};
+      const priv = cfg.privacy;
+      if (!priv.injection) priv.injection = {};
+      priv.injection.banned_senders = newBanned;
       writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), "utf-8");
-      updateLiveInjectionConfig({ banned_senders: inj.banned_senders });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);
@@ -7287,7 +7297,7 @@ var plugin = {
     api.logger.info(`[GuardClaw] Router pipeline initialized (built-in: privacy)`);
     initLiveConfig(resolvedPluginConfig);
     watchConfigFile(GUARDCLAW_CONFIG_PATH3, api.logger);
-    const userInjection = resolvedPluginConfig.injection ?? {};
+    const userInjection = resolvedPluginConfig.privacy?.injection ?? {};
     const injectionConfig = { ...defaultInjectionConfig, ...userInjection };
     initInjectionConfig(injectionConfig);
     if (injectionConfig.enabled !== false && !injectionConfig.heuristics_only) {

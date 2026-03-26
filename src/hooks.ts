@@ -58,7 +58,7 @@ import {
 } from "./privacy-proxy.js";
 import { getGlobalPipeline } from "./router-pipeline.js";
 import { getGlobalCollector } from "./token-stats.js";
-import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, injectionAttemptCounts } from "./live-config.js";
 import { detectInjection, SECURITY_CHANNEL, formatBlockAlert } from "./injection/index.js";
 import { finalizeLoop } from "./loop-detection-level.js";
 import { recordFinalReply } from "./usage-intel.js";
@@ -123,8 +123,7 @@ const GUARDCLAW_INJECTIONS_PATH = "/Users/centraseai/.openclaw/guardclaw-injecti
 const GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
 const GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
 
-// Injection attempt counter for auto-ban
-const injectionAttemptCounts = new Map<string, number>();
+// injectionAttemptCounts is imported from live-config.ts (shared with privacy-proxy.ts)
 
 interface InjectionEntry {
   ts: string;

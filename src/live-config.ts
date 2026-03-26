@@ -17,11 +17,14 @@ let liveConfig: PrivacyConfig = { ...defaultPrivacyConfig } as PrivacyConfig;
 let liveInjectionConfig: InjectionConfig = { ...defaultInjectionConfig };
 let configWatcher: FSWatcher | null = null;
 
+/** Shared injection attempt counter — used by both hooks and proxy so cross-layer attempts aggregate. */
+export const injectionAttemptCounts = new Map<string, number>();
+
 /** Initialize live config from the plugin's startup config snapshot. */
 export function initLiveConfig(pluginConfig: Record<string, unknown> | undefined): void {
   const userConfig = (pluginConfig?.privacy ?? {}) as PrivacyConfig;
   liveConfig = mergeConfig(userConfig);
-  const userInjection = (pluginConfig?.injection ?? {}) as InjectionConfig;
+  const userInjection = ((pluginConfig?.privacy as Record<string, unknown>)?.injection ?? {}) as InjectionConfig;
   liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
 }
 
@@ -43,7 +46,7 @@ export function watchConfigFile(
           const raw = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
           const privacy = (raw.privacy ?? {}) as PrivacyConfig;
           liveConfig = mergeConfig(privacy);
-          const injection = (raw.injection ?? {}) as InjectionConfig;
+          const injection = ((raw.privacy as Record<string, unknown>)?.injection ?? {}) as InjectionConfig;
           liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
           logger.info("[GuardClaw] guardclaw.json changed — config hot-reloaded");
         } catch { /* ignore parse errors from partial writes */ }
