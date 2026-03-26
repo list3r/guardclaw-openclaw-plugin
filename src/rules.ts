@@ -10,11 +10,34 @@ import { extractPathsFromParams, matchesPathPattern } from "./utils.js";
 
 /** Cache compiled regex patterns to avoid re-compilation on every call */
 const PATTERN_CACHE_MAX = 500;
+const PATTERN_MAX_LENGTH = 500;
 const patternCache = new Map<string, RegExp>();
+
+/**
+ * Detect patterns likely to cause catastrophic backtracking (ReDoS).
+ * Rejects patterns with nested quantifiers like (a+)+, (a*)*, (a+)*, etc.
+ */
+function isDangerousRegex(pattern: string): boolean {
+  // Nested quantifiers on groups: (x+)+, (x*)*, (x+)*, (x?)+ etc.
+  if (/\([^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
+  // Alternation with overlap inside a repeated group: (a|a)+
+  if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern)) return true;
+  return false;
+}
 
 function getOrCompileRegex(pattern: string): RegExp | null {
   const cached = patternCache.get(pattern);
   if (cached) return cached;
+
+  if (pattern.length > PATTERN_MAX_LENGTH) {
+    console.warn(`[GuardClaw] Regex pattern too long (${pattern.length} > ${PATTERN_MAX_LENGTH}), skipping`);
+    return null;
+  }
+  if (isDangerousRegex(pattern)) {
+    console.warn(`[GuardClaw] Potentially dangerous regex pattern rejected (nested quantifiers): ${pattern.slice(0, 80)}`);
+    return null;
+  }
+
   try {
     // Strip Python-style inline flags (?i), (?s), (?m) etc. — JS uses RegExp flags instead
     let flags = "i";

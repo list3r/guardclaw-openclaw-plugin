@@ -235,7 +235,16 @@ import { readFileSync, watch } from "fs";
 var liveConfig = { ...defaultPrivacyConfig };
 var liveInjectionConfig = { ...defaultInjectionConfig };
 var configWatcher = null;
+var ATTEMPT_TTL_MS = 24 * 60 * 60 * 1e3;
 var injectionAttemptCounts = /* @__PURE__ */ new Map();
+var pendingBans = /* @__PURE__ */ new Set();
+function recordInjectionAttempt(senderId) {
+  const now = Date.now();
+  const entry = injectionAttemptCounts.get(senderId);
+  const count = entry && now - entry.ts < ATTEMPT_TTL_MS ? entry.count + 1 : 1;
+  injectionAttemptCounts.set(senderId, { count, ts: now });
+  return count;
+}
 function initLiveConfig(pluginConfig) {
   const userConfig = pluginConfig?.privacy ?? {};
   liveConfig = mergeConfig(userConfig);
@@ -414,9 +423,20 @@ function getCurrentLoopHighestLevel(sessionKey) {
 }
 
 // src/session-state.ts
+var MAX_SESSION_STATES = 5e3;
 var sessionStates2 = /* @__PURE__ */ new Map();
 var pendingDetections = /* @__PURE__ */ new Map();
 var activeLocalRouting = /* @__PURE__ */ new Set();
+function evictOldestSessionIfNeeded() {
+  if (sessionStates2.size >= MAX_SESSION_STATES) {
+    const oldest = sessionStates2.keys().next().value;
+    if (oldest !== void 0) {
+      sessionStates2.delete(oldest);
+      pendingDetections.delete(oldest);
+      activeLocalRouting.delete(oldest);
+    }
+  }
+}
 function markSessionAsPrivate(sessionKey, level) {
   const existing = sessionStates2.get(sessionKey);
   if (existing) {
@@ -424,6 +444,7 @@ function markSessionAsPrivate(sessionKey, level) {
     existing.highestLevel = getHigherLevel(existing.highestLevel, level);
     existing.isPrivate = existing.currentTurnLevel !== "S1";
   } else {
+    evictOldestSessionIfNeeded();
     const isPrivate = level === "S2" || level === "S3";
     sessionStates2.set(sessionKey, {
       sessionKey,
@@ -452,6 +473,7 @@ function getSessionHighestLevel(sessionKey) {
 function recordDetection(sessionKey, level, checkpoint, reason) {
   let state = sessionStates2.get(sessionKey);
   if (!state) {
+    evictOldestSessionIfNeeded();
     state = {
       sessionKey,
       isPrivate: false,
@@ -497,6 +519,7 @@ function trackSessionLevel(sessionKey, level) {
     existing.highestLevel = getHigherLevel(existing.highestLevel, level);
     existing.currentTurnLevel = getHigherLevel(existing.currentTurnLevel, level);
   } else {
+    evictOldestSessionIfNeeded();
     sessionStates2.set(sessionKey, {
       sessionKey,
       isPrivate: false,
@@ -666,7 +689,7 @@ var TokenStatsCollector = class {
     addToBucket(hourly[category], event.usage, cost);
     addToBucket(hourly.bySource[source], event.usage, cost);
     const sk = event.sessionKey;
-    if (sk) {
+    if (sk && typeof sk === "string" && sk.length > 0 && sk.length <= 512 && sk !== "__proto__" && sk !== "constructor" && sk !== "prototype") {
       let sess = this.data.sessions[sk];
       if (!sess) {
         sess = {
@@ -1803,7 +1826,8 @@ export {
   setLastSenderId,
   getLastSenderId,
   clearLastSenderId,
-  injectionAttemptCounts,
+  pendingBans,
+  recordInjectionAttempt,
   initLiveConfig,
   watchConfigFile,
   getLiveConfig,

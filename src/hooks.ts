@@ -20,6 +20,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { join } from "node:path";
 import type { PrivacyConfig } from "./types.js";
 import {
   buildMainSessionPlaceholder,
@@ -58,7 +59,7 @@ import {
 } from "./privacy-proxy.js";
 import { getGlobalPipeline } from "./router-pipeline.js";
 import { getGlobalCollector } from "./token-stats.js";
-import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, injectionAttemptCounts } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans } from "./live-config.js";
 import { detectInjection, SECURITY_CHANNEL, formatBlockAlert } from "./injection/index.js";
 import { finalizeLoop } from "./loop-detection-level.js";
 import { recordFinalReply } from "./usage-intel.js";
@@ -118,10 +119,11 @@ function isToolAllowlisted(toolName: string): boolean {
 // Workspace dir cache — set from first hook that has PluginHookAgentContext
 let _cachedWorkspaceDir: string | undefined;
 
-const GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/guardclaw-stats.json";
-const GUARDCLAW_INJECTIONS_PATH = "/Users/centraseai/.openclaw/guardclaw-injections.json";
-const GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
-const GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+const _OPENCLAW_DIR = join(process.env.HOME ?? "/tmp", ".openclaw");
+const GUARDCLAW_STATS_PATH = join(_OPENCLAW_DIR, "guardclaw-stats.json");
+const GUARDCLAW_INJECTIONS_PATH = join(_OPENCLAW_DIR, "guardclaw-injections.json");
+const GUARDCLAW_PENDING_CONFIG_PATH = join(_OPENCLAW_DIR, "workspace", "dashboard", "guardclaw-pending-config.json");
+const GUARDCLAW_JSON_PATH = join(_OPENCLAW_DIR, "guardclaw.json");
 
 // injectionAttemptCounts is imported from live-config.ts (shared with privacy-proxy.ts)
 
@@ -137,17 +139,27 @@ interface InjectionEntry {
 }
 
 async function appendInjectionLog(entry: InjectionEntry): Promise<void> {
+  let entries: InjectionEntry[] = [];
   try {
-    let entries: InjectionEntry[] = [];
+    const raw = await fs.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
     try {
-      const raw = await fs.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
-      entries = JSON.parse(raw) as InjectionEntry[];
-      if (!Array.isArray(entries)) entries = [];
-    } catch { /* first run or missing file */ }
-    entries.push(entry);
-    if (entries.length > 200) entries = entries.slice(entries.length - 200);
+      const parsed = JSON.parse(raw) as InjectionEntry[];
+      entries = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      // File exists but is corrupted — start fresh rather than losing the new entry;
+      // the corrupt file will be overwritten below.
+    }
+  } catch {
+    // File doesn't exist yet — normal on first run.
+  }
+  entries.push(entry);
+  if (entries.length > 200) entries = entries.slice(entries.length - 200);
+  try {
     await fs.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
-  } catch { /* best-effort */ }
+  } catch (err) {
+    // Log write failures so operators know the audit trail has a gap.
+    console.warn(`[GuardClaw S0] Failed to write injection log: ${String(err)}`);
+  }
 }
 
 async function updateS0Stats(action: "block" | "sanitise"): Promise<void> {
@@ -299,26 +311,25 @@ export function registerHooks(api: OpenClawPluginApi): void {
               void updateS0Stats('block');
               // Auto-ban logic: track injection attempts per senderId
               if (senderId) {
-                const attempts = (injectionAttemptCounts.get(senderId) ?? 0) + 1;
-                injectionAttemptCounts.set(senderId, attempts);
-                if (attempts >= 2) {
+                const attempts = recordInjectionAttempt(senderId);
+                const alreadyBanned = (injectionCfg.banned_senders ?? []).includes(senderId);
+                if (attempts >= 2 && !alreadyBanned && !pendingBans.has(senderId)) {
+                  pendingBans.add(senderId);
                   api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
-                  const currentBanned = injectionCfg.banned_senders ?? [];
-                  if (!currentBanned.includes(senderId)) {
-                    const newBanned = [...currentBanned, senderId];
-                    updateLiveInjectionConfig({ banned_senders: newBanned });
-                    // Persist to guardclaw.json (path: privacy.injection.banned_senders)
-                    fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8')
-                      .then((raw) => {
-                        const cfg = JSON.parse(raw) as Record<string, unknown>;
-                        if (!cfg.privacy) cfg.privacy = {};
-                        const privacy = cfg.privacy as Record<string, unknown>;
-                        if (!privacy.injection) privacy.injection = {};
-                        (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
-                        return fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
-                      })
-                      .catch(() => {});
-                  }
+                  const newBanned = [...(injectionCfg.banned_senders ?? []), senderId];
+                  updateLiveInjectionConfig({ banned_senders: newBanned });
+                  // Persist to guardclaw.json (path: privacy.injection.banned_senders)
+                  fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8')
+                    .then((raw) => {
+                      const cfg = JSON.parse(raw) as Record<string, unknown>;
+                      if (!cfg.privacy) cfg.privacy = {};
+                      const privacy = cfg.privacy as Record<string, unknown>;
+                      if (!privacy.injection) privacy.injection = {};
+                      (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
+                      return fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+                    })
+                    .catch((err) => { api.logger.warn(`[GuardClaw S0] Failed to persist ban for ${senderId}: ${String(err)}`); })
+                    .finally(() => { pendingBans.delete(senderId); });
                 }
               }
               // Record in session state so dashboard /api/detections picks it up

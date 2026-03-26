@@ -13,6 +13,7 @@
  * via config or programmatically.
  */
 
+import { join, resolve, normalize } from "node:path";
 import type {
   Checkpoint,
   DetectionContext,
@@ -22,6 +23,17 @@ import type {
   RouterRegistration,
 } from "./types.js";
 import { maxLevel } from "./types.js";
+
+/** Allowed base directories for custom router modules. */
+const ALLOWED_ROUTER_DIRS = [
+  resolve(process.env.HOME ?? "/tmp", ".openclaw", "routers"),
+  resolve(process.env.HOME ?? "/tmp", ".openclaw", "plugins"),
+];
+
+function isAllowedModulePath(modulePath: string): boolean {
+  const resolved = resolve(normalize(modulePath));
+  return ALLOWED_ROUTER_DIRS.some((dir) => resolved.startsWith(dir + "/") || resolved === dir);
+}
 
 export class RouterPipeline {
   private routers = new Map<string, GuardClawRouter>();
@@ -52,6 +64,10 @@ export class RouterPipeline {
    * Load a custom router from a module path.
    */
   async loadCustomRouter(id: string, modulePath: string, registration?: RouterRegistration): Promise<void> {
+    if (!isAllowedModulePath(modulePath)) {
+      this.logger.error(`[RouterPipeline] Blocked load of custom router "${id}": path "${modulePath}" is outside allowed directories (${ALLOWED_ROUTER_DIRS.join(", ")})`);
+      return;
+    }
     try {
       const mod = await import(modulePath);
       const router: GuardClawRouter = mod.default ?? mod;

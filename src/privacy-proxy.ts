@@ -17,8 +17,9 @@
 
 import * as http from "node:http";
 import * as fs from "node:fs";
+import { join } from "node:path";
 import { redactSensitiveInfo } from "./utils.js";
-import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, injectionAttemptCounts } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans } from "./live-config.js";
 import { getProviderForModel } from "./provider.js";
 import { detectInjection } from "./injection/index.js";
 
@@ -39,9 +40,15 @@ export type OriginalProviderTarget = {
 
 type StashedTarget = { target: OriginalProviderTarget; ts: number };
 const PROVIDER_STASH_TTL_MS = 120_000; // 2 minutes
+const PROVIDER_STASH_MAX = 500;        // cap to prevent memory DoS
 const originalProviderTargets = new Map<string, StashedTarget>();
 
 export function stashOriginalProvider(key: string, target: OriginalProviderTarget): void {
+  // Evict oldest entry if at capacity (before inserting)
+  if (originalProviderTargets.size >= PROVIDER_STASH_MAX) {
+    const oldest = originalProviderTargets.keys().next().value;
+    if (oldest !== undefined) originalProviderTargets.delete(oldest);
+  }
   originalProviderTargets.set(key, { target, ts: Date.now() });
 }
 
@@ -69,8 +76,9 @@ if (typeof _providerCleanupInterval === "object" && "unref" in _providerCleanupI
 
 // ── Injection detection support ──
 
-const GUARDCLAW_INJECTIONS_PATH = "/Users/centraseai/.openclaw/guardclaw-injections.json";
-const GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+const _OPENCLAW_DIR = join(process.env.HOME ?? "/tmp", ".openclaw");
+const GUARDCLAW_INJECTIONS_PATH = join(_OPENCLAW_DIR, "guardclaw-injections.json");
+const GUARDCLAW_JSON_PATH = join(_OPENCLAW_DIR, "guardclaw.json");
 
 interface ProxyInjectionEntry {
   ts: string;
@@ -84,17 +92,25 @@ interface ProxyInjectionEntry {
 }
 
 async function appendProxyInjectionLog(entry: ProxyInjectionEntry): Promise<void> {
+  let entries: ProxyInjectionEntry[] = [];
   try {
-    let entries: ProxyInjectionEntry[] = [];
+    const raw = await fs.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
     try {
-      const raw = await fs.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
-      entries = JSON.parse(raw) as ProxyInjectionEntry[];
-      if (!Array.isArray(entries)) entries = [];
-    } catch { /* first run or missing file */ }
-    entries.push(entry);
-    if (entries.length > 200) entries = entries.slice(entries.length - 200);
+      const parsed = JSON.parse(raw) as ProxyInjectionEntry[];
+      entries = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      // Corrupted file — start fresh rather than losing the new entry.
+    }
+  } catch {
+    // File doesn't exist yet — normal on first run.
+  }
+  entries.push(entry);
+  if (entries.length > 200) entries = entries.slice(entries.length - 200);
+  try {
     await fs.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
-  } catch { /* best-effort */ }
+  } catch (err) {
+    console.warn(`[GuardClaw S0] Failed to write proxy injection log: ${String(err)}`);
+  }
 }
 
 // injectionAttemptCounts is imported from live-config.ts (shared with hooks.ts)
@@ -239,9 +255,9 @@ export function stripPiiMarkers(
       const openIdx = msg.content.indexOf(GUARDCLAW_S2_OPEN);
       const closeIdx = msg.content.indexOf(GUARDCLAW_S2_CLOSE);
       if (openIdx === -1 || closeIdx === -1 || closeIdx <= openIdx) continue;
-      msg.content = msg.content
-        .slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx)
-        .trim();
+      const extracted = msg.content.slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx).trim();
+      if (!extracted) continue; // guard against empty extraction stripping the whole message
+      msg.content = extracted;
       stripped = true;
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content as Array<Record<string, unknown>>) {
@@ -249,9 +265,9 @@ export function stripPiiMarkers(
         const openIdx = part.text.indexOf(GUARDCLAW_S2_OPEN);
         const closeIdx = part.text.indexOf(GUARDCLAW_S2_CLOSE);
         if (openIdx === -1 || closeIdx === -1 || closeIdx <= openIdx) continue;
-        part.text = part.text
-          .slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx)
-          .trim();
+        const extracted = part.text.slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx).trim();
+        if (!extracted) continue;
+        part.text = extracted;
         stripped = true;
       }
     }
@@ -641,9 +657,10 @@ export async function startPrivacyProxy(
               preview: userContent.slice(0, 80),
             });
             if (proxySenderId) {
-              const attempts = (injectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
-              injectionAttemptCounts.set(proxySenderId, attempts);
-              if (attempts >= 2 && !(injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
+              const attempts = recordInjectionAttempt(proxySenderId);
+              const alreadyBanned = (injectionCfg.banned_senders ?? []).includes(proxySenderId);
+              if (attempts >= 2 && !alreadyBanned && !pendingBans.has(proxySenderId)) {
+                pendingBans.add(proxySenderId);
                 log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
                 const newBanned = [...(injectionCfg.banned_senders ?? []), proxySenderId];
                 updateLiveInjectionConfig({ banned_senders: newBanned });
@@ -656,7 +673,8 @@ export async function startPrivacyProxy(
                     (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
                     return fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
                   })
-                  .catch(() => {});
+                  .catch((err) => { log.warn(`[GuardClaw S0] Failed to persist ban for ${proxySenderId}: ${String(err)}`); })
+                  .finally(() => { pendingBans.delete(proxySenderId); });
               }
             }
             res.writeHead(403, { "Content-Type": "application/json" });

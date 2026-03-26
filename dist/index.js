@@ -27,16 +27,17 @@ import {
   getPendingDetection,
   guardClawConfigSchema,
   initLiveConfig,
-  injectionAttemptCounts,
   isActiveLocalRouting,
   isSessionMarkedPrivate,
   levelToNumeric,
   loadPrompt,
   markSessionAsPrivate,
   maxLevel,
+  pendingBans,
   readPromptFromDisk,
   recordDetection,
   recordFinalReply,
+  recordInjectionAttempt,
   resetTurnLevel,
   setActiveLocalRouting,
   setGlobalCollector,
@@ -47,15 +48,16 @@ import {
   updateLiveInjectionConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-LZUJTNNY.js";
+} from "./chunk-QZEWHJNW.js";
 
 // index.ts
-import { join as join5 } from "path";
+import { join as join8 } from "path";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
 
 // src/hooks.ts
 import * as fs4 from "fs";
 import * as path3 from "path";
+import { join as join5 } from "path";
 
 // src/guard-agent.ts
 function isGuardAgentConfigured(config) {
@@ -867,10 +869,24 @@ function getDefaultSessionManager(baseDir) {
 
 // src/rules.ts
 var PATTERN_CACHE_MAX = 500;
+var PATTERN_MAX_LENGTH = 500;
 var patternCache = /* @__PURE__ */ new Map();
+function isDangerousRegex(pattern) {
+  if (/\([^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
+  if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern)) return true;
+  return false;
+}
 function getOrCompileRegex(pattern) {
   const cached = patternCache.get(pattern);
   if (cached) return cached;
+  if (pattern.length > PATTERN_MAX_LENGTH) {
+    console.warn(`[GuardClaw] Regex pattern too long (${pattern.length} > ${PATTERN_MAX_LENGTH}), skipping`);
+    return null;
+  }
+  if (isDangerousRegex(pattern)) {
+    console.warn(`[GuardClaw] Potentially dangerous regex pattern rejected (nested quantifiers): ${pattern.slice(0, 80)}`);
+    return null;
+  }
   try {
     let flags = "i";
     const cleaned = pattern.replace(/^\(\?([gimsuy]+)\)/, (_m, f) => {
@@ -1084,6 +1100,7 @@ function checkToolParams(params, config) {
 // src/privacy-proxy.ts
 import * as http from "http";
 import * as fs3 from "fs";
+import { join as join3 } from "path";
 
 // src/provider.ts
 var activeProxy = null;
@@ -1338,8 +1355,13 @@ async function detectInjection(content, source, config) {
 var GUARDCLAW_S2_OPEN = "<guardclaw-s2>";
 var GUARDCLAW_S2_CLOSE = "</guardclaw-s2>";
 var PROVIDER_STASH_TTL_MS = 12e4;
+var PROVIDER_STASH_MAX = 500;
 var originalProviderTargets = /* @__PURE__ */ new Map();
 function stashOriginalProvider(key, target) {
+  if (originalProviderTargets.size >= PROVIDER_STASH_MAX) {
+    const oldest = originalProviderTargets.keys().next().value;
+    if (oldest !== void 0) originalProviderTargets.delete(oldest);
+  }
   originalProviderTargets.set(key, { target, ts: Date.now() });
 }
 function getStashedProvider(key) {
@@ -1361,21 +1383,26 @@ var _providerCleanupInterval = setInterval(cleanupStaleProviderTargets, 6e4);
 if (typeof _providerCleanupInterval === "object" && "unref" in _providerCleanupInterval) {
   _providerCleanupInterval.unref();
 }
-var GUARDCLAW_INJECTIONS_PATH = "/Users/centraseai/.openclaw/guardclaw-injections.json";
-var GUARDCLAW_JSON_PATH = "/Users/centraseai/.openclaw/guardclaw.json";
+var _OPENCLAW_DIR = join3(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_INJECTIONS_PATH = join3(_OPENCLAW_DIR, "guardclaw-injections.json");
+var GUARDCLAW_JSON_PATH = join3(_OPENCLAW_DIR, "guardclaw.json");
 async function appendProxyInjectionLog(entry) {
+  let entries = [];
   try {
-    let entries = [];
+    const raw = await fs3.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
     try {
-      const raw = await fs3.promises.readFile(GUARDCLAW_INJECTIONS_PATH, "utf8");
-      entries = JSON.parse(raw);
-      if (!Array.isArray(entries)) entries = [];
+      const parsed = JSON.parse(raw);
+      entries = Array.isArray(parsed) ? parsed : [];
     } catch {
     }
-    entries.push(entry);
-    if (entries.length > 200) entries = entries.slice(entries.length - 200);
-    await fs3.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
   } catch {
+  }
+  entries.push(entry);
+  if (entries.length > 200) entries = entries.slice(entries.length - 200);
+  try {
+    await fs3.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
+  } catch (err) {
+    console.warn(`[GuardClaw S0] Failed to write proxy injection log: ${String(err)}`);
   }
 }
 var defaultProviderTarget = null;
@@ -1383,10 +1410,10 @@ function setDefaultProviderTarget(target) {
   defaultProviderTarget = target;
 }
 function readRequestBody(req) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve2(Buffer.concat(chunks).toString("utf-8")));
+    req.on("end", () => resolve3(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
 }
@@ -1469,7 +1496,9 @@ function stripPiiMarkers(messages) {
       const openIdx = msg.content.indexOf(GUARDCLAW_S2_OPEN);
       const closeIdx = msg.content.indexOf(GUARDCLAW_S2_CLOSE);
       if (openIdx === -1 || closeIdx === -1 || closeIdx <= openIdx) continue;
-      msg.content = msg.content.slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx).trim();
+      const extracted = msg.content.slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx).trim();
+      if (!extracted) continue;
+      msg.content = extracted;
       stripped = true;
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
@@ -1477,7 +1506,9 @@ function stripPiiMarkers(messages) {
         const openIdx = part.text.indexOf(GUARDCLAW_S2_OPEN);
         const closeIdx = part.text.indexOf(GUARDCLAW_S2_CLOSE);
         if (openIdx === -1 || closeIdx === -1 || closeIdx <= openIdx) continue;
-        part.text = part.text.slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx).trim();
+        const extracted = part.text.slice(openIdx + GUARDCLAW_S2_OPEN.length, closeIdx).trim();
+        if (!extracted) continue;
+        part.text = extracted;
         stripped = true;
       }
     }
@@ -1753,9 +1784,10 @@ async function startPrivacyProxy(port, logger) {
               preview: userContent.slice(0, 80)
             });
             if (proxySenderId) {
-              const attempts = (injectionAttemptCounts.get(proxySenderId) ?? 0) + 1;
-              injectionAttemptCounts.set(proxySenderId, attempts);
-              if (attempts >= 2 && !(injectionCfg.banned_senders ?? []).includes(proxySenderId)) {
+              const attempts = recordInjectionAttempt(proxySenderId);
+              const alreadyBanned = (injectionCfg.banned_senders ?? []).includes(proxySenderId);
+              if (attempts >= 2 && !alreadyBanned && !pendingBans.has(proxySenderId)) {
+                pendingBans.add(proxySenderId);
                 log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
                 const newBanned = [...injectionCfg.banned_senders ?? [], proxySenderId];
                 updateLiveInjectionConfig({ banned_senders: newBanned });
@@ -1766,7 +1798,10 @@ async function startPrivacyProxy(port, logger) {
                   if (!privacy.injection) privacy.injection = {};
                   privacy.injection.banned_senders = newBanned;
                   return fs3.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
-                }).catch(() => {
+                }).catch((err) => {
+                  log.warn(`[GuardClaw S0] Failed to persist ban for ${proxySenderId}: ${String(err)}`);
+                }).finally(() => {
+                  pendingBans.delete(proxySenderId);
                 });
               }
             }
@@ -1949,9 +1984,9 @@ async function startPrivacyProxy(port, logger) {
   server.on("error", (err) => {
     log.error(`[GuardClaw Proxy] Server error: ${String(err)}`);
   });
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     server.listen(port, "127.0.0.1", () => {
-      resolve2({
+      resolve3({
         baseUrl: `http://127.0.0.1:${port}`,
         port,
         close: () => new Promise((r) => {
@@ -1965,6 +2000,15 @@ async function startPrivacyProxy(port, logger) {
 }
 
 // src/router-pipeline.ts
+import { resolve, normalize } from "path";
+var ALLOWED_ROUTER_DIRS = [
+  resolve(process.env.HOME ?? "/tmp", ".openclaw", "routers"),
+  resolve(process.env.HOME ?? "/tmp", ".openclaw", "plugins")
+];
+function isAllowedModulePath(modulePath) {
+  const resolved = resolve(normalize(modulePath));
+  return ALLOWED_ROUTER_DIRS.some((dir) => resolved.startsWith(dir + "/") || resolved === dir);
+}
 var RouterPipeline = class {
   routers = /* @__PURE__ */ new Map();
   pipelineConfig = {};
@@ -1991,6 +2035,10 @@ var RouterPipeline = class {
    * Load a custom router from a module path.
    */
   async loadCustomRouter(id, modulePath, registration) {
+    if (!isAllowedModulePath(modulePath)) {
+      this.logger.error(`[RouterPipeline] Blocked load of custom router "${id}": path "${modulePath}" is outside allowed directories (${ALLOWED_ROUTER_DIRS.join(", ")})`);
+      return;
+    }
     try {
       const mod = await import(modulePath);
       const router = mod.default ?? mod;
@@ -2253,23 +2301,28 @@ function isToolAllowlisted(toolName) {
   return allowlist.includes(toolName);
 }
 var _cachedWorkspaceDir;
-var GUARDCLAW_STATS_PATH = "/Users/centraseai/.openclaw/guardclaw-stats.json";
-var GUARDCLAW_INJECTIONS_PATH2 = "/Users/centraseai/.openclaw/guardclaw-injections.json";
-var GUARDCLAW_PENDING_CONFIG_PATH = "/Users/centraseai/.openclaw/workspace/dashboard/guardclaw-pending-config.json";
-var GUARDCLAW_JSON_PATH2 = "/Users/centraseai/.openclaw/guardclaw.json";
+var _OPENCLAW_DIR2 = join5(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_STATS_PATH = join5(_OPENCLAW_DIR2, "guardclaw-stats.json");
+var GUARDCLAW_INJECTIONS_PATH2 = join5(_OPENCLAW_DIR2, "guardclaw-injections.json");
+var GUARDCLAW_PENDING_CONFIG_PATH = join5(_OPENCLAW_DIR2, "workspace", "dashboard", "guardclaw-pending-config.json");
+var GUARDCLAW_JSON_PATH2 = join5(_OPENCLAW_DIR2, "guardclaw.json");
 async function appendInjectionLog(entry) {
+  let entries = [];
   try {
-    let entries = [];
+    const raw = await fs4.promises.readFile(GUARDCLAW_INJECTIONS_PATH2, "utf8");
     try {
-      const raw = await fs4.promises.readFile(GUARDCLAW_INJECTIONS_PATH2, "utf8");
-      entries = JSON.parse(raw);
-      if (!Array.isArray(entries)) entries = [];
+      const parsed = JSON.parse(raw);
+      entries = Array.isArray(parsed) ? parsed : [];
     } catch {
     }
-    entries.push(entry);
-    if (entries.length > 200) entries = entries.slice(entries.length - 200);
-    await fs4.promises.writeFile(GUARDCLAW_INJECTIONS_PATH2, JSON.stringify(entries, null, 2));
   } catch {
+  }
+  entries.push(entry);
+  if (entries.length > 200) entries = entries.slice(entries.length - 200);
+  try {
+    await fs4.promises.writeFile(GUARDCLAW_INJECTIONS_PATH2, JSON.stringify(entries, null, 2));
+  } catch (err) {
+    console.warn(`[GuardClaw S0] Failed to write injection log: ${String(err)}`);
   }
 }
 async function updateS0Stats(action) {
@@ -2399,24 +2452,25 @@ function registerHooks(api) {
                 });
                 void updateS0Stats("block");
                 if (senderId) {
-                  const attempts = (injectionAttemptCounts.get(senderId) ?? 0) + 1;
-                  injectionAttemptCounts.set(senderId, attempts);
-                  if (attempts >= 2) {
+                  const attempts = recordInjectionAttempt(senderId);
+                  const alreadyBanned = (injectionCfg.banned_senders ?? []).includes(senderId);
+                  if (attempts >= 2 && !alreadyBanned && !pendingBans.has(senderId)) {
+                    pendingBans.add(senderId);
                     api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
-                    const currentBanned = injectionCfg.banned_senders ?? [];
-                    if (!currentBanned.includes(senderId)) {
-                      const newBanned = [...currentBanned, senderId];
-                      updateLiveInjectionConfig({ banned_senders: newBanned });
-                      fs4.promises.readFile(GUARDCLAW_JSON_PATH2, "utf8").then((raw) => {
-                        const cfg = JSON.parse(raw);
-                        if (!cfg.privacy) cfg.privacy = {};
-                        const privacy = cfg.privacy;
-                        if (!privacy.injection) privacy.injection = {};
-                        privacy.injection.banned_senders = newBanned;
-                        return fs4.promises.writeFile(GUARDCLAW_JSON_PATH2, JSON.stringify(cfg, null, 2));
-                      }).catch(() => {
-                      });
-                    }
+                    const newBanned = [...injectionCfg.banned_senders ?? [], senderId];
+                    updateLiveInjectionConfig({ banned_senders: newBanned });
+                    fs4.promises.readFile(GUARDCLAW_JSON_PATH2, "utf8").then((raw) => {
+                      const cfg = JSON.parse(raw);
+                      if (!cfg.privacy) cfg.privacy = {};
+                      const privacy = cfg.privacy;
+                      if (!privacy.injection) privacy.injection = {};
+                      privacy.injection.banned_senders = newBanned;
+                      return fs4.promises.writeFile(GUARDCLAW_JSON_PATH2, JSON.stringify(cfg, null, 2));
+                    }).catch((err) => {
+                      api.logger.warn(`[GuardClaw S0] Failed to persist ban for ${senderId}: ${String(err)}`);
+                    }).finally(() => {
+                      pendingBans.delete(senderId);
+                    });
                   }
                 }
                 recordDetection(sessionKey, "S0", "onUserMessage", injResult.blocked_reason ?? "Prompt injection detected");
@@ -3811,11 +3865,11 @@ var tokenSaverRouter = {
 
 // src/stats-dashboard.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2 } from "fs";
-import { join as join4 } from "path";
+import { join as join7 } from "path";
 
 // src/presets.ts
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { join as join3 } from "path";
+import { join as join6 } from "path";
 var BUILTIN_PRESETS = [
   {
     id: "vllm-qwen35",
@@ -3844,9 +3898,9 @@ var BUILTIN_PRESETS = [
     defaultModel: "minimax/MiniMax-M2.5-highspeed"
   }
 ];
-var OPENCLAW_DIR = join3(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH = join3(OPENCLAW_DIR, "guardclaw.json");
-var OPENCLAW_CONFIG_PATH = join3(OPENCLAW_DIR, "openclaw.json");
+var OPENCLAW_DIR = join6(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH = join6(OPENCLAW_DIR, "guardclaw.json");
+var OPENCLAW_CONFIG_PATH = join6(OPENCLAW_DIR, "openclaw.json");
 function readConfig() {
   try {
     return JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8"));
@@ -4143,8 +4197,8 @@ function createConfigurableRouter(id) {
 }
 
 // src/stats-dashboard.ts
-var GUARDCLAW_CONFIG_PATH2 = join4(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
-var GUARDCLAW_INJECTIONS_PATH3 = join4(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-injections.json");
+var GUARDCLAW_CONFIG_PATH2 = join7(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+var GUARDCLAW_INJECTIONS_PATH3 = join7(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-injections.json");
 var CENTRASE_LOGO_B64 = (() => {
   try {
     return readFileSync2("/Users/centraseai/.openclaw/workspace/reference/centrase/brand/Centrase_Logo_dark_bg.png").toString("base64");
@@ -4154,7 +4208,7 @@ var CENTRASE_LOGO_B64 = (() => {
 })();
 function saveGuardClawConfig(privacy) {
   try {
-    const dir = join4(process.env.HOME ?? "/tmp", ".openclaw");
+    const dir = join7(process.env.HOME ?? "/tmp", ".openclaw");
     mkdirSync2(dir, { recursive: true });
     let existing = {};
     try {
@@ -4171,10 +4225,10 @@ function initDashboard(d) {
   deps = d;
 }
 function readBody(req) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve2(Buffer.concat(chunks).toString("utf-8")));
+    req.on("end", () => resolve3(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
 }
@@ -7017,9 +7071,9 @@ if (LANG !== 'en') setLang(LANG);
 }
 
 // index.ts
-var OPENCLAW_DIR2 = join5(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH3 = join5(OPENCLAW_DIR2, "guardclaw.json");
-var LEGACY_DASHBOARD_PATH = join5(OPENCLAW_DIR2, "guardclaw-dashboard.json");
+var OPENCLAW_DIR2 = join8(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH3 = join8(OPENCLAW_DIR2, "guardclaw.json");
+var LEGACY_DASHBOARD_PATH = join8(OPENCLAW_DIR2, "guardclaw-dashboard.json");
 function loadGuardClawConfigFile() {
   try {
     return JSON.parse(readFileSync3(GUARDCLAW_CONFIG_PATH3, "utf-8"));
@@ -7047,7 +7101,7 @@ function getPrivacyConfig3(pluginConfig) {
 }
 function readApiKeyFromAuthProfiles(providerName) {
   const authPaths = [
-    join5(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
+    join8(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
   ];
   for (const authPath of authPaths) {
     try {
@@ -7305,7 +7359,7 @@ var plugin = {
       });
     }
     api.logger.info(`[GuardClaw] S0 injection detection initialized (heuristics_only=${injectionConfig.heuristics_only ?? false})`);
-    const statsPath = join5(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
+    const statsPath = join8(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
     const collector = new TokenStatsCollector(statsPath);
     setGlobalCollector(collector);
     collector.load().then(() => {

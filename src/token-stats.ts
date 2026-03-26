@@ -244,7 +244,9 @@ export class TokenStatsCollector {
 
     // Per-session tracking
     const sk = event.sessionKey;
-    if (sk) {
+    // Validate session key before using as object key to prevent prototype pollution.
+    if (sk && typeof sk === "string" && sk.length > 0 && sk.length <= 512 &&
+        sk !== "__proto__" && sk !== "constructor" && sk !== "prototype") {
       let sess = this.data.sessions[sk];
       if (!sess) {
         sess = {

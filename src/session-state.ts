@@ -11,11 +11,24 @@ import { recordLoopDetection } from "./loop-detection-level.js";
 
 // ── In-memory state stores ──────────────────────────────────────────────
 
+const MAX_SESSION_STATES = 5_000;
 const sessionStates = new Map<string, SessionPrivacyState>();
 
 const pendingDetections = new Map<string, PendingDetection>();
 
 const activeLocalRouting = new Set<string>();
+
+/** Evict oldest session if the map exceeds its cap. Map insertion order = LRU. */
+function evictOldestSessionIfNeeded(): void {
+  if (sessionStates.size >= MAX_SESSION_STATES) {
+    const oldest = sessionStates.keys().next().value;
+    if (oldest !== undefined) {
+      sessionStates.delete(oldest);
+      pendingDetections.delete(oldest);
+      activeLocalRouting.delete(oldest);
+    }
+  }
+}
 
 // ── Per-turn privacy level ──────────────────────────────────────────────
 
@@ -37,6 +50,7 @@ export function markSessionAsPrivate(sessionKey: string, level: SensitivityLevel
     existing.highestLevel = getHigherLevel(existing.highestLevel, level);
     existing.isPrivate = existing.currentTurnLevel !== "S1";
   } else {
+    evictOldestSessionIfNeeded();
     const isPrivate = level === "S2" || level === "S3";
     sessionStates.set(sessionKey, {
       sessionKey,
@@ -97,6 +111,7 @@ export function recordDetection(
   let state = sessionStates.get(sessionKey);
 
   if (!state) {
+    evictOldestSessionIfNeeded();
     state = {
       sessionKey,
       isPrivate: false,
@@ -188,6 +203,7 @@ export function trackSessionLevel(sessionKey: string, level: SensitivityLevel): 
     existing.highestLevel = getHigherLevel(existing.highestLevel, level);
     existing.currentTurnLevel = getHigherLevel(existing.currentTurnLevel, level);
   } else {
+    evictOldestSessionIfNeeded();
     sessionStates.set(sessionKey, {
       sessionKey,
       isPrivate: false,

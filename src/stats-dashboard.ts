@@ -64,12 +64,9 @@ function saveGuardClawConfig(privacy: Record<string, unknown>): void {
     mkdirSync(dir, { recursive: true });
     let existing: Record<string, unknown> = {};
     try {
-      existing = JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8")) as Record<
-        string,
-        unknown
-      >;
+      existing = JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8")) as Record<string, unknown>;
     } catch {
-      /* file may not exist yet */
+      /* file may not exist yet or is malformed — start from defaults */
     }
     const updated = { ...existing, privacy };
     writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(updated, null, 2), "utf-8");

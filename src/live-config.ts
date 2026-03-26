@@ -17,8 +17,22 @@ let liveConfig: PrivacyConfig = { ...defaultPrivacyConfig } as PrivacyConfig;
 let liveInjectionConfig: InjectionConfig = { ...defaultInjectionConfig };
 let configWatcher: FSWatcher | null = null;
 
-/** Shared injection attempt counter — used by both hooks and proxy so cross-layer attempts aggregate. */
-export const injectionAttemptCounts = new Map<string, number>();
+/** Shared injection attempt counter — used by both hooks and proxy so cross-layer attempts aggregate.
+ *  Value is {count, ts} so entries can be expired after 24 h to prevent unbounded growth. */
+const ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const injectionAttemptCounts = new Map<string, { count: number; ts: number }>();
+
+/** Track senders currently mid-ban to prevent duplicate concurrent ban operations. */
+export const pendingBans = new Set<string>();
+
+/** Increment attempt count for a sender (resetting if expired) and return the new count. */
+export function recordInjectionAttempt(senderId: string): number {
+  const now = Date.now();
+  const entry = injectionAttemptCounts.get(senderId);
+  const count = (entry && now - entry.ts < ATTEMPT_TTL_MS) ? entry.count + 1 : 1;
+  injectionAttemptCounts.set(senderId, { count, ts: now });
+  return count;
+}
 
 /** Initialize live config from the plugin's startup config snapshot. */
 export function initLiveConfig(pluginConfig: Record<string, unknown> | undefined): void {
