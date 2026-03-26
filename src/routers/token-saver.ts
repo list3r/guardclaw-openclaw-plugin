@@ -26,6 +26,12 @@ type OpenRouterConfig = {
   enabled: boolean;
   /** OpenClaw provider name that points to OpenRouter (default: "openrouter") */
   providerName?: string;
+  /**
+   * Model to use on OpenRouter. Defaults to "auto" which lets OpenRouter pick
+   * the best model for each request. Use provider/model format for a specific
+   * model e.g. "anthropic/claude-sonnet-4.6" or "openai/gpt-4o".
+   */
+  model?: string;
 };
 
 type TokenSaverConfig = {
@@ -56,18 +62,7 @@ const DEFAULT_CONFIG: TokenSaverConfig = {
   cacheTtlMs: 300_000,
 };
 
-/**
- * Default tier mappings when routing through OpenRouter.
- * Model names use OpenRouter's provider/model namespace format so requests
- * are routed to the right upstream. All tiers hit a single endpoint under
- * one API key — no per-provider auth needed.
- */
-const OPENROUTER_DEFAULT_TIERS: Record<Tier, { provider: string; model: string }> = {
-  SIMPLE:    { provider: OPENROUTER_PROVIDER, model: "openai/gpt-4o-mini" },
-  MEDIUM:    { provider: OPENROUTER_PROVIDER, model: "openai/gpt-4o" },
-  COMPLEX:   { provider: OPENROUTER_PROVIDER, model: "anthropic/claude-sonnet-4.6" },
-  REASONING: { provider: OPENROUTER_PROVIDER, model: "openai/o4-mini" },
-};
+const OPENROUTER_DEFAULT_MODEL = "auto";
 
 const DEFAULT_JUDGE_PROMPT = `You are a task complexity classifier. Classify the user's task into exactly one tier.
 
@@ -153,16 +148,8 @@ function resolveConfig(pluginConfig: Record<string, unknown>): TokenSaverConfig 
     | { endpoint?: string; model?: string; type?: EdgeProviderType; module?: string; apiKey?: string }
     | undefined;
 
-  // OpenRouter toggle — when enabled, all tiers route through a single provider
   const orCfg = (options.openrouter ?? {}) as Partial<OpenRouterConfig>;
   const openrouterEnabled = orCfg.enabled === true;
-  const orProviderName = orCfg.providerName ?? OPENROUTER_PROVIDER;
-
-  const baseTiers = openrouterEnabled
-    ? (Object.fromEntries(
-        Object.entries(OPENROUTER_DEFAULT_TIERS).map(([k, v]) => [k, { ...v, provider: orProviderName }])
-      ) as Record<Tier, { provider: string; model: string }>)
-    : DEFAULT_CONFIG.tiers;
 
   return {
     enabled: tsConfig?.enabled ?? DEFAULT_CONFIG.enabled,
@@ -185,11 +172,17 @@ function resolveConfig(pluginConfig: Record<string, unknown>): TokenSaverConfig 
       (options.judgeApiKey as string) ??
       privacyLocalModel?.apiKey,
     tiers: {
-      ...baseTiers,
+      ...DEFAULT_CONFIG.tiers,
       ...((options.tiers as Record<string, { provider: string; model: string }>) ?? {}),
     },
     cacheTtlMs: (options.cacheTtlMs as number) ?? DEFAULT_CONFIG.cacheTtlMs,
-    openrouter: openrouterEnabled ? { enabled: true, providerName: orProviderName } : undefined,
+    openrouter: openrouterEnabled
+      ? {
+          enabled: true,
+          providerName: orCfg.providerName ?? OPENROUTER_PROVIDER,
+          model: orCfg.model ?? OPENROUTER_DEFAULT_MODEL,
+        }
+      : undefined,
   };
 }
 
@@ -212,6 +205,21 @@ export const tokenSaverRouter: GuardClawRouter = {
     const isSubagent = context.sessionKey?.includes(":subagent:") ?? false;
     if (isSubagent) {
       return { level: "S1", action: "passthrough", reason: "subagent — skipped" };
+    }
+
+    // OpenRouter mode — bypass the tier system entirely.
+    // No local judge needed; everything routes to OpenRouter directly.
+    if (config.openrouter?.enabled) {
+      return {
+        level: "S1",
+        action: "redirect",
+        target: {
+          provider: config.openrouter.providerName ?? OPENROUTER_PROVIDER,
+          model: config.openrouter.model ?? OPENROUTER_DEFAULT_MODEL,
+        },
+        reason: "openrouter",
+        confidence: 1,
+      };
     }
 
     const prompt = context.message ?? "";
@@ -271,5 +279,5 @@ export const tokenSaverRouter: GuardClawRouter = {
 
 // ── Exports for testing ──
 
-export { parseTier, hashPrompt, classificationCache, resolveConfig, DEFAULT_CONFIG, DEFAULT_JUDGE_PROMPT, OPENROUTER_DEFAULT_TIERS, OPENROUTER_PROVIDER };
+export { parseTier, hashPrompt, classificationCache, resolveConfig, DEFAULT_CONFIG, DEFAULT_JUDGE_PROMPT, OPENROUTER_PROVIDER, OPENROUTER_DEFAULT_MODEL };
 export type { Tier, TokenSaverConfig, OpenRouterConfig };
