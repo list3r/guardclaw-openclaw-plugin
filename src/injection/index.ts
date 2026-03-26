@@ -1,12 +1,9 @@
 /**
  * GuardClaw S0 — Prompt Injection Detection
  *
- * The ML classification layer is inspired by LLM Guard
- * (https://github.com/protectai/llm-guard, MIT License) by Protect AI, which
- * pioneered using deberta-v3-base-prompt-injection-v2 for injection detection.
- * No code was copied — GuardClaw's two-layer pipeline (heuristics + DeBERTa)
- * and all regex patterns are original. The DeBERTa model itself is separately
- * licensed Apache 2.0 by Protect AI on HuggingFace.
+ * ML classification layer informed by LLM Guard
+ * (https://github.com/protectai/llm-guard, MIT) by Protect AI.
+ * Uses deberta-v3-base-prompt-injection-v2 (Apache 2.0, Protect AI / HuggingFace).
  *
  * Pipeline position: runs BEFORE S1 (PII redaction).
  *

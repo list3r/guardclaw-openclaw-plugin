@@ -1,10 +1,9 @@
 /**
  * GuardClaw S0 — Injection Detection Patterns
  *
- * These regex patterns are original to GuardClaw. LLM Guard
- * (https://github.com/protectai/llm-guard, MIT License) by Protect AI uses a
- * model-only approach with no heuristic patterns. The pattern categories and
- * scoring weights here are independently authored.
+ * Heuristic pattern layer for GuardClaw S0 injection detection.
+ * Complements the DeBERTa ML classifier; inspired by LLM Guard
+ * (https://github.com/protectai/llm-guard, MIT) by Protect AI.
  */
 
 export const INJECTION_PATTERNS = {
