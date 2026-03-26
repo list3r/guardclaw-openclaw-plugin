@@ -2282,6 +2282,95 @@ function getGlobalPipeline() {
   return globalPipeline;
 }
 
+// src/secret-manager.ts
+import { execFile } from "child_process";
+import { promisify } from "util";
+var execFileAsync = promisify(execFile);
+var MAX_TRACKED_PER_SESSION = 50;
+var MIN_SECRET_LENGTH = 4;
+var trackedSecrets = /* @__PURE__ */ new Map();
+var pendingKeychainFetch = /* @__PURE__ */ new Set();
+function trackSecret(sessionKey, value) {
+  if (!value || value.length < MIN_SECRET_LENGTH) return;
+  let set = trackedSecrets.get(sessionKey);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    trackedSecrets.set(sessionKey, set);
+  }
+  if (set.size < MAX_TRACKED_PER_SESSION) {
+    set.add(value);
+  }
+}
+function markKeychainFetchPending(sessionKey) {
+  pendingKeychainFetch.add(sessionKey);
+}
+function consumeKeychainFetchPending(sessionKey) {
+  const had = pendingKeychainFetch.has(sessionKey);
+  pendingKeychainFetch.delete(sessionKey);
+  return had;
+}
+function containsTrackedSecret(sessionKey, text) {
+  const set = trackedSecrets.get(sessionKey);
+  if (!set) return false;
+  for (const secret of set) {
+    if (text.includes(secret)) return true;
+  }
+  return false;
+}
+function redactTrackedSecrets(sessionKey, text) {
+  const set = trackedSecrets.get(sessionKey);
+  if (!set || set.size === 0) return text;
+  let result = text;
+  for (const secret of set) {
+    result = result.split(secret).join("[REDACTED:SECRET]");
+  }
+  return result;
+}
+function clearSessionSecrets(sessionKey) {
+  trackedSecrets.delete(sessionKey);
+  pendingKeychainFetch.delete(sessionKey);
+}
+var NETWORK_TOOL_EXACT = /* @__PURE__ */ new Set([
+  "web_fetch",
+  "web_search",
+  "http_get",
+  "http_post",
+  "http_request",
+  "fetch",
+  "curl",
+  "wget",
+  "browse",
+  "browser",
+  "websearch",
+  "search_web",
+  "url_fetch",
+  "http",
+  "get_url",
+  "post_url"
+]);
+function isNetworkTool(toolName) {
+  const lower = toolName.toLowerCase();
+  if (NETWORK_TOOL_EXACT.has(lower)) return true;
+  if (lower.startsWith("mcp__") && (lower.includes("fetch") || lower.includes("http") || lower.includes("search") || lower.includes("browse") || lower.includes("curl"))) return true;
+  return false;
+}
+function parseKeychainCommand(command) {
+  if (!command.includes("security") || !command.includes("find-generic-password")) return null;
+  const m1 = command.match(
+    /\bsecurity\s+find-generic-password\b[^|]*?-s\s+["']([^"']+)["'][^|]*?-a\s+["']([^"']+)["'][^|]*?-w\b/
+  ) || command.match(
+    /\bsecurity\s+find-generic-password\b[^|]*?-s\s+(\S+)[^|]*?-a\s+(\S+)[^|]*?-w\b/
+  );
+  if (m1) return { service: m1[1], account: m1[2] };
+  const m2 = command.match(
+    /\bsecurity\s+find-generic-password\b[^|]*?-a\s+["']([^"']+)["'][^|]*?-s\s+["']([^"']+)["'][^|]*?-w\b/
+  ) || command.match(
+    /\bsecurity\s+find-generic-password\b[^|]*?-a\s+(\S+)[^|]*?-s\s+(\S+)[^|]*?-w\b/
+  );
+  if (m2) return { service: m2[2], account: m2[1] };
+  return null;
+}
+
 // src/hooks.ts
 function getPipelineConfig() {
   return { privacy: getLiveConfig() };
@@ -2785,6 +2874,32 @@ ${GUARDCLAW_S2_CLOSE}`
       const typedParams = params;
       const privacyConfig = getLiveConfig();
       const baseDir = privacyConfig.session?.baseDir ?? "~/.openclaw";
+      if (isGuardSessionKey(sessionKey)) {
+        if (isNetworkTool(toolName)) {
+          api.logger.warn(
+            `[GuardClaw] BLOCKED guard session network tool: ${toolName} (session=${sessionKey})`
+          );
+          return {
+            block: true,
+            blockReason: `GuardClaw: network tools are blocked in guard sessions to prevent secret exfiltration (${toolName})`
+          };
+        }
+        const bashCmd = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
+        if (bashCmd && parseKeychainCommand(bashCmd)) {
+          markKeychainFetchPending(sessionKey);
+          api.logger.info(`[GuardClaw] Guard session keychain fetch detected \u2014 result will be tracked (session=${sessionKey})`);
+        }
+        const paramStr = JSON.stringify(typedParams);
+        if (containsTrackedSecret(sessionKey, paramStr)) {
+          api.logger.warn(
+            `[GuardClaw] BLOCKED guard session tool "${toolName}": params contain a tracked secret (session=${sessionKey})`
+          );
+          return {
+            block: true,
+            blockReason: `GuardClaw: tool parameters contain a tracked Keychain secret and cannot be called in this context (${toolName})`
+          };
+        }
+      }
       if (!isGuardSessionKey(sessionKey) && !isActiveLocalRouting(sessionKey)) {
         const pathValues = extractPathsFromParams(typedParams);
         for (const p of pathValues) {
@@ -2929,6 +3044,28 @@ ${GUARDCLAW_S2_CLOSE}`
               sessionKey
             }).catch(() => {
             });
+          }
+        }
+        return;
+      }
+      if (isGuardSessionKey(sessionKey)) {
+        const resultText = extractMessageText(msg);
+        if (resultText) {
+          if (consumeKeychainFetchPending(sessionKey)) {
+            const secretValue = resultText.trim();
+            trackSecret(sessionKey, secretValue);
+            api.logger.info(`[GuardClaw] Guard session Keychain secret tracked (session=${sessionKey})`);
+            const redactedResult = redactTrackedSecrets(sessionKey, resultText);
+            if (redactedResult !== resultText) {
+              const modified = replaceMessageText(msg, redactedResult);
+              if (modified) return { message: modified };
+            }
+          } else {
+            const redactedResult = redactTrackedSecrets(sessionKey, resultText);
+            if (redactedResult !== resultText) {
+              const modified = replaceMessageText(msg, redactedResult);
+              if (modified) return { message: modified };
+            }
           }
         }
         return;
@@ -3089,6 +3226,18 @@ ${GUARDCLAW_S2_CLOSE}`
           }
         }
       }
+      if (role === "assistant" && isGuardSessionKey(sessionKey)) {
+        const assistantText = extractMessageText(msg);
+        if (assistantText && assistantText.length >= 4) {
+          const secretRedacted = redactTrackedSecrets(sessionKey, assistantText);
+          const fullyRedacted = redactSensitiveInfo(secretRedacted, getLiveConfig().redaction);
+          if (fullyRedacted !== assistantText) {
+            api.logger.info("[GuardClaw] Redacted secrets/PII from guard session assistant response");
+            return { message: { ...msg, content: [{ type: "text", text: fullyRedacted }] } };
+          }
+        }
+        return;
+      }
       if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
         const assistantText = extractMessageText(msg);
         if (assistantText && assistantText.length >= 10) {
@@ -3123,6 +3272,7 @@ ${GUARDCLAW_S2_CLOSE}`
       const privacyConfig = getLiveConfig();
       await memMgr.syncAllMemoryToClean(privacyConfig);
       clearSessionState(sessionKey);
+      clearSessionSecrets(sessionKey);
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
     } catch (err) {

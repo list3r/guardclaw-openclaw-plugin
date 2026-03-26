@@ -63,6 +63,16 @@ import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recor
 import { detectInjection, SECURITY_CHANNEL, formatBlockAlert } from "./injection/index.js";
 import { finalizeLoop } from "./loop-detection-level.js";
 import { recordFinalReply } from "./usage-intel.js";
+import {
+  markKeychainFetchPending,
+  consumeKeychainFetchPending,
+  trackSecret,
+  containsTrackedSecret,
+  redactTrackedSecrets,
+  clearSessionSecrets,
+  isNetworkTool,
+  parseKeychainCommand,
+} from "./secret-manager.js";
 
 function getPipelineConfig(): Record<string, unknown> {
   return { privacy: getLiveConfig() };
@@ -90,15 +100,23 @@ function shouldUseFullMemoryTrack(sessionKey: string): boolean {
   return false;
 }
 
-const DEFAULT_GUARD_AGENT_SYSTEM_PROMPT = `You are a privacy-aware analyst. Analyze the data the user provides. Do your job.
+const DEFAULT_GUARD_AGENT_SYSTEM_PROMPT = `You are a privacy-aware local assistant running in a secure, air-gapped session. All data you handle stays on this machine.
 
 RULES:
 1. Analyze the data directly. Do NOT write code. Do NOT generate programming examples or tutorials.
-2. NEVER echo raw sensitive values (exact salary, SSN, bank account, password). Use generic references like "your base salary", "the SSN on file", etc.
+2. NEVER echo raw sensitive values (exact salary, SSN, bank account, password, API key, token). Use generic references like "your base salary", "the SSN on file", "the stored credential", etc.
 3. You MAY discuss percentages, ratios, whether deductions are correct, anomalies, and recommendations.
 4. Reply ONCE, then stop. No [message_id:] tags. No multi-turn simulation.
 5. **Language rule: Reply in the SAME language the user writes in.** If the user writes in Chinese, reply entirely in Chinese. If the user writes in English, reply entirely in English.
 6. Be concise and professional.
+7. You MUST NOT make any outbound network requests (web_fetch, http_get, curl, etc.). All operations must be local.
+
+KEYCHAIN ACCESS (macOS only):
+- To retrieve a stored secret from macOS Passwords.app / Keychain, run:
+    bash -c "security find-generic-password -s 'ServiceName' -a 'AccountName' -w"
+- GuardClaw automatically tracks the retrieved value and ensures it is never sent outside this machine.
+- Use the secret directly in subsequent local tool calls (e.g. as an env var for a subprocess).
+- NEVER include the raw secret value in your text replies. Reference it as "the stored credential" instead.
 
 语言规则：必须使用与用户相同的语言回复。如果用户用中文提问，你必须用中文回答。`;
 
@@ -731,6 +749,44 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const privacyConfig = getLiveConfig();
       const baseDir = privacyConfig.session?.baseDir ?? "~/.openclaw";
 
+      // ── Guard session controls ─────────────────────────────────────────────
+      // Guard Agent sessions run entirely locally (S3 isolation).  They have
+      // elevated trust for local tools but must be prevented from exfiltrating
+      // secrets via network calls or by leaking secret values in tool params.
+      if (isGuardSessionKey(sessionKey)) {
+        // 1. Block all outbound network tools unconditionally.
+        if (isNetworkTool(toolName)) {
+          api.logger.warn(
+            `[GuardClaw] BLOCKED guard session network tool: ${toolName} (session=${sessionKey})`,
+          );
+          return {
+            block: true,
+            blockReason: `GuardClaw: network tools are blocked in guard sessions to prevent secret exfiltration (${toolName})`,
+          };
+        }
+
+        // 2. Detect macOS Keychain fetch commands so the result can be tracked.
+        //    security find-generic-password -w prints the password to stdout.
+        const bashCmd = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
+        if (bashCmd && parseKeychainCommand(bashCmd)) {
+          markKeychainFetchPending(sessionKey);
+          api.logger.info(`[GuardClaw] Guard session keychain fetch detected — result will be tracked (session=${sessionKey})`);
+        }
+
+        // 3. Scan tool parameters for any already-tracked secrets.
+        //    Block if a tracked secret would be sent outside the local environment.
+        const paramStr = JSON.stringify(typedParams);
+        if (containsTrackedSecret(sessionKey, paramStr)) {
+          api.logger.warn(
+            `[GuardClaw] BLOCKED guard session tool "${toolName}": params contain a tracked secret (session=${sessionKey})`,
+          );
+          return {
+            block: true,
+            blockReason: `GuardClaw: tool parameters contain a tracked Keychain secret and cannot be called in this context (${toolName})`,
+          };
+        }
+      }
+
       // File-access guard for cloud models only — local models (Guard Agent
       // sessions and S3 active routing) are trusted to read full history.
       if (!isGuardSessionKey(sessionKey) && !isActiveLocalRouting(sessionKey)) {
@@ -904,6 +960,39 @@ export function registerHooks(api: OpenClawPluginApi): void {
             sessionManager.writeToClean(sessionKey, {
               role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
             }).catch(() => {});
+          }
+        }
+        return;
+      }
+
+      // ── Guard session tool results ─────────────────────────────────────────
+      // Guard Agent tool results never go to the clean transcript (isGuardAgentMessage
+      // in session-manager filters them), but we still need to:
+      //   a) Track bash results that came from Keychain fetch commands.
+      //   b) Redact tracked secrets from the guard session's own persisted transcript
+      //      (the full.jsonl) as an extra safety net — the guard may echo the secret.
+      if (isGuardSessionKey(sessionKey)) {
+        const resultText = extractMessageText(msg);
+        if (resultText) {
+          // Track result as a secret if this is a pending Keychain bash fetch.
+          if (consumeKeychainFetchPending(sessionKey)) {
+            const secretValue = resultText.trim();
+            trackSecret(sessionKey, secretValue);
+            api.logger.info(`[GuardClaw] Guard session Keychain secret tracked (session=${sessionKey})`);
+            // Replace the persisted result with a redacted placeholder so the raw
+            // secret value is never written to full.jsonl either.
+            const redactedResult = redactTrackedSecrets(sessionKey, resultText);
+            if (redactedResult !== resultText) {
+              const modified = replaceMessageText(msg, redactedResult);
+              if (modified) return { message: modified };
+            }
+          } else {
+            // For non-keychain results, still redact any previously tracked secrets.
+            const redactedResult = redactTrackedSecrets(sessionKey, resultText);
+            if (redactedResult !== resultText) {
+              const modified = replaceMessageText(msg, redactedResult);
+              if (modified) return { message: modified };
+            }
           }
         }
         return;
@@ -1109,6 +1198,26 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
       }
 
+      // ── Guard session assistant responses ──────────────────────────────
+      // The guard agent must never echo raw Keychain secret values.  Even
+      // though guard session messages are filtered from clean.jsonl by
+      // isGuardAgentMessage(), we redact tracked secrets from the guard's
+      // full.jsonl transcript as a defense-in-depth measure.
+      if (role === "assistant" && isGuardSessionKey(sessionKey)) {
+        const assistantText = extractMessageText(msg);
+        if (assistantText && assistantText.length >= 4) {
+          // First: redact tracked Keychain secrets
+          const secretRedacted = redactTrackedSecrets(sessionKey, assistantText);
+          // Then: redact general PII patterns
+          const fullyRedacted = redactSensitiveInfo(secretRedacted, getLiveConfig().redaction);
+          if (fullyRedacted !== assistantText) {
+            api.logger.info("[GuardClaw] Redacted secrets/PII from guard session assistant response");
+            return { message: { ...(msg as Record<string, unknown>), content: [{ type: "text", text: fullyRedacted }] } };
+          }
+        }
+        return;
+      }
+
       // ── PII-redact assistant responses from local model ──
       // When S3 data is processed locally the model may echo back PII
       // (e.g. "Your ID 310101... is valid"). Redact before entering the
@@ -1157,6 +1266,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       await memMgr.syncAllMemoryToClean(privacyConfig);
 
       clearSessionState(sessionKey);
+      clearSessionSecrets(sessionKey); // Free any in-memory Keychain secret values
 
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
