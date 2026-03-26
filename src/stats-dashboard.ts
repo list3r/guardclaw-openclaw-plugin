@@ -83,6 +83,16 @@ export function initDashboard(d: DashboardDeps): void {
   deps = d;
 }
 
+const MAX_SENDER_ID_LENGTH = 128;
+const MAX_CORRECTION_MESSAGE_LENGTH = 2000;
+
+/** Trim and validate a sender ID — returns null if empty or too long. */
+function parseSenderId(raw: unknown): string | null {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  if (!s || s.length > MAX_SENDER_ID_LENGTH) return null;
+  return s;
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -354,6 +364,10 @@ export async function statsHttpHandler(
         json(res, { error: "message, predicted, and corrected are required" }, 400);
         return true;
       }
+      if (body.message.length > MAX_CORRECTION_MESSAGE_LENGTH) {
+        json(res, { error: `message too long (max ${MAX_CORRECTION_MESSAGE_LENGTH} chars)` }, 400);
+        return true;
+      }
       const validLevels = ["S1", "S2", "S3"];
       if (!validLevels.includes(body.predicted) || !validLevels.includes(body.corrected)) {
         json(res, { error: "predicted and corrected must be S1, S2, or S3" }, 400);
@@ -562,12 +576,13 @@ export async function statsHttpHandler(
   if (req.method === "POST" && sub === "/api/unban") {
     try {
       const body = JSON.parse(await readBody(req)) as { senderId: string };
-      if (!body.senderId) {
-        json(res, { error: "senderId required" }, 400);
+      const senderId = parseSenderId(body.senderId);
+      if (!senderId) {
+        json(res, { error: "senderId required (max 128 chars)" }, 400);
         return true;
       }
       // Update in-memory live config immediately so the unban takes effect right away
-      const newBanned = (getLiveInjectionConfig().banned_senders ?? []).filter((id) => id !== body.senderId);
+      const newBanned = (getLiveInjectionConfig().banned_senders ?? []).filter((id) => id !== senderId);
       updateLiveInjectionConfig({ banned_senders: newBanned });
       // Persist to guardclaw.json under the correct privacy.injection path
       let cfg: Record<string, unknown> = {};
@@ -597,9 +612,9 @@ export async function statsHttpHandler(
   if (req.method === "POST" && sub === "/api/exempt") {
     try {
       const body = JSON.parse(await readBody(req)) as { senderId: string; label?: string };
-      const senderId = body.senderId?.trim();
+      const senderId = parseSenderId(body.senderId);
       if (!senderId) {
-        json(res, { error: "senderId required" }, 400);
+        json(res, { error: "senderId required (max 128 chars)" }, 400);
         return true;
       }
       const current = getLiveInjectionConfig().exempt_senders ?? [];
@@ -627,9 +642,9 @@ export async function statsHttpHandler(
 
   if (req.method === "DELETE" && sub.startsWith("/api/exempt/")) {
     try {
-      const senderId = decodeURIComponent(sub.slice("/api/exempt/".length)).trim();
+      const senderId = parseSenderId(decodeURIComponent(sub.slice("/api/exempt/".length)));
       if (!senderId) {
-        json(res, { error: "senderId required" }, 400);
+        json(res, { error: "senderId required (max 128 chars)" }, 400);
         return true;
       }
       const newExempt = (getLiveInjectionConfig().exempt_senders ?? []).filter((id) => id !== senderId);

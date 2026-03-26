@@ -22,6 +22,12 @@ import { getGlobalCollector } from "../token-stats.js";
 
 type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
+type OpenRouterConfig = {
+  enabled: boolean;
+  /** OpenClaw provider name that points to OpenRouter (default: "openrouter") */
+  providerName?: string;
+};
+
 type TokenSaverConfig = {
   enabled: boolean;
   judgeEndpoint: string;
@@ -31,7 +37,10 @@ type TokenSaverConfig = {
   judgeApiKey?: string;
   tiers: Record<Tier, { provider: string; model: string }>;
   cacheTtlMs: number;
+  openrouter?: OpenRouterConfig;
 };
+
+const OPENROUTER_PROVIDER = "openrouter";
 
 const DEFAULT_CONFIG: TokenSaverConfig = {
   enabled: false,
@@ -39,12 +48,25 @@ const DEFAULT_CONFIG: TokenSaverConfig = {
   judgeModel: "openbmb/minicpm4.1",
   judgeProviderType: "openai-compatible",
   tiers: {
-    SIMPLE: { provider: "openai", model: "gpt-4o-mini" },
-    MEDIUM: { provider: "openai", model: "gpt-4o" },
-    COMPLEX: { provider: "anthropic", model: "claude-sonnet-4.6" },
-    REASONING: { provider: "openai", model: "o4-mini" },
+    SIMPLE:    { provider: "openai",    model: "gpt-4o-mini" },
+    MEDIUM:    { provider: "openai",    model: "gpt-4o" },
+    COMPLEX:   { provider: "anthropic", model: "claude-sonnet-4.6" },
+    REASONING: { provider: "openai",    model: "o4-mini" },
   },
   cacheTtlMs: 300_000,
+};
+
+/**
+ * Default tier mappings when routing through OpenRouter.
+ * Model names use OpenRouter's provider/model namespace format so requests
+ * are routed to the right upstream. All tiers hit a single endpoint under
+ * one API key — no per-provider auth needed.
+ */
+const OPENROUTER_DEFAULT_TIERS: Record<Tier, { provider: string; model: string }> = {
+  SIMPLE:    { provider: OPENROUTER_PROVIDER, model: "openai/gpt-4o-mini" },
+  MEDIUM:    { provider: OPENROUTER_PROVIDER, model: "openai/gpt-4o" },
+  COMPLEX:   { provider: OPENROUTER_PROVIDER, model: "anthropic/claude-sonnet-4.6" },
+  REASONING: { provider: OPENROUTER_PROVIDER, model: "openai/o4-mini" },
 };
 
 const DEFAULT_JUDGE_PROMPT = `You are a task complexity classifier. Classify the user's task into exactly one tier.
@@ -131,6 +153,17 @@ function resolveConfig(pluginConfig: Record<string, unknown>): TokenSaverConfig 
     | { endpoint?: string; model?: string; type?: EdgeProviderType; module?: string; apiKey?: string }
     | undefined;
 
+  // OpenRouter toggle — when enabled, all tiers route through a single provider
+  const orCfg = (options.openrouter ?? {}) as Partial<OpenRouterConfig>;
+  const openrouterEnabled = orCfg.enabled === true;
+  const orProviderName = orCfg.providerName ?? OPENROUTER_PROVIDER;
+
+  const baseTiers = openrouterEnabled
+    ? (Object.fromEntries(
+        Object.entries(OPENROUTER_DEFAULT_TIERS).map(([k, v]) => [k, { ...v, provider: orProviderName }])
+      ) as Record<Tier, { provider: string; model: string }>)
+    : DEFAULT_CONFIG.tiers;
+
   return {
     enabled: tsConfig?.enabled ?? DEFAULT_CONFIG.enabled,
     judgeEndpoint:
@@ -152,10 +185,11 @@ function resolveConfig(pluginConfig: Record<string, unknown>): TokenSaverConfig 
       (options.judgeApiKey as string) ??
       privacyLocalModel?.apiKey,
     tiers: {
-      ...DEFAULT_CONFIG.tiers,
+      ...baseTiers,
       ...((options.tiers as Record<string, { provider: string; model: string }>) ?? {}),
     },
     cacheTtlMs: (options.cacheTtlMs as number) ?? DEFAULT_CONFIG.cacheTtlMs,
+    openrouter: openrouterEnabled ? { enabled: true, providerName: orProviderName } : undefined,
   };
 }
 
@@ -237,5 +271,5 @@ export const tokenSaverRouter: GuardClawRouter = {
 
 // ── Exports for testing ──
 
-export { parseTier, hashPrompt, classificationCache, resolveConfig, DEFAULT_CONFIG, DEFAULT_JUDGE_PROMPT };
-export type { Tier, TokenSaverConfig };
+export { parseTier, hashPrompt, classificationCache, resolveConfig, DEFAULT_CONFIG, DEFAULT_JUDGE_PROMPT, OPENROUTER_DEFAULT_TIERS, OPENROUTER_PROVIDER };
+export type { Tier, TokenSaverConfig, OpenRouterConfig };

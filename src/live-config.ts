@@ -56,7 +56,12 @@ export async function loadInjectionAttemptCounts(): Promise<void> {
         injectionAttemptCounts.set(id, entry);
       }
     }
-  } catch { /* absent or corrupt — start fresh */ }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      console.warn("[GuardClaw] guardclaw-attempt-counts.json appears corrupt, starting fresh:", String(err));
+    }
+  }
 }
 
 /** Atomically persist the current attempt counts to disk (best-effort). */
@@ -115,7 +120,9 @@ export function watchConfigFile(
           liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
           updateInjectionConfig(liveInjectionConfig); // keep injection/index.ts store in sync
           logger.info("[GuardClaw] guardclaw.json changed — config hot-reloaded");
-        } catch { /* ignore parse errors from partial writes */ }
+        } catch (err) {
+          console.warn("[GuardClaw] Config reload failed (partial write?) — retaining previous config:", String(err));
+        }
       }, 300);
     });
   } catch { /* file may not exist yet — non-fatal */ }

@@ -85,14 +85,25 @@ export function invalidatePrompt(name: string): void {
 }
 
 /**
+ * Sanitize a prompt name to prevent path traversal.
+ * Allows only alphanumeric characters, hyphens, and underscores — no slashes,
+ * dots, or null bytes that could escape the prompts directory.
+ */
+function sanitizePromptName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+}
+
+/**
  * Write a prompt to `prompts/{name}.md` and invalidate its cache.
  * Creates the prompts directory if it doesn't exist.
  */
 export function writePrompt(name: string, content: string): void {
+  const safe = sanitizePromptName(name);
+  if (!safe) throw new Error(`Invalid prompt name: ${name}`);
   mkdirSync(PROMPTS_DIR, { recursive: true });
-  const filePath = resolve(PROMPTS_DIR, `${name}.md`);
+  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
   writeFileSync(filePath, content, "utf-8");
-  invalidatePrompt(name);
+  invalidatePrompt(safe);
 }
 
 /**
@@ -100,7 +111,9 @@ export function writePrompt(name: string, content: string): void {
  * Returns null if the file doesn't exist.
  */
 export function readPromptFromDisk(name: string): string | null {
-  const filePath = resolve(PROMPTS_DIR, `${name}.md`);
+  const safe = sanitizePromptName(name);
+  if (!safe) return null;
+  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
   try {
     if (existsSync(filePath)) {
       return readFileSync(filePath, "utf-8").trim();

@@ -65,23 +65,37 @@ function checkKeywords(
   return { level: "S1" };
 }
 
+const MAX_PATTERN_LENGTH = 500;
+
 function checkPatterns(
   text: string,
   patterns: { S2?: string[]; S3?: string[] },
 ): { level: SensitivityLevel; reason?: string } {
   for (const pat of patterns.S3 ?? []) {
+    if (pat.length > MAX_PATTERN_LENGTH) {
+      console.warn(`[GuardClaw] S3 pattern too long (>${MAX_PATTERN_LENGTH} chars), skipped`);
+      continue;
+    }
     try {
       if (new RegExp(pat, "i").test(text)) {
         return { level: "S3", reason: `S3 pattern: ${pat}` };
       }
-    } catch { /* skip invalid regex */ }
+    } catch (e) {
+      console.warn(`[GuardClaw] Invalid S3 regex pattern skipped: ${String(e)}`);
+    }
   }
   for (const pat of patterns.S2 ?? []) {
+    if (pat.length > MAX_PATTERN_LENGTH) {
+      console.warn(`[GuardClaw] S2 pattern too long (>${MAX_PATTERN_LENGTH} chars), skipped`);
+      continue;
+    }
     try {
       if (new RegExp(pat, "i").test(text)) {
         return { level: "S2", reason: `S2 pattern: ${pat}` };
       }
-    } catch { /* skip invalid regex */ }
+    } catch (e) {
+      console.warn(`[GuardClaw] Invalid S2 regex pattern skipped: ${String(e)}`);
+    }
   }
   return { level: "S1" };
 }
@@ -120,7 +134,8 @@ async function classifyWithPrompt(
       return { level: level as SensitivityLevel, reason: parsed.reason ?? "LLM classification" };
     }
     return { level: "S1" };
-  } catch {
+  } catch (err) {
+    console.warn(`[GuardClaw] Configurable router LLM classification failed:`, String(err));
     return null;
   }
 }
