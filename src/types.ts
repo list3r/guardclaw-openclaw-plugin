@@ -109,6 +109,24 @@ export type PrivacyConfig = {
    * All default to false (off) to avoid over-redaction.
    */
   redaction?: RedactionOptions;
+  /**
+   * Outbound webhook notifications for security events.
+   * Supports Discord (rich embeds), Slack (blocks), and generic JSON.
+   * Fire-and-forget — never blocks the main request path.
+   */
+  webhooks?: WebhookConfig[];
+  /**
+   * Scan LLM responses for accidentally echoed secrets or PII.
+   * Runs synchronously in before_message_write — can redact or block.
+   */
+  responseScanning?: ResponseScanConfig;
+  /**
+   * Daily and monthly cloud spend caps.
+   * Tracks cost independently of token-stats for fast threshold checks.
+   */
+  budget?: BudgetConfig;
+  /** User IDs exempt from outbound message redaction */
+  operatorPassthrough?: string[];
 };
 
 export type InjectionConfig = {
@@ -128,6 +146,43 @@ export type InjectionConfig = {
   exempt_senders?: string[];
   /** Discord user IDs that are permanently banned (auto-blocked before detection) */
   banned_senders?: string[];
+};
+
+export type WebhookFormat = "json" | "discord" | "slack";
+
+export type WebhookEvent =
+  | "s3_detected"
+  | "s2_detected"
+  | "injection_blocked"
+  | "ban_triggered"
+  | "budget_warning"
+  | "budget_exceeded"
+  | "response_scan_hit";
+
+export type WebhookConfig = {
+  url: string;
+  format?: WebhookFormat;
+  events?: WebhookEvent[];
+  secret?: string;
+};
+
+export type ResponseScanAction = "warn" | "redact" | "block";
+
+export type ResponseScanConfig = {
+  enabled?: boolean;
+  action?: ResponseScanAction;
+  scanSecrets?: boolean;
+  scanPii?: boolean;
+};
+
+export type BudgetAction = "warn" | "pause_cloud" | "block";
+
+export type BudgetConfig = {
+  enabled?: boolean;
+  dailyCap?: number;
+  monthlyCap?: number;
+  action?: BudgetAction;
+  warnAt?: number;
 };
 
 export type RedactionOptions = {

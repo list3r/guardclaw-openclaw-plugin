@@ -23,6 +23,7 @@ import { TokenStatsCollector, setGlobalCollector } from "./src/token-stats.js";
 import { initLiveConfig, watchConfigFile, loadInjectionAttemptCounts } from "./src/live-config.js";
 import { initDashboard, statsHttpHandler } from "./src/stats-dashboard.js";
 import { initInjectionConfig } from "./src/injection/index.js";
+import { loadBudgetData } from "./src/budget-guard.js";
 import { runDebertaClassifier } from "./src/injection/deberta.js";
 import { defaultInjectionConfig } from "./src/config-schema.js";
 import type { PrivacyConfig, PipelineConfig, RouterRegistration, InjectionConfig } from "./src/types.js";
@@ -416,6 +417,9 @@ const plugin = {
     }).catch((err) => {
       api.logger.error(`[GuardClaw] Failed to load token stats: ${String(err)}`);
     });
+
+    // Load persisted budget counters (non-fatal)
+    loadBudgetData().catch(() => {});
 
     // ── Step 6: Register Dashboard HTTP route ──
     initDashboard({

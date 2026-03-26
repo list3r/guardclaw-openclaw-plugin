@@ -151,6 +151,51 @@ export const guardClawConfigSchema = Type.Object({
           pin: Type.Optional(Type.Boolean()),
         }),
       ),
+      webhooks: Type.Optional(
+        Type.Array(
+          Type.Object({
+            url: Type.String(),
+            format: Type.Optional(
+              Type.Union([
+                Type.Literal("json"),
+                Type.Literal("discord"),
+                Type.Literal("slack"),
+              ]),
+            ),
+            events: Type.Optional(Type.Array(Type.String())),
+            secret: Type.Optional(Type.String()),
+          }),
+        ),
+      ),
+      responseScanning: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          action: Type.Optional(
+            Type.Union([
+              Type.Literal("warn"),
+              Type.Literal("redact"),
+              Type.Literal("block"),
+            ]),
+          ),
+          scanSecrets: Type.Optional(Type.Boolean()),
+          scanPii: Type.Optional(Type.Boolean()),
+        }),
+      ),
+      budget: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          dailyCap: Type.Optional(Type.Number()),
+          monthlyCap: Type.Optional(Type.Number()),
+          action: Type.Optional(
+            Type.Union([
+              Type.Literal("warn"),
+              Type.Literal("pause_cloud"),
+              Type.Literal("block"),
+            ]),
+          ),
+          warnAt: Type.Optional(Type.Number()),
+        }),
+      ),
     }),
   ),
 });

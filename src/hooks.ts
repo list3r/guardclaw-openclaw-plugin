@@ -76,6 +76,9 @@ import {
   isNetworkTool,
   parseKeychainCommand,
 } from "./secret-manager.js";
+import { fireWebhooks } from "./webhook.js";
+import { scanResponse } from "./response-scanner.js";
+import { checkBudget, recordCost, calculateCost } from "./budget-guard.js";
 
 function getPipelineConfig(): Record<string, unknown> {
   return { privacy: getLiveConfig() };
@@ -286,6 +289,33 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
 
+      // ── Budget guard — check before pipeline runs ──────────────────────────
+      const budgetCfg = privacyConfig.budget;
+      if (budgetCfg?.enabled) {
+        const budgetStatus = checkBudget(budgetCfg);
+        if (budgetStatus.exceeded) {
+          const msg = `Budget cap exceeded — daily: $${budgetStatus.dailyCost.toFixed(4)}${budgetCfg.dailyCap ? `/$${budgetCfg.dailyCap}` : ""}, monthly: $${budgetStatus.monthlyCost.toFixed(4)}${budgetCfg.monthlyCap ? `/$${budgetCfg.monthlyCap}` : ""}`;
+          api.logger.warn(`[GuardClaw] ${msg}`);
+          const hooks = privacyConfig.webhooks ?? [];
+          fireWebhooks("budget_exceeded", { sessionKey, reason: msg }, hooks);
+          if (budgetStatus.action === "block") {
+            throw new Error(`[GuardClaw] Request blocked: ${msg}`);
+          }
+          if (budgetStatus.action === "pause_cloud") {
+            api.logger.info("[GuardClaw] Budget exceeded — routing to local model");
+            const guardCfg = getGuardAgentConfig(privacyConfig);
+            const localProvider = guardCfg?.provider ?? privacyConfig.localModel?.provider ?? "ollama";
+            const localModel = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
+            return { providerOverride: localProvider, modelOverride: localModel };
+          }
+        } else if (budgetStatus.warning) {
+          const msg = `Budget warning — daily: $${budgetStatus.dailyCost.toFixed(4)}${budgetCfg.dailyCap ? `/$${budgetCfg.dailyCap}` : ""}, monthly: $${budgetStatus.monthlyCost.toFixed(4)}${budgetCfg.monthlyCap ? `/$${budgetCfg.monthlyCap}` : ""}`;
+          api.logger.warn(`[GuardClaw] ${msg}`);
+          const hooks = privacyConfig.webhooks ?? [];
+          fireWebhooks("budget_warning", { sessionKey, reason: msg }, hooks);
+        }
+      }
+
       if (isGuardSessionKey(sessionKey)) {
         // S0: Run injection detection for guard sessions (no sender-ban check —
         // guard inputs don't have a meaningful sender ID, but tool-result injections
@@ -345,6 +375,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         if (isBannedSender) {
           api.logger.warn(`[GuardClaw S0] BANNED sender blocked: senderId=${senderId} session=${sessionKey}`);
           recordDetection(sessionKey, 'S0', 'onUserMessage', `Banned sender: ${senderId}`);
+          fireWebhooks("ban_triggered", { sessionKey, reason: `Banned sender: ${senderId}`, details: { senderId: senderId ?? "" } }, privacyConfig.webhooks ?? []);
           throw new Error(`[GuardClaw S0] Message blocked: Sender ${senderId} is banned`);
         }
 
@@ -535,6 +566,16 @@ export function registerHooks(api: OpenClawPluginApi): void {
       recordDetection(sessionKey, decision.level, "onUserMessage", decision.reason);
       updateGuardclawStats(decision.level).catch(() => {});
       api.logger.info(`[GuardClaw] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`);
+
+      // Dispatch webhooks for S2/S3 detections
+      if (decision.level === "S3" || decision.level === "S2") {
+        const webhooks = privacyConfig.webhooks ?? [];
+        if (webhooks.length > 0) {
+          const event = decision.level === "S3" ? "s3_detected" : "s2_detected";
+          fireWebhooks(event, { sessionKey, level: decision.level, reason: decision.reason }, webhooks);
+        }
+      }
+
       if (decision.level === "S1" && decision.action === "passthrough") {
         return;
       }
@@ -1323,6 +1364,31 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
       }
 
+      // ── Response scanning — cloud assistant responses ───────────────────────
+      // Scans for secrets/PII echoed in cloud model responses (e.g. API keys
+      // accidentally included in generated code or explanations).
+      // Only applies to non-guard, non-local-routing sessions.
+      if (role === "assistant" && !isVerifiedGuardSession(sessionKey) && !isActiveLocalRouting(sessionKey)) {
+        const scanCfg = getLiveConfig().responseScanning;
+        if (scanCfg?.enabled) {
+          const assistantText = extractMessageText(msg);
+          if (assistantText && assistantText.length >= 20) {
+            const result = scanResponse(assistantText, scanCfg);
+            if (result.hit) {
+              api.logger.warn(`[GuardClaw] Response scan hit: ${result.reason} (session=${sessionKey})`);
+              fireWebhooks("response_scan_hit", { sessionKey, reason: result.reason, details: { matches: result.matches.join(", ") } }, getLiveConfig().webhooks ?? []);
+              if (result.action === "block") {
+                return { message: { ...(msg as Record<string, unknown>), content: [{ type: "text", text: "[GuardClaw: Response blocked — contained sensitive content. Use a local model session to work with sensitive data.]" }] } };
+              }
+              if (result.action === "redact" && result.redacted !== undefined) {
+                api.logger.info(`[GuardClaw] Response scan: redacted ${result.matches.join(", ")} from cloud response`);
+                return { message: { ...(msg as Record<string, unknown>), content: [{ type: "text", text: result.redacted }] } };
+              }
+            }
+          }
+        }
+      }
+
       // ── Sanitize user messages for session transcript ──
       if (role !== "user") return;
       if (!pending || pending.level === "S1") return;
@@ -1400,6 +1466,23 @@ export function registerHooks(api: OpenClawPluginApi): void {
       });
 
       const liveConfig = getLiveConfig();
+
+      // ── Budget guard — record cost, check post-request thresholds ─────────
+      const budgetCfg = liveConfig.budget;
+      if (budgetCfg?.enabled && event.usage) {
+        const cost = calculateCost(model, { input: event.usage.input, output: event.usage.output }, liveConfig.modelPricing ?? {});
+        if (cost > 0) {
+          recordCost(cost);
+          // Check if this request tipped us over the warning threshold
+          // (the pre-request check in before_model_resolve already handles exceeded/block;
+          // this catches the case where a single large response crosses warn% mid-session)
+          const status = checkBudget(budgetCfg);
+          if (status.warning && !status.exceeded) {
+            const msg = `Budget at ${Math.round((status.dailyCost / (status.dailyCap ?? Infinity)) * 100)}% daily / ${Math.round((status.monthlyCost / (status.monthlyCap ?? Infinity)) * 100)}% monthly`;
+            fireWebhooks("budget_warning", { sessionKey, reason: msg, details: { dailyCost: status.dailyCost, monthlyCost: status.monthlyCost } }, liveConfig.webhooks ?? []);
+          }
+        }
+      }
       const origin =
         provider === "guardclaw-privacy"
           ? "cloud"
