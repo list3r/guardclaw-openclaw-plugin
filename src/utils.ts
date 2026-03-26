@@ -47,7 +47,10 @@ export function matchesPathPattern(path: string, patterns: string[]): boolean {
 /**
  * Extract paths from tool parameters
  */
-export function extractPathsFromParams(params: Record<string, unknown>): string[] {
+export function extractPathsFromParams(params: Record<string, unknown>, _depth = 0): string[] {
+  // Guard against deeply-nested attacker-controlled objects causing a stack overflow.
+  if (_depth > 5) return [];
+
   const paths: string[] = [];
 
   // Common path parameter names
@@ -72,7 +75,7 @@ export function extractPathsFromParams(params: Record<string, unknown>): string[
   // Also check nested objects
   for (const value of Object.values(params)) {
     if (value && typeof value === "object" && !Array.isArray(value)) {
-      paths.push(...extractPathsFromParams(value as Record<string, unknown>));
+      paths.push(...extractPathsFromParams(value as Record<string, unknown>, _depth + 1));
     }
   }
 

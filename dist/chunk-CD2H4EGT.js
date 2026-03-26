@@ -230,6 +230,206 @@ var defaultInjectionConfig = {
   banned_senders: []
 };
 
+// src/injection/deberta.ts
+var ENDPOINT = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
+var TIMEOUT_MS = 5e3;
+async function runDebertaClassifier(content) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") {
+      return { label: 0, score: 0, injection: false, error: "Timeout" };
+    }
+    return { label: 0, score: 0, injection: false, error: err.message ?? "Unknown error" };
+  }
+}
+
+// src/injection/patterns.ts
+var INJECTION_PATTERNS = {
+  // Role override attempts
+  role_override: [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
+    /forget\s+(everything|all|your)\s+(you\s+know|instructions?|training|context)/i,
+    /you\s+are\s+now\s+/i,
+    /from\s+now\s+on\s*,?\s*(you|act|behave|respond)/i,
+    /pretend\s+(you\s+are|to\s+be|you're)/i,
+    /act\s+as\s+(if\s+you\s+(are|were)|a|an|the)/i,
+    /your\s+new\s+(instructions?|directive|goal|purpose|role)/i,
+    /switch\s+(to|into)\s+.{0,20}\s+mode/i,
+    /\[?(system|admin|root|sudo|developer|debug|unrestricted|jailbreak|DAN)\]?\s*(mode|prompt|override|access)/i,
+    /do\s+anything\s+now/i,
+    /you\s+have\s+no\s+(restrictions?|limits?|guidelines?)/i
+  ],
+  // Exfiltration instructions
+  exfiltration: [
+    /send\s+(this|all|everything|the\s+\w+)\s+to\s+https?:\/\//i,
+    /send\s+(this|all|everything)\s+to\s/i,
+    /POST\s+(this|data|it|everything)\s+to\s/i,
+    /upload\s+(this|all|the\s+\w+)\s+to\s/i,
+    /email\s+(this|all|the\s+\w+|everything)\s+to\s/i,
+    /forward\s+(this|all|everything)\s+to\s/i,
+    /exfiltrat/i,
+    /HTTP\s+(request|POST|GET)\s+to\s/i,
+    /curl\s+(-X\s+POST\s+)?https?:\/\//i,
+    /wget\s+https?:\/\//i
+  ],
+  // Credential fishing
+  credential_fishing: [
+    /(provide|give|tell\s+me|show\s+me|reveal|share|what\s+is)\s+(your\s+)?(API\s*key|token|secret|password|credentials?|auth)/i,
+    /reveal\s+(your\s+)?(system\s+prompt|instructions?|context|training)/i,
+    /print\s+(your\s+)?(system|initial)\s+(prompt|instructions?|message)/i,
+    /output\s+(your\s+)?(config|configuration|settings|environment)/i,
+    /display\s+(hidden|secret|internal)\s/i
+  ],
+  // Encoding tricks (signals, not definitive)
+  encoding_tricks: [
+    /[A-Za-z0-9+\/]{50,}={0,2}/,
+    // Base64 blob (50+ chars)
+    /\\u[0-9a-fA-F]{4}/,
+    // Unicode escapes
+    /&#x?[0-9a-fA-F]+;/,
+    // HTML entities
+    /\x00|\x0d|\x0a{5,}/
+    // Null bytes or excessive newlines
+  ],
+  // Structural signals (imperative in data context)
+  structural: [
+    /^(you\s+must|you\s+should|you\s+will|you\s+need\s+to|always|never)\s/im,
+    /^(do\s+not|don't|stop|halt|cease|terminate)\s/im,
+    /\[\s*(INST|SYSTEM|ASSISTANT|USER)\s*\]/i,
+    // Role tags in content
+    /<\|?(im_start|im_end|system|user|assistant)\|?>/i
+    // ChatML tags
+  ]
+};
+var PATTERN_WEIGHTS = {
+  role_override: 40,
+  exfiltration: 35,
+  credential_fishing: 30,
+  encoding_tricks: 15,
+  structural: 20
+};
+
+// src/injection/heuristics.ts
+function runHeuristics(content) {
+  const matches = [];
+  const matchedPatterns = [];
+  let score = 0;
+  for (const [category, patterns] of Object.entries(INJECTION_PATTERNS)) {
+    for (const pattern of patterns) {
+      const match = content.match(pattern);
+      if (match) {
+        if (!matches.includes(category)) {
+          matches.push(category);
+          score += PATTERN_WEIGHTS[category] || 10;
+        }
+        matchedPatterns.push({
+          category,
+          pattern: pattern.toString(),
+          match: match[0].slice(0, 100)
+        });
+      }
+    }
+  }
+  score = Math.min(score, 100);
+  return { score, matches, matchedPatterns };
+}
+
+// src/injection/sanitiser.ts
+var REDACTION_MARKER = "[CONTENT REDACTED \u2014 POTENTIAL INJECTION]";
+function sanitiseContent(content, matchedPatterns) {
+  let sanitised = content;
+  const sorted = [...matchedPatterns].filter((p) => p.match.length > 0).sort((a, b) => b.match.length - a.match.length);
+  for (const { match } of sorted) {
+    const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(escaped, "gi");
+    sanitised = sanitised.replace(regex, REDACTION_MARKER);
+  }
+  const escapedMarker = REDACTION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  sanitised = sanitised.replace(
+    new RegExp(`(${escapedMarker}\\s*)+`, "g"),
+    REDACTION_MARKER + "\n"
+  );
+  return sanitised.trim();
+}
+
+// src/injection/index.ts
+var DEFAULT_BLOCK_THRESHOLD = 70;
+var DEFAULT_SANITISE_THRESHOLD = 30;
+var SECURITY_CHANNEL = "1483608914774986943";
+function formatBlockAlert(result, source, preview) {
+  return `\u{1F6E1}\uFE0F **GuardClaw S0 \u2014 Injection Blocked**
+> **Source:** ${source}
+> **Score:** ${result.score}/100
+> **Patterns:** ${result.matches.join(", ")}
+> **Preview:** \`${preview.slice(0, 100)}${preview.length > 100 ? "..." : ""}\`
+>
+> Content blocked and not passed to model. Review in guardclaw-injections.log`;
+}
+var _injectionConfig = {};
+function initInjectionConfig(config) {
+  _injectionConfig = config;
+}
+function updateInjectionConfig(config) {
+  _injectionConfig = config;
+}
+async function detectInjection(content, source, config) {
+  const cfg = config ?? _injectionConfig;
+  if (cfg.exempt_sources?.includes(source)) {
+    return { pass: true, score: 0, action: "pass", matches: [] };
+  }
+  const blockThreshold = cfg.block_threshold ?? DEFAULT_BLOCK_THRESHOLD;
+  const sanitiseThreshold = cfg.sanitise_threshold ?? DEFAULT_SANITISE_THRESHOLD;
+  const heuristic = runHeuristics(content);
+  let finalScore = heuristic.score;
+  let debertaResult = null;
+  if (!cfg.heuristics_only && heuristic.score >= 20 && heuristic.score <= 80) {
+    debertaResult = await runDebertaClassifier(content);
+    if (!debertaResult.error) {
+      if (debertaResult.injection) {
+        finalScore = Math.max(finalScore, 70 + debertaResult.score * 30);
+      } else if (debertaResult.score > 0.7 && debertaResult.label === 0) {
+        finalScore = Math.min(finalScore, 25);
+      }
+    }
+  }
+  let action;
+  if (finalScore < sanitiseThreshold) {
+    action = "pass";
+  } else if (finalScore < blockThreshold) {
+    action = "sanitise";
+  } else {
+    action = "block";
+  }
+  let sanitised;
+  if (action === "sanitise") {
+    sanitised = sanitiseContent(content, heuristic.matchedPatterns);
+  }
+  return {
+    pass: action === "pass",
+    score: Math.round(finalScore),
+    action,
+    sanitised,
+    matches: heuristic.matches,
+    blocked_reason: action === "block" ? `Injection detected (score ${Math.round(finalScore)}): ${heuristic.matches.join(", ")}` : void 0
+  };
+}
+
 // src/live-config.ts
 import { readFileSync, watch } from "fs";
 var liveConfig = { ...defaultPrivacyConfig };
@@ -250,6 +450,7 @@ function initLiveConfig(pluginConfig) {
   liveConfig = mergeConfig(userConfig);
   const userInjection = pluginConfig?.privacy?.injection ?? {};
   liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
+  updateInjectionConfig(liveInjectionConfig);
 }
 function watchConfigFile(configPath, logger) {
   if (configWatcher) return;
@@ -264,6 +465,7 @@ function watchConfigFile(configPath, logger) {
           liveConfig = mergeConfig(privacy);
           const injection = raw.privacy?.injection ?? {};
           liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
+          updateInjectionConfig(liveInjectionConfig);
           logger.info("[GuardClaw] guardclaw.json changed \u2014 config hot-reloaded");
         } catch {
         }
@@ -283,6 +485,7 @@ function updateLiveConfig(patch) {
 }
 function updateLiveInjectionConfig(patch) {
   liveInjectionConfig = { ...liveInjectionConfig, ...patch };
+  updateInjectionConfig(liveInjectionConfig);
 }
 function mergeConfig(userConfig) {
   return {
@@ -1826,6 +2029,11 @@ export {
   setLastSenderId,
   getLastSenderId,
   clearLastSenderId,
+  runDebertaClassifier,
+  SECURITY_CHANNEL,
+  formatBlockAlert,
+  initInjectionConfig,
+  detectInjection,
   pendingBans,
   recordInjectionAttempt,
   initLiveConfig,

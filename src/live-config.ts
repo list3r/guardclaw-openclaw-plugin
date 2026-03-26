@@ -12,6 +12,7 @@
 import { readFileSync, watch, type FSWatcher } from "node:fs";
 import type { PrivacyConfig, InjectionConfig } from "./types.js";
 import { defaultPrivacyConfig, defaultInjectionConfig } from "./config-schema.js";
+import { updateInjectionConfig } from "./injection/index.js";
 
 let liveConfig: PrivacyConfig = { ...defaultPrivacyConfig } as PrivacyConfig;
 let liveInjectionConfig: InjectionConfig = { ...defaultInjectionConfig };
@@ -40,6 +41,7 @@ export function initLiveConfig(pluginConfig: Record<string, unknown> | undefined
   liveConfig = mergeConfig(userConfig);
   const userInjection = ((pluginConfig?.privacy as Record<string, unknown>)?.injection ?? {}) as InjectionConfig;
   liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
+  updateInjectionConfig(liveInjectionConfig); // keep injection/index.ts store in sync
 }
 
 /**
@@ -62,6 +64,7 @@ export function watchConfigFile(
           liveConfig = mergeConfig(privacy);
           const injection = ((raw.privacy as Record<string, unknown>)?.injection ?? {}) as InjectionConfig;
           liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
+          updateInjectionConfig(liveInjectionConfig); // keep injection/index.ts store in sync
           logger.info("[GuardClaw] guardclaw.json changed — config hot-reloaded");
         } catch { /* ignore parse errors from partial writes */ }
       }, 300);
@@ -87,6 +90,7 @@ export function updateLiveConfig(patch: Partial<PrivacyConfig>): void {
 /** Hot-update the live injection config. Called after auto-ban. */
 export function updateLiveInjectionConfig(patch: Partial<InjectionConfig>): void {
   liveInjectionConfig = { ...liveInjectionConfig, ...patch };
+  updateInjectionConfig(liveInjectionConfig); // keep injection/index.ts store in sync
 }
 
 function mergeConfig(userConfig: PrivacyConfig): PrivacyConfig {

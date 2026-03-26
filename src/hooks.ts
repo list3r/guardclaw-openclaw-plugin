@@ -180,6 +180,12 @@ async function appendInjectionLog(entry: InjectionEntry): Promise<void> {
   }
 }
 
+async function writeStatsAtomic(stats: Record<string, unknown>): Promise<void> {
+  const tmp = GUARDCLAW_STATS_PATH + ".tmp";
+  await fs.promises.writeFile(tmp, JSON.stringify(stats, null, 2));
+  await fs.promises.rename(tmp, GUARDCLAW_STATS_PATH); // atomic on POSIX
+}
+
 async function updateS0Stats(action: "block" | "sanitise"): Promise<void> {
   try {
     let stats: Record<string, unknown> = { s1Count: 0, s2Count: 0, s3Count: 0, totalMessages: 0, s3Policy: "local-only", lastUpdated: null };
@@ -192,7 +198,7 @@ async function updateS0Stats(action: "block" | "sanitise"): Promise<void> {
     if (action === "block") s0.blocked = (s0.blocked ?? 0) + 1;
     else s0.sanitised = (s0.sanitised ?? 0) + 1;
     s0.total = (s0.total ?? 0) + 1;
-    await fs.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+    await writeStatsAtomic(stats);
   } catch { /* best-effort */ }
 }
 
@@ -208,7 +214,7 @@ async function updateGuardclawStats(level: string): Promise<void> {
     else if (level === "S3") stats.s3Count = (stats.s3Count as number) + 1;
     stats.totalMessages = (stats.totalMessages as number) + 1;
     stats.lastUpdated = new Date().toISOString();
-    await fs.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+    await writeStatsAtomic(stats);
   } catch { /* stats are best-effort */ }
 }
 
@@ -265,6 +271,29 @@ export function registerHooks(api: OpenClawPluginApi): void {
       if (!privacyConfig.enabled) return;
 
       if (isGuardSessionKey(sessionKey)) {
+        // S0: Run injection detection for guard sessions (no sender-ban check —
+        // guard inputs don't have a meaningful sender ID, but tool-result injections
+        // targeting the guard agent still need to be caught).
+        const guardInjCfg = getLiveInjectionConfig();
+        if (guardInjCfg.enabled !== false) {
+          const guardMsgStr = String(prompt);
+          const guardContent = extractUserContent(guardMsgStr) ?? guardMsgStr;
+          try {
+            const guardInjResult = await detectInjection(guardContent, "user_message", guardInjCfg);
+            if (guardInjResult.action === "block") {
+              api.logger.warn(
+                `[GuardClaw S0] BLOCKED guard session injection: session=${sessionKey} score=${guardInjResult.score} patterns=${guardInjResult.matches.join(",")}`,
+              );
+              recordDetection(sessionKey, "S0", "onUserMessage", guardInjResult.blocked_reason ?? "Prompt injection in guard session");
+              throw new Error(`[GuardClaw S0] Guard session message blocked: ${guardInjResult.blocked_reason ?? "Prompt injection detected"}`);
+            }
+          } catch (err) {
+            const msg = String(err);
+            if (msg.includes("[GuardClaw S0] Guard session message blocked")) throw err;
+            api.logger.warn(`[GuardClaw S0] Guard session detection error (non-fatal): ${msg}`);
+          }
+        }
+
         const guardCfg = getGuardAgentConfig(privacyConfig);
         if (guardCfg) {
           return { providerOverride: guardCfg.provider, modelOverride: guardCfg.modelName };
@@ -293,15 +322,22 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const senderMatch = msgStr.match(/"sender_id"\s*:\s*"(\d+)"/);
           if (senderMatch) senderId = senderMatch[1];
         }
+        // Build a Set once for O(1) ban/exempt lookups (#10)
+        const bannedSet = new Set(injectionCfg.banned_senders ?? []);
         // Check if sender is banned (auto-block immediately, no detection needed)
-        const isBannedSender = senderId && (injectionCfg.banned_senders ?? []).includes(senderId);
+        const isBannedSender = senderId && bannedSet.has(senderId);
         if (isBannedSender) {
           api.logger.warn(`[GuardClaw S0] BANNED sender blocked: senderId=${senderId} session=${sessionKey}`);
           recordDetection(sessionKey, 'S0', 'onUserMessage', `Banned sender: ${senderId}`);
           throw new Error(`[GuardClaw S0] Message blocked: Sender ${senderId} is banned`);
         }
 
-        const isExemptSender = senderId && (injectionCfg.exempt_senders ?? []).includes(senderId);
+        const isExemptSender = senderId && new Set(injectionCfg.exempt_senders ?? []).has(senderId);
+
+        // Audit log for every exempt-sender bypass so the skip is visible (#13)
+        if (isExemptSender) {
+          api.logger.info(`[GuardClaw S0] Exempt sender bypass — skipping injection check: senderId=${senderId} session=${sessionKey}`);
+        }
 
         if (!isExemptSender) {
           // Extract actual user content from OpenClaw envelope (Discord/iMessage/Telegram)
@@ -330,7 +366,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
               // Auto-ban logic: track injection attempts per senderId
               if (senderId) {
                 const attempts = recordInjectionAttempt(senderId);
-                const alreadyBanned = (injectionCfg.banned_senders ?? []).includes(senderId);
+                const alreadyBanned = bannedSet.has(senderId);
                 if (attempts >= 2 && !alreadyBanned && !pendingBans.has(senderId)) {
                   pendingBans.add(senderId);
                   api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
@@ -377,6 +413,20 @@ export function registerHooks(api: OpenClawPluginApi): void {
               void updateS0Stats('sanitise');
               // Record in session state so dashboard /api/detections picks it up
               recordDetection(sessionKey, 'S0', 'onUserMessage', `Injection sanitised (score ${Math.round(injResult.score)})`);
+              // Re-scan sanitised content: a sophisticated payload may partially survive
+              // sanitisation but still trigger S2/S3 sensitivity rules. Escalate to
+              // block if any privacy rule fires on the cleaned text. (#11)
+              const sanitiseRecheck = detectByRules(
+                { checkpoint: "onUserMessage", message: injResult.sanitised, sessionKey },
+                privacyConfig,
+              );
+              if (sanitiseRecheck.level !== "S1") {
+                api.logger.warn(
+                  `[GuardClaw S0] Sanitised content still triggers ${sanitiseRecheck.level} — escalating to block. reason=${sanitiseRecheck.reason}`,
+                );
+                recordDetection(sessionKey, "S0", "onUserMessage", `Post-sanitise escalation: ${sanitiseRecheck.reason}`);
+                throw new Error(`[GuardClaw S0] Message blocked after sanitise re-check: ${sanitiseRecheck.reason}`);
+              }
               // Replace the prompt with sanitised content for the rest of the pipeline
               (event as unknown as Record<string, unknown>).prompt = injResult.sanitised;
             }
@@ -1398,9 +1448,18 @@ export function registerHooks(api: OpenClawPluginApi): void {
       if (!pipeline) return;
 
       const sessionKey = ctx.sessionKey ?? "";
+
+      // Redact any in-memory tracked Keychain secrets before the message leaves (#14)
+      let outboundContent = content;
+      const secretRedacted = redactTrackedSecrets(sessionKey, outboundContent);
+      if (secretRedacted !== outboundContent) {
+        api.logger.warn(`[GuardClaw] Redacted tracked secret(s) from outbound message (session=${sessionKey})`);
+        outboundContent = secretRedacted;
+      }
+
       const decision = await pipeline.run(
         "onUserMessage",
-        { checkpoint: "onUserMessage", message: content, sessionKey },
+        { checkpoint: "onUserMessage", message: outboundContent, sessionKey },
         getPipelineConfig(),
       );
 
@@ -1409,13 +1468,15 @@ export function registerHooks(api: OpenClawPluginApi): void {
         return { cancel: true };
       }
       if (decision.level === "S2") {
-        const desenResult = await desensitizeWithLocalModel(content, privacyConfig, ctx.sessionKey);
+        const desenResult = await desensitizeWithLocalModel(outboundContent, privacyConfig, ctx.sessionKey);
         if (desenResult.failed) {
           api.logger.warn("[GuardClaw] S2 desensitization failed — cancelling outbound message to prevent PII leak");
           return { cancel: true };
         }
         return { content: desenResult.desensitized };
       }
+      // S1: return the secret-redacted content if it changed
+      if (outboundContent !== content) return { content: outboundContent };
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in message_sending hook: ${String(err)}`);
     }

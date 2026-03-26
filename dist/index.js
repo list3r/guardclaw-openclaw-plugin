@@ -1,6 +1,7 @@
 import {
   DEFAULT_DETECTION_SYSTEM_PROMPT,
   DEFAULT_PII_EXTRACTION_PROMPT,
+  SECURITY_CHANNEL,
   TokenStatsCollector,
   addCorrection,
   callChatCompletion,
@@ -13,7 +14,9 @@ import {
   deleteCorrection,
   desensitizeWithLocalModel,
   detectByLocalModel,
+  detectInjection,
   finalizeLoop,
+  formatBlockAlert,
   getAllSessionStates,
   getCorrections,
   getCurrentLoopHighestLevel,
@@ -26,6 +29,7 @@ import {
   getLiveInjectionConfig,
   getPendingDetection,
   guardClawConfigSchema,
+  initInjectionConfig,
   initLiveConfig,
   isActiveLocalRouting,
   isSessionMarkedPrivate,
@@ -39,6 +43,7 @@ import {
   recordFinalReply,
   recordInjectionAttempt,
   resetTurnLevel,
+  runDebertaClassifier,
   setActiveLocalRouting,
   setGlobalCollector,
   setLastSenderId,
@@ -48,7 +53,7 @@ import {
   updateLiveInjectionConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-QZEWHJNW.js";
+} from "./chunk-CD2H4EGT.js";
 
 // index.ts
 import { join as join8 } from "path";
@@ -167,7 +172,8 @@ function matchesPathPattern(path4, patterns) {
   }
   return false;
 }
-function extractPathsFromParams(params) {
+function extractPathsFromParams(params, _depth = 0) {
+  if (_depth > 5) return [];
   const paths = [];
   const pathKeys = ["path", "file", "filepath", "filename", "dir", "directory", "target", "source"];
   for (const key of pathKeys) {
@@ -185,7 +191,7 @@ function extractPathsFromParams(params) {
   }
   for (const value of Object.values(params)) {
     if (value && typeof value === "object" && !Array.isArray(value)) {
-      paths.push(...extractPathsFromParams(value));
+      paths.push(...extractPathsFromParams(value, _depth + 1));
     }
   }
   return paths;
@@ -874,6 +880,9 @@ var patternCache = /* @__PURE__ */ new Map();
 function isDangerousRegex(pattern) {
   if (/\([^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
   if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern)) return true;
+  if (/\([^)]*\{\d+,\d*\}[^)]*\)[+*?{]/.test(pattern)) return true;
+  if (/\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
+  if (/\([^)]*[+*?][^)]*\|[^)]*[+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   return false;
 }
 function getOrCompileRegex(pattern) {
@@ -1152,203 +1161,6 @@ function mirrorAllProviderModels(config, resolveApiKey) {
     }
   }
   return mirrored;
-}
-
-// src/injection/patterns.ts
-var INJECTION_PATTERNS = {
-  // Role override attempts
-  role_override: [
-    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
-    /forget\s+(everything|all|your)\s+(you\s+know|instructions?|training|context)/i,
-    /you\s+are\s+now\s+/i,
-    /from\s+now\s+on\s*,?\s*(you|act|behave|respond)/i,
-    /pretend\s+(you\s+are|to\s+be|you're)/i,
-    /act\s+as\s+(if\s+you\s+(are|were)|a|an|the)/i,
-    /your\s+new\s+(instructions?|directive|goal|purpose|role)/i,
-    /switch\s+(to|into)\s+.{0,20}\s+mode/i,
-    /\[?(system|admin|root|sudo|developer|debug|unrestricted|jailbreak|DAN)\]?\s*(mode|prompt|override|access)/i,
-    /do\s+anything\s+now/i,
-    /you\s+have\s+no\s+(restrictions?|limits?|guidelines?)/i
-  ],
-  // Exfiltration instructions
-  exfiltration: [
-    /send\s+(this|all|everything|the\s+\w+)\s+to\s+https?:\/\//i,
-    /send\s+(this|all|everything)\s+to\s/i,
-    /POST\s+(this|data|it|everything)\s+to\s/i,
-    /upload\s+(this|all|the\s+\w+)\s+to\s/i,
-    /email\s+(this|all|the\s+\w+|everything)\s+to\s/i,
-    /forward\s+(this|all|everything)\s+to\s/i,
-    /exfiltrat/i,
-    /HTTP\s+(request|POST|GET)\s+to\s/i,
-    /curl\s+(-X\s+POST\s+)?https?:\/\//i,
-    /wget\s+https?:\/\//i
-  ],
-  // Credential fishing
-  credential_fishing: [
-    /(provide|give|tell\s+me|show\s+me|reveal|share|what\s+is)\s+(your\s+)?(API\s*key|token|secret|password|credentials?|auth)/i,
-    /reveal\s+(your\s+)?(system\s+prompt|instructions?|context|training)/i,
-    /print\s+(your\s+)?(system|initial)\s+(prompt|instructions?|message)/i,
-    /output\s+(your\s+)?(config|configuration|settings|environment)/i,
-    /display\s+(hidden|secret|internal)\s/i
-  ],
-  // Encoding tricks (signals, not definitive)
-  encoding_tricks: [
-    /[A-Za-z0-9+\/]{50,}={0,2}/,
-    // Base64 blob (50+ chars)
-    /\\u[0-9a-fA-F]{4}/,
-    // Unicode escapes
-    /&#x?[0-9a-fA-F]+;/,
-    // HTML entities
-    /\x00|\x0d|\x0a{5,}/
-    // Null bytes or excessive newlines
-  ],
-  // Structural signals (imperative in data context)
-  structural: [
-    /^(you\s+must|you\s+should|you\s+will|you\s+need\s+to|always|never)\s/im,
-    /^(do\s+not|don't|stop|halt|cease|terminate)\s/im,
-    /\[\s*(INST|SYSTEM|ASSISTANT|USER)\s*\]/i,
-    // Role tags in content
-    /<\|?(im_start|im_end|system|user|assistant)\|?>/i
-    // ChatML tags
-  ]
-};
-var PATTERN_WEIGHTS = {
-  role_override: 40,
-  exfiltration: 35,
-  credential_fishing: 30,
-  encoding_tricks: 15,
-  structural: 20
-};
-
-// src/injection/heuristics.ts
-function runHeuristics(content) {
-  const matches = [];
-  const matchedPatterns = [];
-  let score = 0;
-  for (const [category, patterns] of Object.entries(INJECTION_PATTERNS)) {
-    for (const pattern of patterns) {
-      const match = content.match(pattern);
-      if (match) {
-        if (!matches.includes(category)) {
-          matches.push(category);
-          score += PATTERN_WEIGHTS[category] || 10;
-        }
-        matchedPatterns.push({
-          category,
-          pattern: pattern.toString(),
-          match: match[0].slice(0, 100)
-        });
-      }
-    }
-  }
-  score = Math.min(score, 100);
-  return { score, matches, matchedPatterns };
-}
-
-// src/injection/deberta.ts
-var ENDPOINT = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
-var TIMEOUT_MS = 5e3;
-async function runDebertaClassifier(content) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    if (!res.ok) {
-      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
-    }
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") {
-      return { label: 0, score: 0, injection: false, error: "Timeout" };
-    }
-    return { label: 0, score: 0, injection: false, error: err.message ?? "Unknown error" };
-  }
-}
-
-// src/injection/sanitiser.ts
-var REDACTION_MARKER = "[CONTENT REDACTED \u2014 POTENTIAL INJECTION]";
-function sanitiseContent(content, matchedPatterns) {
-  let sanitised = content;
-  const sorted = [...matchedPatterns].filter((p) => p.match.length > 0).sort((a, b) => b.match.length - a.match.length);
-  for (const { match } of sorted) {
-    const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const regex = new RegExp(escaped, "gi");
-    sanitised = sanitised.replace(regex, REDACTION_MARKER);
-  }
-  const escapedMarker = REDACTION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  sanitised = sanitised.replace(
-    new RegExp(`(${escapedMarker}\\s*)+`, "g"),
-    REDACTION_MARKER + "\n"
-  );
-  return sanitised.trim();
-}
-
-// src/injection/index.ts
-var DEFAULT_BLOCK_THRESHOLD = 70;
-var DEFAULT_SANITISE_THRESHOLD = 30;
-var SECURITY_CHANNEL = "1483608914774986943";
-function formatBlockAlert(result, source, preview) {
-  return `\u{1F6E1}\uFE0F **GuardClaw S0 \u2014 Injection Blocked**
-> **Source:** ${source}
-> **Score:** ${result.score}/100
-> **Patterns:** ${result.matches.join(", ")}
-> **Preview:** \`${preview.slice(0, 100)}${preview.length > 100 ? "..." : ""}\`
->
-> Content blocked and not passed to model. Review in guardclaw-injections.log`;
-}
-var _injectionConfig = {};
-function initInjectionConfig(config) {
-  _injectionConfig = config;
-}
-async function detectInjection(content, source, config) {
-  const cfg = config ?? _injectionConfig;
-  if (cfg.exempt_sources?.includes(source)) {
-    return { pass: true, score: 0, action: "pass", matches: [] };
-  }
-  const blockThreshold = cfg.block_threshold ?? DEFAULT_BLOCK_THRESHOLD;
-  const sanitiseThreshold = cfg.sanitise_threshold ?? DEFAULT_SANITISE_THRESHOLD;
-  const heuristic = runHeuristics(content);
-  let finalScore = heuristic.score;
-  let debertaResult = null;
-  if (!cfg.heuristics_only && heuristic.score >= 20 && heuristic.score <= 80) {
-    debertaResult = await runDebertaClassifier(content);
-    if (!debertaResult.error) {
-      if (debertaResult.injection) {
-        finalScore = Math.max(finalScore, 70 + debertaResult.score * 30);
-      } else if (debertaResult.score > 0.7 && debertaResult.label === 0) {
-        finalScore = Math.min(finalScore, 25);
-      }
-    }
-  }
-  let action;
-  if (finalScore < sanitiseThreshold) {
-    action = "pass";
-  } else if (finalScore < blockThreshold) {
-    action = "sanitise";
-  } else {
-    action = "block";
-  }
-  let sanitised;
-  if (action === "sanitise") {
-    sanitised = sanitiseContent(content, heuristic.matchedPatterns);
-  }
-  return {
-    pass: action === "pass",
-    score: Math.round(finalScore),
-    action,
-    sanitised,
-    matches: heuristic.matches,
-    blocked_reason: action === "block" ? `Injection detected (score ${Math.round(finalScore)}): ${heuristic.matches.join(", ")}` : void 0
-  };
 }
 
 // src/privacy-proxy.ts
@@ -2414,6 +2226,11 @@ async function appendInjectionLog(entry) {
     console.warn(`[GuardClaw S0] Failed to write injection log: ${String(err)}`);
   }
 }
+async function writeStatsAtomic(stats) {
+  const tmp = GUARDCLAW_STATS_PATH + ".tmp";
+  await fs4.promises.writeFile(tmp, JSON.stringify(stats, null, 2));
+  await fs4.promises.rename(tmp, GUARDCLAW_STATS_PATH);
+}
 async function updateS0Stats(action) {
   try {
     let stats = { s1Count: 0, s2Count: 0, s3Count: 0, totalMessages: 0, s3Policy: "local-only", lastUpdated: null };
@@ -2427,7 +2244,7 @@ async function updateS0Stats(action) {
     if (action === "block") s0.blocked = (s0.blocked ?? 0) + 1;
     else s0.sanitised = (s0.sanitised ?? 0) + 1;
     s0.total = (s0.total ?? 0) + 1;
-    await fs4.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+    await writeStatsAtomic(stats);
   } catch {
   }
 }
@@ -2444,7 +2261,7 @@ async function updateGuardclawStats(level) {
     else if (level === "S3") stats.s3Count = stats.s3Count + 1;
     stats.totalMessages = stats.totalMessages + 1;
     stats.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
-    await fs4.promises.writeFile(GUARDCLAW_STATS_PATH, JSON.stringify(stats, null, 2));
+    await writeStatsAtomic(stats);
   } catch {
   }
 }
@@ -2491,6 +2308,25 @@ function registerHooks(api) {
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
       if (isGuardSessionKey(sessionKey)) {
+        const guardInjCfg = getLiveInjectionConfig();
+        if (guardInjCfg.enabled !== false) {
+          const guardMsgStr = String(prompt);
+          const guardContent = extractUserContent(guardMsgStr) ?? guardMsgStr;
+          try {
+            const guardInjResult = await detectInjection(guardContent, "user_message", guardInjCfg);
+            if (guardInjResult.action === "block") {
+              api.logger.warn(
+                `[GuardClaw S0] BLOCKED guard session injection: session=${sessionKey} score=${guardInjResult.score} patterns=${guardInjResult.matches.join(",")}`
+              );
+              recordDetection(sessionKey, "S0", "onUserMessage", guardInjResult.blocked_reason ?? "Prompt injection in guard session");
+              throw new Error(`[GuardClaw S0] Guard session message blocked: ${guardInjResult.blocked_reason ?? "Prompt injection detected"}`);
+            }
+          } catch (err) {
+            const msg = String(err);
+            if (msg.includes("[GuardClaw S0] Guard session message blocked")) throw err;
+            api.logger.warn(`[GuardClaw S0] Guard session detection error (non-fatal): ${msg}`);
+          }
+        }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         if (guardCfg) {
           return { providerOverride: guardCfg.provider, modelOverride: guardCfg.modelName };
@@ -2511,13 +2347,17 @@ function registerHooks(api) {
           const senderMatch = msgStr.match(/"sender_id"\s*:\s*"(\d+)"/);
           if (senderMatch) senderId = senderMatch[1];
         }
-        const isBannedSender = senderId && (injectionCfg.banned_senders ?? []).includes(senderId);
+        const bannedSet = new Set(injectionCfg.banned_senders ?? []);
+        const isBannedSender = senderId && bannedSet.has(senderId);
         if (isBannedSender) {
           api.logger.warn(`[GuardClaw S0] BANNED sender blocked: senderId=${senderId} session=${sessionKey}`);
           recordDetection(sessionKey, "S0", "onUserMessage", `Banned sender: ${senderId}`);
           throw new Error(`[GuardClaw S0] Message blocked: Sender ${senderId} is banned`);
         }
-        const isExemptSender = senderId && (injectionCfg.exempt_senders ?? []).includes(senderId);
+        const isExemptSender = senderId && new Set(injectionCfg.exempt_senders ?? []).has(senderId);
+        if (isExemptSender) {
+          api.logger.info(`[GuardClaw S0] Exempt sender bypass \u2014 skipping injection check: senderId=${senderId} session=${sessionKey}`);
+        }
         if (!isExemptSender) {
           const userContent = extractUserContent(msgStr);
           if (!userContent) {
@@ -2542,7 +2382,7 @@ function registerHooks(api) {
                 void updateS0Stats("block");
                 if (senderId) {
                   const attempts = recordInjectionAttempt(senderId);
-                  const alreadyBanned = (injectionCfg.banned_senders ?? []).includes(senderId);
+                  const alreadyBanned = bannedSet.has(senderId);
                   if (attempts >= 2 && !alreadyBanned && !pendingBans.has(senderId)) {
                     pendingBans.add(senderId);
                     api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
@@ -2585,6 +2425,17 @@ function registerHooks(api) {
                 });
                 void updateS0Stats("sanitise");
                 recordDetection(sessionKey, "S0", "onUserMessage", `Injection sanitised (score ${Math.round(injResult.score)})`);
+                const sanitiseRecheck = detectByRules(
+                  { checkpoint: "onUserMessage", message: injResult.sanitised, sessionKey },
+                  privacyConfig
+                );
+                if (sanitiseRecheck.level !== "S1") {
+                  api.logger.warn(
+                    `[GuardClaw S0] Sanitised content still triggers ${sanitiseRecheck.level} \u2014 escalating to block. reason=${sanitiseRecheck.reason}`
+                  );
+                  recordDetection(sessionKey, "S0", "onUserMessage", `Post-sanitise escalation: ${sanitiseRecheck.reason}`);
+                  throw new Error(`[GuardClaw S0] Message blocked after sanitise re-check: ${sanitiseRecheck.reason}`);
+                }
                 event.prompt = injResult.sanitised;
               }
             } catch (err) {
@@ -3349,9 +3200,15 @@ ${GUARDCLAW_S2_CLOSE}`
       const pipeline = getGlobalPipeline();
       if (!pipeline) return;
       const sessionKey = ctx.sessionKey ?? "";
+      let outboundContent = content;
+      const secretRedacted = redactTrackedSecrets(sessionKey, outboundContent);
+      if (secretRedacted !== outboundContent) {
+        api.logger.warn(`[GuardClaw] Redacted tracked secret(s) from outbound message (session=${sessionKey})`);
+        outboundContent = secretRedacted;
+      }
       const decision = await pipeline.run(
         "onUserMessage",
-        { checkpoint: "onUserMessage", message: content, sessionKey },
+        { checkpoint: "onUserMessage", message: outboundContent, sessionKey },
         getPipelineConfig()
       );
       if (decision.level === "S3" || decision.action === "block") {
@@ -3359,13 +3216,14 @@ ${GUARDCLAW_S2_CLOSE}`
         return { cancel: true };
       }
       if (decision.level === "S2") {
-        const desenResult = await desensitizeWithLocalModel(content, privacyConfig, ctx.sessionKey);
+        const desenResult = await desensitizeWithLocalModel(outboundContent, privacyConfig, ctx.sessionKey);
         if (desenResult.failed) {
           api.logger.warn("[GuardClaw] S2 desensitization failed \u2014 cancelling outbound message to prevent PII leak");
           return { cancel: true };
         }
         return { content: desenResult.desensitized };
       }
+      if (outboundContent !== content) return { content: outboundContent };
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in message_sending hook: ${String(err)}`);
     }

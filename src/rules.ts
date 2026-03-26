@@ -16,12 +16,22 @@ const patternCache = new Map<string, RegExp>();
 /**
  * Detect patterns likely to cause catastrophic backtracking (ReDoS).
  * Rejects patterns with nested quantifiers like (a+)+, (a*)*, (a+)*, etc.
+ *
+ * Note: This is a heuristic, not a complete ReDoS prover.  It catches the
+ * most common classes.  For truly untrusted input a library like `recheck`
+ * or `safe-regex` would be more thorough.
  */
 function isDangerousRegex(pattern: string): boolean {
   // Nested quantifiers on groups: (x+)+, (x*)*, (x+)*, (x?)+ etc.
   if (/\([^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
   // Alternation with overlap inside a repeated group: (a|a)+
   if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern)) return true;
+  // Curly-brace quantifiers inside a repeated group: (a{2,})+
+  if (/\([^)]*\{\d+,\d*\}[^)]*\)[+*?{]/.test(pattern)) return true;
+  // Character class followed by a quantifier inside a repeated group: ([a-z]+)*
+  if (/\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
+  // Alternation of quantified terms in a repeated group: (a+|b+)*
+  if (/\([^)]*[+*?][^)]*\|[^)]*[+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   return false;
 }
 
