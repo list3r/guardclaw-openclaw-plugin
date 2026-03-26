@@ -458,7 +458,11 @@ async function loadInjectionAttemptCounts() {
         injectionAttemptCounts.set(id, entry);
       }
     }
-  } catch {
+  } catch (err) {
+    const code = err.code;
+    if (code !== "ENOENT") {
+      console.warn("[GuardClaw] guardclaw-attempt-counts.json appears corrupt, starting fresh:", String(err));
+    }
   }
 }
 async function persistInjectionAttemptCounts() {
@@ -505,7 +509,8 @@ function watchConfigFile(configPath, logger) {
           liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
           updateInjectionConfig(liveInjectionConfig);
           logger.info("[GuardClaw] guardclaw.json changed \u2014 config hot-reloaded");
-        } catch {
+        } catch (err) {
+          console.warn("[GuardClaw] Config reload failed (partial write?) \u2014 retaining previous config:", String(err));
         }
       }, 300);
     });
@@ -1060,14 +1065,21 @@ function loadPromptWithVars(name, fallback, vars) {
 function invalidatePrompt(name) {
   cache.delete(name);
 }
+function sanitizePromptName(name) {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+}
 function writePrompt(name, content) {
+  const safe = sanitizePromptName(name);
+  if (!safe) throw new Error(`Invalid prompt name: ${name}`);
   mkdirSync(PROMPTS_DIR, { recursive: true });
-  const filePath = resolve(PROMPTS_DIR, `${name}.md`);
+  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
   writeFileSync(filePath, content, "utf-8");
-  invalidatePrompt(name);
+  invalidatePrompt(safe);
 }
 function readPromptFromDisk(name) {
-  const filePath = resolve(PROMPTS_DIR, `${name}.md`);
+  const safe = sanitizePromptName(name);
+  if (!safe) return null;
+  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
   try {
     if (existsSync(filePath)) {
       return readFileSync2(filePath, "utf-8").trim();

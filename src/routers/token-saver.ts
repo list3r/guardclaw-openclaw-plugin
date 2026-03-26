@@ -10,6 +10,12 @@
  *   - Prompt-hash cache avoids redundant LLM calls (TTL 5 min)
  *   - Reuses GuardClaw's callChatCompletion() infrastructure (Ollama/vLLM/etc.)
  *   - Default disabled — users opt in via config
+ *
+ * OpenRouter modes:
+ *   openrouter.enabled             → tiers work normally, all targets go through
+ *                                    OpenRouter (one key, one endpoint)
+ *   openrouter.enabled + passthrough → skip tiers entirely, route straight to
+ *                                    OpenRouter with a single model (default: "auto")
  */
 
 import { createHash } from "node:crypto";
@@ -24,12 +30,17 @@ type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
 type OpenRouterConfig = {
   enabled: boolean;
+  /**
+   * Skip tier classification entirely and route everything straight to
+   * OpenRouter with a single model. Default: false.
+   */
+  passthrough?: boolean;
   /** OpenClaw provider name that points to OpenRouter (default: "openrouter") */
   providerName?: string;
   /**
-   * Model to use on OpenRouter. Defaults to "auto" which lets OpenRouter pick
-   * the best model for each request. Use provider/model format for a specific
-   * model e.g. "anthropic/claude-sonnet-4.6" or "openai/gpt-4o".
+   * Model used in passthrough mode. Defaults to "auto" which lets OpenRouter
+   * pick the best model per request. Use provider/model format for a specific
+   * model e.g. "anthropic/claude-sonnet-4.6".
    */
   model?: string;
 };
@@ -47,6 +58,7 @@ type TokenSaverConfig = {
 };
 
 const OPENROUTER_PROVIDER = "openrouter";
+const OPENROUTER_DEFAULT_MODEL = "auto";
 
 const DEFAULT_CONFIG: TokenSaverConfig = {
   enabled: false,
@@ -62,7 +74,16 @@ const DEFAULT_CONFIG: TokenSaverConfig = {
   cacheTtlMs: 300_000,
 };
 
-const OPENROUTER_DEFAULT_MODEL = "auto";
+/**
+ * When OpenRouter is enabled (but not passthrough), these are the default
+ * tier targets — same models, unified provider/key, OpenRouter namespace format.
+ */
+const OPENROUTER_DEFAULT_TIERS: Record<Tier, { provider: string; model: string }> = {
+  SIMPLE:    { provider: OPENROUTER_PROVIDER, model: "openai/gpt-4o-mini" },
+  MEDIUM:    { provider: OPENROUTER_PROVIDER, model: "openai/gpt-4o" },
+  COMPLEX:   { provider: OPENROUTER_PROVIDER, model: "anthropic/claude-sonnet-4.6" },
+  REASONING: { provider: OPENROUTER_PROVIDER, model: "openai/o4-mini" },
+};
 
 const DEFAULT_JUDGE_PROMPT = `You are a task complexity classifier. Classify the user's task into exactly one tier.
 
@@ -150,6 +171,15 @@ function resolveConfig(pluginConfig: Record<string, unknown>): TokenSaverConfig 
 
   const orCfg = (options.openrouter ?? {}) as Partial<OpenRouterConfig>;
   const openrouterEnabled = orCfg.enabled === true;
+  const orProviderName = orCfg.providerName ?? OPENROUTER_PROVIDER;
+
+  // When OpenRouter is enabled (non-passthrough), use OpenRouter-namespaced
+  // model names as tier defaults so all traffic goes through one provider/key.
+  const baseTiers = openrouterEnabled && !orCfg.passthrough
+    ? (Object.fromEntries(
+        Object.entries(OPENROUTER_DEFAULT_TIERS).map(([k, v]) => [k, { ...v, provider: orProviderName }])
+      ) as Record<Tier, { provider: string; model: string }>)
+    : DEFAULT_CONFIG.tiers;
 
   return {
     enabled: tsConfig?.enabled ?? DEFAULT_CONFIG.enabled,
@@ -172,14 +202,15 @@ function resolveConfig(pluginConfig: Record<string, unknown>): TokenSaverConfig 
       (options.judgeApiKey as string) ??
       privacyLocalModel?.apiKey,
     tiers: {
-      ...DEFAULT_CONFIG.tiers,
+      ...baseTiers,
       ...((options.tiers as Record<string, { provider: string; model: string }>) ?? {}),
     },
     cacheTtlMs: (options.cacheTtlMs as number) ?? DEFAULT_CONFIG.cacheTtlMs,
     openrouter: openrouterEnabled
       ? {
           enabled: true,
-          providerName: orCfg.providerName ?? OPENROUTER_PROVIDER,
+          passthrough: orCfg.passthrough === true,
+          providerName: orProviderName,
           model: orCfg.model ?? OPENROUTER_DEFAULT_MODEL,
         }
       : undefined,
@@ -207,9 +238,9 @@ export const tokenSaverRouter: GuardClawRouter = {
       return { level: "S1", action: "passthrough", reason: "subagent — skipped" };
     }
 
-    // OpenRouter mode — bypass the tier system entirely.
-    // No local judge needed; everything routes to OpenRouter directly.
-    if (config.openrouter?.enabled) {
+    // OpenRouter passthrough — skip tier classification entirely.
+    // No local judge needed; everything routes to OpenRouter with a single model.
+    if (config.openrouter?.enabled && config.openrouter.passthrough) {
       return {
         level: "S1",
         action: "redirect",
@@ -217,7 +248,7 @@ export const tokenSaverRouter: GuardClawRouter = {
           provider: config.openrouter.providerName ?? OPENROUTER_PROVIDER,
           model: config.openrouter.model ?? OPENROUTER_DEFAULT_MODEL,
         },
-        reason: "openrouter",
+        reason: "openrouter passthrough",
         confidence: 1,
       };
     }
@@ -279,5 +310,5 @@ export const tokenSaverRouter: GuardClawRouter = {
 
 // ── Exports for testing ──
 
-export { parseTier, hashPrompt, classificationCache, resolveConfig, DEFAULT_CONFIG, DEFAULT_JUDGE_PROMPT, OPENROUTER_PROVIDER, OPENROUTER_DEFAULT_MODEL };
+export { parseTier, hashPrompt, classificationCache, resolveConfig, DEFAULT_CONFIG, DEFAULT_JUDGE_PROMPT, OPENROUTER_PROVIDER, OPENROUTER_DEFAULT_MODEL, OPENROUTER_DEFAULT_TIERS };
 export type { Tier, TokenSaverConfig, OpenRouterConfig };
