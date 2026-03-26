@@ -1,9 +1,10 @@
 /**
  * GuardClaw S0 — Injection Detection Patterns
  *
- * Inspired by LLM Guard (https://github.com/protectai/llm-guard) by Protect AI.
- * Apache 2.0 licence acknowledgement: patterns and approach adapted from
- * LLM Guard's PromptInjection scanner.
+ * These regex patterns are original to GuardClaw. LLM Guard
+ * (https://github.com/protectai/llm-guard, MIT License) by Protect AI uses a
+ * model-only approach with no heuristic patterns. The pattern categories and
+ * scoring weights here are independently authored.
  */
 
 export const INJECTION_PATTERNS = {
