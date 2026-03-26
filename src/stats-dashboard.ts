@@ -590,6 +590,70 @@ export async function statsHttpHandler(
     return true;
   }
 
+  // ── Exempt Senders API ──
+
+  if (req.method === "GET" && sub === "/api/exempt") {
+    const exempt = getLiveInjectionConfig().exempt_senders ?? [];
+    json(res, { exempt });
+    return true;
+  }
+
+  if (req.method === "POST" && sub === "/api/exempt") {
+    try {
+      const body = JSON.parse(await readBody(req)) as { senderId: string; label?: string };
+      const senderId = body.senderId?.trim();
+      if (!senderId) {
+        json(res, { error: "senderId required" }, 400);
+        return true;
+      }
+      const current = getLiveInjectionConfig().exempt_senders ?? [];
+      if (current.includes(senderId)) {
+        json(res, { ok: true, already: true });
+        return true;
+      }
+      const newExempt = [...current, senderId];
+      updateLiveInjectionConfig({ exempt_senders: newExempt });
+      let cfg: Record<string, unknown> = {};
+      try {
+        cfg = JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8")) as Record<string, unknown>;
+      } catch { /* file may not exist */ }
+      if (!cfg.privacy) cfg.privacy = {};
+      const priv = cfg.privacy as Record<string, unknown>;
+      if (!priv.injection) priv.injection = {};
+      (priv.injection as Record<string, unknown>).exempt_senders = newExempt;
+      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
+      json(res, { ok: true });
+    } catch (err) {
+      json(res, { error: String(err) }, 400);
+    }
+    return true;
+  }
+
+  if (req.method === "DELETE" && sub.startsWith("/api/exempt/")) {
+    try {
+      const senderId = decodeURIComponent(sub.slice("/api/exempt/".length)).trim();
+      if (!senderId) {
+        json(res, { error: "senderId required" }, 400);
+        return true;
+      }
+      const newExempt = (getLiveInjectionConfig().exempt_senders ?? []).filter((id) => id !== senderId);
+      updateLiveInjectionConfig({ exempt_senders: newExempt });
+      let cfg: Record<string, unknown> = {};
+      try {
+        cfg = JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8")) as Record<string, unknown>;
+      } catch { /* file may not exist */ }
+      if (!cfg.privacy) cfg.privacy = {};
+      const priv = cfg.privacy as Record<string, unknown>;
+      if (!priv.injection) priv.injection = {};
+      (priv.injection as Record<string, unknown>).exempt_senders = newExempt;
+      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
+      json(res, { ok: true });
+    } catch (err) {
+      json(res, { error: String(err) }, 400);
+    }
+    return true;
+  }
+
   return false;
 }
 
@@ -825,7 +889,7 @@ function dashboardHtml(): string {
   <div class="tab" data-tab="detections" data-i18n="tab.detections">Detection Log</div>
   <div class="tab" data-tab="rules"><span data-i18n="tab.rules">Router Rules</span> <span class="badge badge-hot">live</span></div>
   <div class="tab" data-tab="config"><span data-i18n="tab.config">Configuration</span> <span class="badge badge-hot">live</span></div>
-  <div class="tab" data-tab="banned">Banned Senders</div>
+  <div class="tab" data-tab="banned">Access Control</div>
 </div>
 
 <!-- Overview -->
@@ -899,16 +963,38 @@ function dashboardHtml(): string {
   </table>
 </div>
 
-<!-- Banned Senders -->
+<!-- Access Control (Exempt + Banned) -->
 <div id="banned-panel" class="panel">
+
+  <!-- Exempt Senders -->
+  <div class="config-section" style="margin-bottom:20px">
+    <h3 style="color:#8DC63F">Trusted Senders (Exempt from Injection Detection)</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+      Discord user IDs listed here skip the S0 injection scanner entirely. Use this for operators and trusted team members whose messages should never be blocked. Their messages are still subject to S2/S3 privacy routing.<br>
+      <span style="font-size:11px;color:var(--text-tertiary);margin-top:4px;display:block">Find your Discord ID: enable Developer Mode in Discord settings → right-click your name → Copy User ID.</span>
+    </p>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <input id="exempt-input" type="text" placeholder="Discord user ID (e.g. 1317396442993922061)"
+        style="flex:1;padding:10px 14px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:var(--font-mono);outline:none"
+        onkeydown="if(event.key==='Enter')addExempt()">
+      <button class="btn btn-primary btn-sm" onclick="addExempt()" style="white-space:nowrap">+ Add Trusted</button>
+    </div>
+    <table class="data-table" id="exempt-table">
+      <thead><tr><th>Discord User ID</th><th style="text-align:right">Action</th></tr></thead>
+      <tbody id="exempt-body"><tr><td colspan="2" class="empty-state">No trusted senders configured</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Banned Senders -->
   <div class="config-section">
-    <h3 style="color:#ef4444">Banned Senders</h3>
-    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Senders that have been automatically banned after 2+ injection attempts. They are blocked immediately before any detection runs.</p>
+    <h3 style="color:#ef4444">Banned Senders (Auto-blocked)</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Senders automatically banned after 2+ injection attempts. Blocked immediately before any detection runs.</p>
     <table class="data-table" id="banned-table">
       <thead><tr><th>Sender ID</th><th style="text-align:right">Action</th></tr></thead>
       <tbody id="banned-body"><tr><td colspan="2" class="empty-state">No banned senders</td></tr></tbody>
     </table>
   </div>
+
 </div>
 
 <!-- Router Rules -->
@@ -1861,6 +1947,9 @@ document.querySelectorAll('.tab').forEach(function(t) {
     document.querySelectorAll('.panel').forEach(function(x) { x.classList.remove('active'); });
     t.classList.add('active');
     document.getElementById(t.dataset.tab + '-panel').classList.add('active');
+    // Refresh data for tabs that show live state
+    if (t.dataset.tab === 'banned') refreshAccessControl();
+    if (t.dataset.tab === 'detections') refreshDetections();
   });
 });
 
@@ -2387,26 +2476,87 @@ function refreshAll() {
   refreshStats();
   refreshSessions();
   refreshDetections();
-  refreshBanned();
+  refreshAccessControl();
 }
 
-// ── Banned Senders ──
+// ── Access Control (Exempt + Banned) ──
 
-async function refreshBanned() {
+async function refreshAccessControl() {
   try {
-    var data = await fetch(BASE + '/banned').then(function(r) { return r.json(); });
-    var tbody = document.getElementById('banned-body');
-    if (!tbody) return;
-    var banned = data.banned || [];
-    if (banned.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="2" class="empty-state">No banned senders</td></tr>';
-      return;
+    var [exemptData, bannedData] = await Promise.all([
+      fetch(BASE + '/exempt').then(function(r) { return r.json(); }),
+      fetch(BASE + '/banned').then(function(r) { return r.json(); }),
+    ]);
+
+    // Exempt senders
+    var exemptBody = document.getElementById('exempt-body');
+    if (exemptBody) {
+      var exempt = exemptData.exempt || [];
+      if (exempt.length === 0) {
+        exemptBody.innerHTML = '<tr><td colspan="2" class="empty-state">No trusted senders configured</td></tr>';
+      } else {
+        exemptBody.innerHTML = exempt.map(function(id) {
+          return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
+            '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="removeExempt(\\'' + escHtml(id) + '\\')">Remove</button></td></tr>';
+        }).join('');
+      }
     }
-    tbody.innerHTML = banned.map(function(id) {
-      return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
-        '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="unbanSender(\\'' + escHtml(id) + '\\')">Unban</button></td></tr>';
-    }).join('');
+
+    // Banned senders
+    var bannedBody = document.getElementById('banned-body');
+    if (bannedBody) {
+      var banned = bannedData.banned || [];
+      if (banned.length === 0) {
+        bannedBody.innerHTML = '<tr><td colspan="2" class="empty-state">No banned senders</td></tr>';
+      } else {
+        bannedBody.innerHTML = banned.map(function(id) {
+          return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
+            '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="unbanSender(\\'' + escHtml(id) + '\\')">Unban</button></td></tr>';
+        }).join('');
+      }
+    }
   } catch (e) { /* non-critical */ }
+}
+
+// Keep refreshBanned as alias for backward compat
+function refreshBanned() { refreshAccessControl(); }
+
+async function addExempt() {
+  var input = document.getElementById('exempt-input');
+  var senderId = (input.value || '').trim();
+  if (!senderId) { showToast('Enter a Discord user ID', true); return; }
+  try {
+    var res = await fetch(BASE + '/exempt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ senderId: senderId }),
+    });
+    var result = await res.json();
+    if (result.ok) {
+      showToast(result.already ? senderId + ' already trusted' : 'Added trusted sender: ' + senderId);
+      input.value = '';
+      refreshAccessControl();
+    } else {
+      showToast('Failed: ' + (result.error || 'unknown'), true);
+    }
+  } catch (e) {
+    showToast('Failed: ' + e.message, true);
+  }
+}
+
+async function removeExempt(senderId) {
+  try {
+    var res = await fetch(BASE + '/exempt/' + encodeURIComponent(senderId), { method: 'DELETE' });
+    var result = await res.json();
+    if (result.ok) {
+      showToast('Removed trusted sender: ' + senderId);
+      refreshAccessControl();
+    } else {
+      showToast('Failed: ' + (result.error || 'unknown'), true);
+    }
+  } catch (e) {
+    showToast('Failed: ' + e.message, true);
+  }
 }
 
 async function unbanSender(senderId) {
@@ -2419,7 +2569,7 @@ async function unbanSender(senderId) {
     var result = await res.json();
     if (result.ok) {
       showToast('Unbanned: ' + senderId);
-      refreshBanned();
+      refreshAccessControl();
     } else {
       showToast('Unban failed: ' + (result.error || 'unknown'), true);
     }

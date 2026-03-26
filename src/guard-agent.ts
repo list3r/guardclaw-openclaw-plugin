@@ -59,10 +59,55 @@ export function getGuardAgentConfig(config: PrivacyConfig): {
 }
 
 /**
- * Check if a session key belongs to a guard subsession
+ * Check if a session key belongs to a guard subsession (pattern-based).
+ *
+ * NOTE: Use isVerifiedGuardSession() for elevated-trust checks (file access,
+ * Keychain, full history).  This function is kept for backward compatibility
+ * with OpenClaw SDK callbacks that only have the session key available and
+ * cannot block on the registry.
  */
 export function isGuardSessionKey(sessionKey: string): boolean {
   return sessionKey.endsWith(":guard") || sessionKey.includes(":guard:");
+}
+
+// ── Guard session registry (#12) ──────────────────────────────────────────────
+//
+// Pattern-only matching (isGuardSessionKey) is exploitable if an attacker
+// can influence the session key to contain ":guard".  The registry tracks
+// parent session keys that legitimately routed to a guard agent so we can
+// cross-check before granting elevated trust.
+
+const registeredGuardParents = new Set<string>();
+
+/**
+ * Register a parent session key as having legitimately spawned a guard session.
+ * Called from hooks.ts whenever before_model_resolve routes to the guard agent.
+ * The guard session key is expected to be `parentKey + ":guard[...]"`.
+ */
+export function registerGuardSessionParent(parentSessionKey: string): void {
+  registeredGuardParents.add(parentSessionKey);
+}
+
+/**
+ * Returns true only when BOTH conditions hold:
+ *   1. The key looks like a guard session (isGuardSessionKey)
+ *   2. The parent session was explicitly registered when S3 was detected
+ *
+ * Use this for all elevated-trust decisions (full history access, Keychain,
+ * network-tool blocking) instead of bare isGuardSessionKey().
+ */
+export function isVerifiedGuardSession(sessionKey: string): boolean {
+  if (!isGuardSessionKey(sessionKey)) return false;
+  const idx = sessionKey.indexOf(":guard");
+  if (idx === -1) return false;
+  const parentKey = sessionKey.slice(0, idx);
+  return registeredGuardParents.has(parentKey);
+}
+
+/** Clear registry entry when a guard session ends (housekeeping). */
+export function deregisterGuardSession(sessionKey: string): void {
+  const idx = sessionKey.indexOf(":guard");
+  if (idx !== -1) registeredGuardParents.delete(sessionKey.slice(0, idx));
 }
 
 /**

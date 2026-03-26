@@ -26,6 +26,9 @@ import {
   buildMainSessionPlaceholder,
   getGuardAgentConfig,
   isGuardSessionKey,
+  isVerifiedGuardSession,
+  registerGuardSessionParent,
+  deregisterGuardSession,
   isLocalProvider,
 } from "./guard-agent.js";
 import { desensitizeWithLocalModel } from "./local-model.js";
@@ -92,7 +95,7 @@ function getPipelineConfig(): Record<string, unknown> {
  */
 function shouldUseFullMemoryTrack(sessionKey: string): boolean {
   if (isActiveLocalRouting(sessionKey)) return true;
-  if (isGuardSessionKey(sessionKey)) return true;
+  if (isVerifiedGuardSession(sessionKey)) return true;
   if (isSessionMarkedPrivate(sessionKey)) {
     const policy = getLiveConfig().s2Policy ?? "proxy";
     return policy === "local";
@@ -120,8 +123,21 @@ KEYCHAIN ACCESS (macOS only):
 
 语言规则：必须使用与用户相同的语言回复。如果用户用中文提问，你必须用中文回答。`;
 
+/**
+ * Build the guard agent system prompt.
+ *
+ * Security rules are ALWAYS taken from DEFAULT_GUARD_AGENT_SYSTEM_PROMPT — they
+ * are hardcoded and cannot be overridden from disk (#3).  Only the task section
+ * (loaded from prompts/guard-agent-task.md) is user-customizable, and it is
+ * appended AFTER the rules so it cannot shadow or replace them.
+ *
+ * This prevents an attacker who can write to the prompts directory from
+ * silently disabling the "no network" or "no raw secret echo" rules.
+ */
 function getGuardAgentSystemPrompt(): string {
-  return loadPrompt("guard-agent-system", DEFAULT_GUARD_AGENT_SYSTEM_PROMPT);
+  const taskSection = loadPrompt("guard-agent-task", "");
+  if (!taskSection) return DEFAULT_GUARD_AGENT_SYSTEM_PROMPT;
+  return `${DEFAULT_GUARD_AGENT_SYSTEM_PROMPT}\n\n## Additional Task Instructions\n${taskSection}`;
 }
 
 /**
@@ -340,8 +356,11 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
 
         if (!isExemptSender) {
-          // Extract actual user content from OpenClaw envelope (Discord/iMessage/Telegram)
-          const userContent = extractUserContent(msgStr);
+          // Extract actual user content from OpenClaw envelope (Discord/iMessage/Telegram).
+          // Also strip any thread-context prefix so DeBERTa doesn't see OpenClaw's own
+          // role labels (🤖 claude, [Thread starter...]) as injection signals.
+          const rawExtracted = extractUserContent(msgStr);
+          const userContent = rawExtracted ? stripThreadContextPrefix(rawExtracted) : stripThreadContextPrefix(msgStr) || null;
           if (!userContent) {
             // No user content found — skip injection detection for pure metadata
             api.logger.debug?.(`[GuardClaw S0] Skipping injection check — no user content extracted`);
@@ -479,6 +498,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
 
         setActiveLocalRouting(sessionKey);
+        registerGuardSessionParent(sessionKey); // #12: register before guard session spawns
         stashDetection(sessionKey, {
           level: "S3",
           reason: rulePreCheck.reason,
@@ -523,6 +543,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       if (decision.level === "S3") {
         trackSessionLevel(sessionKey, "S3");
         setActiveLocalRouting(sessionKey);
+        registerGuardSessionParent(sessionKey); // #12: register before guard session spawns
         stashDetection(sessionKey, {
           level: "S3",
           reason: decision.reason,
@@ -555,6 +576,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           api.logger.warn("[GuardClaw] S2 desensitization failed — escalating to S3 (local-only) to prevent PII leak");
           trackSessionLevel(sessionKey, "S3");
           setActiveLocalRouting(sessionKey);
+          registerGuardSessionParent(sessionKey); // #12: register before guard session spawns
           stashDetection(sessionKey, {
             level: "S3",
             reason: `${decision.reason}; desensitization failed — escalated to S3`,
@@ -651,6 +673,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         if (decision.level === "S3") {
           trackSessionLevel(sessionKey, "S3");
           setActiveLocalRouting(sessionKey);
+          registerGuardSessionParent(sessionKey); // #12: register before guard session spawns
           stashDetection(sessionKey, {
             level: "S3",
             reason: decision.reason,
@@ -803,7 +826,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // Guard Agent sessions run entirely locally (S3 isolation).  They have
       // elevated trust for local tools but must be prevented from exfiltrating
       // secrets via network calls or by leaking secret values in tool params.
-      if (isGuardSessionKey(sessionKey)) {
+      // Use isVerifiedGuardSession (#12) to prevent session-key forgery attacks.
+      if (isVerifiedGuardSession(sessionKey)) {
         // 1. Block all outbound network tools unconditionally.
         if (isNetworkTool(toolName)) {
           api.logger.warn(
@@ -839,7 +863,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       // File-access guard for cloud models only — local models (Guard Agent
       // sessions and S3 active routing) are trusted to read full history.
-      if (!isGuardSessionKey(sessionKey) && !isActiveLocalRouting(sessionKey)) {
+      if (!isVerifiedGuardSession(sessionKey) && !isActiveLocalRouting(sessionKey)) {
         const pathValues = extractPathsFromParams(typedParams);
         for (const p of pathValues) {
           if (isProtectedMemoryPath(p, baseDir)) {
@@ -889,7 +913,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // This is the only reliable interception point — after_tool_call is
       // a void hook (can't modify output) and tool_result_persist only
       // modifies persisted data, not the live model context.
-      if (isExecTool(toolName) && !isActiveLocalRouting(sessionKey) && !isGuardSessionKey(sessionKey)) {
+      if (isExecTool(toolName) && !isActiveLocalRouting(sessionKey) && !isVerifiedGuardSession(sessionKey)) {
         const command = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
         if (command) {
           const blocked = isHighRiskExecCommand(command);
@@ -1021,7 +1045,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       //   a) Track bash results that came from Keychain fetch commands.
       //   b) Redact tracked secrets from the guard session's own persisted transcript
       //      (the full.jsonl) as an extra safety net — the guard may echo the secret.
-      if (isGuardSessionKey(sessionKey)) {
+      if (isVerifiedGuardSession(sessionKey)) {
         const resultText = extractMessageText(msg);
         if (resultText) {
           // Track result as a secret if this is a pending Keychain bash fetch.
@@ -1253,7 +1277,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // though guard session messages are filtered from clean.jsonl by
       // isGuardAgentMessage(), we redact tracked secrets from the guard's
       // full.jsonl transcript as a defense-in-depth measure.
-      if (role === "assistant" && isGuardSessionKey(sessionKey)) {
+      if (role === "assistant" && isVerifiedGuardSession(sessionKey)) {
         const assistantText = extractMessageText(msg);
         if (assistantText && assistantText.length >= 4) {
           // First: redact tracked Keychain secrets
@@ -1317,6 +1341,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       clearSessionState(sessionKey);
       clearSessionSecrets(sessionKey); // Free any in-memory Keychain secret values
+      deregisterGuardSession(sessionKey); // #12: clean up registry entry for guard subsessions
 
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
@@ -1646,6 +1671,35 @@ function shouldSkipMessage(msg: string): boolean {
   // Skip pure system events with no user content
   if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata") && !extractUserContent(msg)) return true;
   return false;
+}
+
+/**
+ * Strip OpenClaw's Discord thread context prefix from a message before passing
+ * to injection detection.  The prefix looks like:
+ *   [Thread starter - for context]\n🤖 claude\n\nConversation info: ...
+ *
+ * DeBERTa sees "🤖 claude" and the JSON role labels and classifies the whole
+ * thing as a role-override injection with very high confidence — a false positive
+ * on OpenClaw's own envelope format.
+ *
+ * If the message has a Discord envelope (conversation_label / sender_id),
+ * extractUserContent already handles stripping. This function handles the
+ * case where those markers are absent (e.g. thread-starter messages that
+ * don't carry the full JSON envelope).
+ */
+function stripThreadContextPrefix(msg: string): string {
+  // Pattern: starts with [Thread starter - for context] up to the actual user text
+  // The user text follows the last ```\n\n block, or after the Sender: block
+  if (!msg.startsWith("[Thread starter")) return msg;
+  const lastBlockEnd = msg.lastIndexOf("```\n\n");
+  if (lastBlockEnd !== -1) {
+    const after = msg.slice(lastBlockEnd + 5).trim();
+    if (after.length > 0) return after;
+  }
+  // Fallback: drop everything before the last double-newline that follows a ``` close
+  const match = msg.match(/```\s*\n+([\s\S]+)$/);
+  if (match?.[1]?.trim()) return match[1].trim();
+  return msg;
 }
 
 /**

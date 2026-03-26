@@ -10,6 +10,8 @@
  */
 
 import { readFileSync, watch, type FSWatcher } from "node:fs";
+import { readFile, writeFile, rename } from "node:fs/promises";
+import { join } from "node:path";
 import type { PrivacyConfig, InjectionConfig } from "./types.js";
 import { defaultPrivacyConfig, defaultInjectionConfig } from "./config-schema.js";
 import { updateInjectionConfig } from "./injection/index.js";
@@ -26,12 +28,59 @@ export const injectionAttemptCounts = new Map<string, { count: number; ts: numbe
 /** Track senders currently mid-ban to prevent duplicate concurrent ban operations. */
 export const pendingBans = new Set<string>();
 
+// ── Attempt count persistence (#7) ─────────────────────────────────────────
+// Path resolved lazily once HOME is known (not available at module load time
+// in all environments).
+let _attemptCountsPath: string | null = null;
+
+function getAttemptCountsPath(): string {
+  if (!_attemptCountsPath) {
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+    _attemptCountsPath = join(home, ".openclaw", "guardclaw-attempt-counts.json");
+  }
+  return _attemptCountsPath;
+}
+
+/**
+ * Load persisted injection attempt counts from disk on startup.
+ * Prunes entries older than ATTEMPT_TTL_MS so the file doesn't grow unbounded.
+ * Non-fatal — silently no-ops if the file is absent or corrupt.
+ */
+export async function loadInjectionAttemptCounts(): Promise<void> {
+  try {
+    const raw = await readFile(getAttemptCountsPath(), "utf-8");
+    const data = JSON.parse(raw) as Record<string, { count: number; ts: number }>;
+    const now = Date.now();
+    for (const [id, entry] of Object.entries(data)) {
+      if (now - entry.ts < ATTEMPT_TTL_MS) {
+        injectionAttemptCounts.set(id, entry);
+      }
+    }
+  } catch { /* absent or corrupt — start fresh */ }
+}
+
+/** Atomically persist the current attempt counts to disk (best-effort). */
+async function persistInjectionAttemptCounts(): Promise<void> {
+  try {
+    const filePath = getAttemptCountsPath();
+    const tmp = filePath + ".tmp";
+    const data: Record<string, { count: number; ts: number }> = {};
+    for (const [id, entry] of injectionAttemptCounts.entries()) {
+      data[id] = entry;
+    }
+    await writeFile(tmp, JSON.stringify(data));
+    await rename(tmp, filePath); // atomic on POSIX
+  } catch { /* best-effort */ }
+}
+
 /** Increment attempt count for a sender (resetting if expired) and return the new count. */
 export function recordInjectionAttempt(senderId: string): number {
   const now = Date.now();
   const entry = injectionAttemptCounts.get(senderId);
   const count = (entry && now - entry.ts < ATTEMPT_TTL_MS) ? entry.count + 1 : 1;
   injectionAttemptCounts.set(senderId, { count, ts: now });
+  // Persist async — fire-and-forget so the hot path isn't blocked (#7)
+  persistInjectionAttemptCounts().catch(() => {});
   return count;
 }
 

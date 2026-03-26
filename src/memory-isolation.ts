@@ -190,6 +190,23 @@ export class MemoryIsolationManager {
       // Write to clean memory
       await this.writeMemory(cleanMemory, true);
 
+      // ── Integrity check (#15) ──────────────────────────────────────────────
+      // Re-read the written MEMORY.md and verify no guard section marker leaked
+      // through.  This catches bugs in filterGuardContent and race conditions
+      // where the file was modified between filtering and writing.
+      const writtenClean = await this.readMemory(true);
+      if (writtenClean.includes(GUARD_SECTION_BEGIN)) {
+        console.warn("[GuardClaw] INTEGRITY: GUARD_SECTION_BEGIN found in MEMORY.md after sync — re-filtering");
+        const reFiltered = this.filterGuardContent(writtenClean);
+        if (reFiltered.includes(GUARD_SECTION_BEGIN)) {
+          // filterGuardContent itself failed — truncate to empty rather than leak
+          console.error("[GuardClaw] INTEGRITY: re-filter failed to remove guard markers — clearing MEMORY.md as safety fallback");
+          await this.writeMemory("", true);
+        } else {
+          await this.writeMemory(reFiltered, true);
+        }
+      }
+
       console.log("[GuardClaw] MEMORY-FULL.md synced to MEMORY.md");
     } catch (err) {
       console.error("[GuardClaw] Failed to sync memory:", err);
@@ -245,6 +262,15 @@ export class MemoryIsolationManager {
           const cleanContent = await this.redactContent(guardStripped, privacyConfig);
 
           await fs.promises.writeFile(cleanPath, cleanContent, "utf-8");
+
+          // ── Integrity check (#15) ────────────────────────────────────────────
+          // Verify the written daily clean file contains no guard section markers.
+          if (cleanContent.includes(GUARD_SECTION_BEGIN)) {
+            console.warn(`[GuardClaw] INTEGRITY: GUARD_SECTION_BEGIN in daily clean file ${file} — re-filtering`);
+            const reFiltered = this.filterGuardContent(cleanContent);
+            await fs.promises.writeFile(cleanPath, reFiltered, "utf-8");
+          }
+
           synced++;
         } catch (fileErr) {
           console.error(`[GuardClaw] Failed to sync daily file ${file}:`, fileErr);

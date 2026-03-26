@@ -20,7 +20,7 @@ import { RouterPipeline, setGlobalPipeline } from "./src/router-pipeline.js";
 import { privacyRouter } from "./src/routers/privacy.js";
 import { tokenSaverRouter } from "./src/routers/token-saver.js";
 import { TokenStatsCollector, setGlobalCollector } from "./src/token-stats.js";
-import { initLiveConfig, watchConfigFile } from "./src/live-config.js";
+import { initLiveConfig, watchConfigFile, loadInjectionAttemptCounts } from "./src/live-config.js";
 import { initDashboard, statsHttpHandler } from "./src/stats-dashboard.js";
 import { initInjectionConfig } from "./src/injection/index.js";
 import { runDebertaClassifier } from "./src/injection/deberta.js";
@@ -395,6 +395,8 @@ const plugin = {
     // ── Step 5: Initialize live config & token stats ──
     initLiveConfig(resolvedPluginConfig);
     watchConfigFile(GUARDCLAW_CONFIG_PATH, api.logger);
+    // Load persisted injection attempt counts so auto-ban survives restarts (#7)
+    loadInjectionAttemptCounts().catch(() => {});
 
     // ── Step 5b: Initialize S0 injection config & warm up model ──
     const userInjection = ((resolvedPluginConfig.privacy as Record<string, unknown>)?.injection ?? {}) as InjectionConfig;

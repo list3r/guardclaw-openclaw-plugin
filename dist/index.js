@@ -34,6 +34,7 @@ import {
   isActiveLocalRouting,
   isSessionMarkedPrivate,
   levelToNumeric,
+  loadInjectionAttemptCounts,
   loadPrompt,
   markSessionAsPrivate,
   maxLevel,
@@ -53,7 +54,7 @@ import {
   updateLiveInjectionConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-CD2H4EGT.js";
+} from "./chunk-JY5K2QWW.js";
 
 // index.ts
 import { join as join8 } from "path";
@@ -88,6 +89,21 @@ function getGuardAgentConfig(config) {
 }
 function isGuardSessionKey(sessionKey) {
   return sessionKey.endsWith(":guard") || sessionKey.includes(":guard:");
+}
+var registeredGuardParents = /* @__PURE__ */ new Set();
+function registerGuardSessionParent(parentSessionKey) {
+  registeredGuardParents.add(parentSessionKey);
+}
+function isVerifiedGuardSession(sessionKey) {
+  if (!isGuardSessionKey(sessionKey)) return false;
+  const idx = sessionKey.indexOf(":guard");
+  if (idx === -1) return false;
+  const parentKey = sessionKey.slice(0, idx);
+  return registeredGuardParents.has(parentKey);
+}
+function deregisterGuardSession(sessionKey) {
+  const idx = sessionKey.indexOf(":guard");
+  if (idx !== -1) registeredGuardParents.delete(sessionKey.slice(0, idx));
 }
 function buildMainSessionPlaceholder(level, reason, timestamp) {
   const emoji = level === "S3" ? "\u{1F512}" : "\u{1F511}";
@@ -458,6 +474,17 @@ ${newLines.join("\n")}
       const guardStripped = this.filterGuardContent(fullMemory);
       const cleanMemory = await this.redactContent(guardStripped, privacyConfig);
       await this.writeMemory(cleanMemory, true);
+      const writtenClean = await this.readMemory(true);
+      if (writtenClean.includes(GUARD_SECTION_BEGIN)) {
+        console.warn("[GuardClaw] INTEGRITY: GUARD_SECTION_BEGIN found in MEMORY.md after sync \u2014 re-filtering");
+        const reFiltered = this.filterGuardContent(writtenClean);
+        if (reFiltered.includes(GUARD_SECTION_BEGIN)) {
+          console.error("[GuardClaw] INTEGRITY: re-filter failed to remove guard markers \u2014 clearing MEMORY.md as safety fallback");
+          await this.writeMemory("", true);
+        } else {
+          await this.writeMemory(reFiltered, true);
+        }
+      }
       console.log("[GuardClaw] MEMORY-FULL.md synced to MEMORY.md");
     } catch (err) {
       console.error("[GuardClaw] Failed to sync memory:", err);
@@ -491,6 +518,11 @@ ${newLines.join("\n")}
           const guardStripped = this.filterGuardContent(fullContent);
           const cleanContent = await this.redactContent(guardStripped, privacyConfig);
           await fs.promises.writeFile(cleanPath, cleanContent, "utf-8");
+          if (cleanContent.includes(GUARD_SECTION_BEGIN)) {
+            console.warn(`[GuardClaw] INTEGRITY: GUARD_SECTION_BEGIN in daily clean file ${file} \u2014 re-filtering`);
+            const reFiltered = this.filterGuardContent(cleanContent);
+            await fs.promises.writeFile(cleanPath, reFiltered, "utf-8");
+          }
           synced++;
         } catch (fileErr) {
           console.error(`[GuardClaw] Failed to sync daily file ${file}:`, fileErr);
@@ -2189,7 +2221,7 @@ function getPipelineConfig() {
 }
 function shouldUseFullMemoryTrack(sessionKey) {
   if (isActiveLocalRouting(sessionKey)) return true;
-  if (isGuardSessionKey(sessionKey)) return true;
+  if (isVerifiedGuardSession(sessionKey)) return true;
   if (isSessionMarkedPrivate(sessionKey)) {
     const policy = getLiveConfig().s2Policy ?? "proxy";
     return policy === "local";
@@ -2359,7 +2391,8 @@ function registerHooks(api) {
           api.logger.info(`[GuardClaw S0] Exempt sender bypass \u2014 skipping injection check: senderId=${senderId} session=${sessionKey}`);
         }
         if (!isExemptSender) {
-          const userContent = extractUserContent(msgStr);
+          const rawExtracted = extractUserContent(msgStr);
+          const userContent = rawExtracted ? stripThreadContextPrefix(rawExtracted) : stripThreadContextPrefix(msgStr) || null;
           if (!userContent) {
             api.logger.debug?.(`[GuardClaw S0] Skipping injection check \u2014 no user content extracted`);
           } else {
@@ -2469,6 +2502,7 @@ function registerHooks(api) {
           return;
         }
         setActiveLocalRouting(sessionKey);
+        registerGuardSessionParent(sessionKey);
         stashDetection(sessionKey, {
           level: "S3",
           reason: rulePreCheck.reason,
@@ -2507,6 +2541,7 @@ function registerHooks(api) {
       if (decision.level === "S3") {
         trackSessionLevel(sessionKey, "S3");
         setActiveLocalRouting(sessionKey);
+        registerGuardSessionParent(sessionKey);
         stashDetection(sessionKey, {
           level: "S3",
           reason: decision.reason,
@@ -2535,6 +2570,7 @@ function registerHooks(api) {
           api.logger.warn("[GuardClaw] S2 desensitization failed \u2014 escalating to S3 (local-only) to prevent PII leak");
           trackSessionLevel(sessionKey, "S3");
           setActiveLocalRouting(sessionKey);
+          registerGuardSessionParent(sessionKey);
           stashDetection(sessionKey, {
             level: "S3",
             reason: `${decision.reason}; desensitization failed \u2014 escalated to S3`,
@@ -2617,6 +2653,7 @@ function registerHooks(api) {
         if (decision.level === "S3") {
           trackSessionLevel(sessionKey, "S3");
           setActiveLocalRouting(sessionKey);
+          registerGuardSessionParent(sessionKey);
           stashDetection(sessionKey, {
             level: "S3",
             reason: decision.reason,
@@ -2725,7 +2762,7 @@ ${GUARDCLAW_S2_CLOSE}`
       const typedParams = params;
       const privacyConfig = getLiveConfig();
       const baseDir = privacyConfig.session?.baseDir ?? "~/.openclaw";
-      if (isGuardSessionKey(sessionKey)) {
+      if (isVerifiedGuardSession(sessionKey)) {
         if (isNetworkTool(toolName)) {
           api.logger.warn(
             `[GuardClaw] BLOCKED guard session network tool: ${toolName} (session=${sessionKey})`
@@ -2751,7 +2788,7 @@ ${GUARDCLAW_S2_CLOSE}`
           };
         }
       }
-      if (!isGuardSessionKey(sessionKey) && !isActiveLocalRouting(sessionKey)) {
+      if (!isVerifiedGuardSession(sessionKey) && !isActiveLocalRouting(sessionKey)) {
         const pathValues = extractPathsFromParams(typedParams);
         for (const p of pathValues) {
           if (isProtectedMemoryPath(p, baseDir)) {
@@ -2790,7 +2827,7 @@ ${GUARDCLAW_S2_CLOSE}`
           }
         }
       }
-      if (isExecTool(toolName) && !isActiveLocalRouting(sessionKey) && !isGuardSessionKey(sessionKey)) {
+      if (isExecTool(toolName) && !isActiveLocalRouting(sessionKey) && !isVerifiedGuardSession(sessionKey)) {
         const command = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
         if (command) {
           const blocked = isHighRiskExecCommand(command);
@@ -2899,7 +2936,7 @@ ${GUARDCLAW_S2_CLOSE}`
         }
         return;
       }
-      if (isGuardSessionKey(sessionKey)) {
+      if (isVerifiedGuardSession(sessionKey)) {
         const resultText = extractMessageText(msg);
         if (resultText) {
           if (consumeKeychainFetchPending(sessionKey)) {
@@ -3077,7 +3114,7 @@ ${GUARDCLAW_S2_CLOSE}`
           }
         }
       }
-      if (role === "assistant" && isGuardSessionKey(sessionKey)) {
+      if (role === "assistant" && isVerifiedGuardSession(sessionKey)) {
         const assistantText = extractMessageText(msg);
         if (assistantText && assistantText.length >= 4) {
           const secretRedacted = redactTrackedSecrets(sessionKey, assistantText);
@@ -3124,6 +3161,7 @@ ${GUARDCLAW_S2_CLOSE}`
       await memMgr.syncAllMemoryToClean(privacyConfig);
       clearSessionState(sessionKey);
       clearSessionSecrets(sessionKey);
+      deregisterGuardSession(sessionKey);
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
     } catch (err) {
@@ -3349,6 +3387,17 @@ function shouldSkipMessage(msg) {
   if (/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(msg)) return true;
   if (msg.includes("<<<EXTERNAL_UNTRUSTED_CONTENT") && msg.includes("Untrusted channel metadata") && !extractUserContent(msg)) return true;
   return false;
+}
+function stripThreadContextPrefix(msg) {
+  if (!msg.startsWith("[Thread starter")) return msg;
+  const lastBlockEnd = msg.lastIndexOf("```\n\n");
+  if (lastBlockEnd !== -1) {
+    const after = msg.slice(lastBlockEnd + 5).trim();
+    if (after.length > 0) return after;
+  }
+  const match = msg.match(/```\s*\n+([\s\S]+)$/);
+  if (match?.[1]?.trim()) return match[1].trim();
+  return msg;
 }
 function extractUserContent(msg) {
   if (!msg.includes("conversation_label") && !msg.includes("sender_id")) {
@@ -4646,6 +4695,67 @@ async function statsHttpHandler(req, res) {
     }
     return true;
   }
+  if (req.method === "GET" && sub === "/api/exempt") {
+    const exempt = getLiveInjectionConfig().exempt_senders ?? [];
+    json(res, { exempt });
+    return true;
+  }
+  if (req.method === "POST" && sub === "/api/exempt") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const senderId = body.senderId?.trim();
+      if (!senderId) {
+        json(res, { error: "senderId required" }, 400);
+        return true;
+      }
+      const current = getLiveInjectionConfig().exempt_senders ?? [];
+      if (current.includes(senderId)) {
+        json(res, { ok: true, already: true });
+        return true;
+      }
+      const newExempt = [...current, senderId];
+      updateLiveInjectionConfig({ exempt_senders: newExempt });
+      let cfg = {};
+      try {
+        cfg = JSON.parse(readFileSync2(GUARDCLAW_CONFIG_PATH2, "utf-8"));
+      } catch {
+      }
+      if (!cfg.privacy) cfg.privacy = {};
+      const priv = cfg.privacy;
+      if (!priv.injection) priv.injection = {};
+      priv.injection.exempt_senders = newExempt;
+      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), "utf-8");
+      json(res, { ok: true });
+    } catch (err) {
+      json(res, { error: String(err) }, 400);
+    }
+    return true;
+  }
+  if (req.method === "DELETE" && sub.startsWith("/api/exempt/")) {
+    try {
+      const senderId = decodeURIComponent(sub.slice("/api/exempt/".length)).trim();
+      if (!senderId) {
+        json(res, { error: "senderId required" }, 400);
+        return true;
+      }
+      const newExempt = (getLiveInjectionConfig().exempt_senders ?? []).filter((id) => id !== senderId);
+      updateLiveInjectionConfig({ exempt_senders: newExempt });
+      let cfg = {};
+      try {
+        cfg = JSON.parse(readFileSync2(GUARDCLAW_CONFIG_PATH2, "utf-8"));
+      } catch {
+      }
+      if (!cfg.privacy) cfg.privacy = {};
+      const priv = cfg.privacy;
+      if (!priv.injection) priv.injection = {};
+      priv.injection.exempt_senders = newExempt;
+      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), "utf-8");
+      json(res, { ok: true });
+    } catch (err) {
+      json(res, { error: String(err) }, 400);
+    }
+    return true;
+  }
   return false;
 }
 function dashboardHtml() {
@@ -4878,7 +4988,7 @@ function dashboardHtml() {
   <div class="tab" data-tab="detections" data-i18n="tab.detections">Detection Log</div>
   <div class="tab" data-tab="rules"><span data-i18n="tab.rules">Router Rules</span> <span class="badge badge-hot">live</span></div>
   <div class="tab" data-tab="config"><span data-i18n="tab.config">Configuration</span> <span class="badge badge-hot">live</span></div>
-  <div class="tab" data-tab="banned">Banned Senders</div>
+  <div class="tab" data-tab="banned">Access Control</div>
 </div>
 
 <!-- Overview -->
@@ -4952,16 +5062,38 @@ function dashboardHtml() {
   </table>
 </div>
 
-<!-- Banned Senders -->
+<!-- Access Control (Exempt + Banned) -->
 <div id="banned-panel" class="panel">
+
+  <!-- Exempt Senders -->
+  <div class="config-section" style="margin-bottom:20px">
+    <h3 style="color:#8DC63F">Trusted Senders (Exempt from Injection Detection)</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+      Discord user IDs listed here skip the S0 injection scanner entirely. Use this for operators and trusted team members whose messages should never be blocked. Their messages are still subject to S2/S3 privacy routing.<br>
+      <span style="font-size:11px;color:var(--text-tertiary);margin-top:4px;display:block">Find your Discord ID: enable Developer Mode in Discord settings \u2192 right-click your name \u2192 Copy User ID.</span>
+    </p>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <input id="exempt-input" type="text" placeholder="Discord user ID (e.g. 1317396442993922061)"
+        style="flex:1;padding:10px 14px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:var(--font-mono);outline:none"
+        onkeydown="if(event.key==='Enter')addExempt()">
+      <button class="btn btn-primary btn-sm" onclick="addExempt()" style="white-space:nowrap">+ Add Trusted</button>
+    </div>
+    <table class="data-table" id="exempt-table">
+      <thead><tr><th>Discord User ID</th><th style="text-align:right">Action</th></tr></thead>
+      <tbody id="exempt-body"><tr><td colspan="2" class="empty-state">No trusted senders configured</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Banned Senders -->
   <div class="config-section">
-    <h3 style="color:#ef4444">Banned Senders</h3>
-    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Senders that have been automatically banned after 2+ injection attempts. They are blocked immediately before any detection runs.</p>
+    <h3 style="color:#ef4444">Banned Senders (Auto-blocked)</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Senders automatically banned after 2+ injection attempts. Blocked immediately before any detection runs.</p>
     <table class="data-table" id="banned-table">
       <thead><tr><th>Sender ID</th><th style="text-align:right">Action</th></tr></thead>
       <tbody id="banned-body"><tr><td colspan="2" class="empty-state">No banned senders</td></tr></tbody>
     </table>
   </div>
+
 </div>
 
 <!-- Router Rules -->
@@ -5914,6 +6046,9 @@ document.querySelectorAll('.tab').forEach(function(t) {
     document.querySelectorAll('.panel').forEach(function(x) { x.classList.remove('active'); });
     t.classList.add('active');
     document.getElementById(t.dataset.tab + '-panel').classList.add('active');
+    // Refresh data for tabs that show live state
+    if (t.dataset.tab === 'banned') refreshAccessControl();
+    if (t.dataset.tab === 'detections') refreshDetections();
   });
 });
 
@@ -6440,26 +6575,87 @@ function refreshAll() {
   refreshStats();
   refreshSessions();
   refreshDetections();
-  refreshBanned();
+  refreshAccessControl();
 }
 
-// \u2500\u2500 Banned Senders \u2500\u2500
+// \u2500\u2500 Access Control (Exempt + Banned) \u2500\u2500
 
-async function refreshBanned() {
+async function refreshAccessControl() {
   try {
-    var data = await fetch(BASE + '/banned').then(function(r) { return r.json(); });
-    var tbody = document.getElementById('banned-body');
-    if (!tbody) return;
-    var banned = data.banned || [];
-    if (banned.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="2" class="empty-state">No banned senders</td></tr>';
-      return;
+    var [exemptData, bannedData] = await Promise.all([
+      fetch(BASE + '/exempt').then(function(r) { return r.json(); }),
+      fetch(BASE + '/banned').then(function(r) { return r.json(); }),
+    ]);
+
+    // Exempt senders
+    var exemptBody = document.getElementById('exempt-body');
+    if (exemptBody) {
+      var exempt = exemptData.exempt || [];
+      if (exempt.length === 0) {
+        exemptBody.innerHTML = '<tr><td colspan="2" class="empty-state">No trusted senders configured</td></tr>';
+      } else {
+        exemptBody.innerHTML = exempt.map(function(id) {
+          return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
+            '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="removeExempt(\\'' + escHtml(id) + '\\')">Remove</button></td></tr>';
+        }).join('');
+      }
     }
-    tbody.innerHTML = banned.map(function(id) {
-      return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
-        '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="unbanSender(\\'' + escHtml(id) + '\\')">Unban</button></td></tr>';
-    }).join('');
+
+    // Banned senders
+    var bannedBody = document.getElementById('banned-body');
+    if (bannedBody) {
+      var banned = bannedData.banned || [];
+      if (banned.length === 0) {
+        bannedBody.innerHTML = '<tr><td colspan="2" class="empty-state">No banned senders</td></tr>';
+      } else {
+        bannedBody.innerHTML = banned.map(function(id) {
+          return '<tr><td><span class="session-key">' + escHtml(id) + '</span></td>' +
+            '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="unbanSender(\\'' + escHtml(id) + '\\')">Unban</button></td></tr>';
+        }).join('');
+      }
+    }
   } catch (e) { /* non-critical */ }
+}
+
+// Keep refreshBanned as alias for backward compat
+function refreshBanned() { refreshAccessControl(); }
+
+async function addExempt() {
+  var input = document.getElementById('exempt-input');
+  var senderId = (input.value || '').trim();
+  if (!senderId) { showToast('Enter a Discord user ID', true); return; }
+  try {
+    var res = await fetch(BASE + '/exempt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ senderId: senderId }),
+    });
+    var result = await res.json();
+    if (result.ok) {
+      showToast(result.already ? senderId + ' already trusted' : 'Added trusted sender: ' + senderId);
+      input.value = '';
+      refreshAccessControl();
+    } else {
+      showToast('Failed: ' + (result.error || 'unknown'), true);
+    }
+  } catch (e) {
+    showToast('Failed: ' + e.message, true);
+  }
+}
+
+async function removeExempt(senderId) {
+  try {
+    var res = await fetch(BASE + '/exempt/' + encodeURIComponent(senderId), { method: 'DELETE' });
+    var result = await res.json();
+    if (result.ok) {
+      showToast('Removed trusted sender: ' + senderId);
+      refreshAccessControl();
+    } else {
+      showToast('Failed: ' + (result.error || 'unknown'), true);
+    }
+  } catch (e) {
+    showToast('Failed: ' + e.message, true);
+  }
 }
 
 async function unbanSender(senderId) {
@@ -6472,7 +6668,7 @@ async function unbanSender(senderId) {
     var result = await res.json();
     if (result.ok) {
       showToast('Unbanned: ' + senderId);
-      refreshBanned();
+      refreshAccessControl();
     } else {
       showToast('Unban failed: ' + (result.error || 'unknown'), true);
     }
@@ -7359,6 +7555,8 @@ var plugin = {
     api.logger.info(`[GuardClaw] Router pipeline initialized (built-in: privacy)`);
     initLiveConfig(resolvedPluginConfig);
     watchConfigFile(GUARDCLAW_CONFIG_PATH3, api.logger);
+    loadInjectionAttemptCounts().catch(() => {
+    });
     const userInjection = resolvedPluginConfig.privacy?.injection ?? {};
     const injectionConfig = { ...defaultInjectionConfig, ...userInjection };
     initInjectionConfig(injectionConfig);
