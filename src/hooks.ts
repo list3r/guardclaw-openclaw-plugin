@@ -847,6 +847,22 @@ export function registerHooks(api: OpenClawPluginApi): void {
           api.logger.info(`[GuardClaw] Guard session keychain fetch detected — result will be tracked (session=${sessionKey})`);
         }
 
+        // 2b. Block bash commands that make outbound network connections (#1).
+        //     Scans the full raw command string, which covers $(...) and backtick
+        //     sub-expressions — the literal tool name is present regardless of nesting.
+        if (isExecTool(toolName) && bashCmd) {
+          const networkTool = isGuardNetworkCommand(bashCmd);
+          if (networkTool) {
+            api.logger.warn(
+              `[GuardClaw] BLOCKED guard session network command via bash: ${networkTool} (session=${sessionKey})`,
+            );
+            return {
+              block: true,
+              blockReason: `GuardClaw: outbound network commands are blocked in guard sessions to prevent secret exfiltration (${networkTool})`,
+            };
+          }
+        }
+
         // 3. Scan tool parameters for any already-tracked secrets.
         //    Block if a tracked secret would be sent outside the local environment.
         const paramStr = JSON.stringify(typedParams);
@@ -1661,6 +1677,44 @@ function isHighRiskExecCommand(command: string): string | null {
   const normalized = command.trim();
   for (const { pattern, reason } of HIGH_RISK_EXEC_PATTERNS) {
     if (pattern.test(normalized)) return reason;
+  }
+  return null;
+}
+
+/**
+ * Network-capable CLI tools blocked inside guard (S3) bash commands.
+ *
+ * Scanned against the raw command string, which naturally covers $(...) and
+ * backtick sub-expressions — the literal tool name is still present regardless
+ * of how it is quoted or nested.
+ */
+const GUARD_BASH_NETWORK_PATTERNS: Array<{ pattern: RegExp; tool: string }> = [
+  { pattern: /\bcurl\b/i,                                       tool: "curl" },
+  { pattern: /\bwget\b/i,                                       tool: "wget" },
+  { pattern: /(?:^|\s)ncat?\b/m,                                tool: "nc/ncat" },
+  { pattern: /\bnetcat\b/i,                                     tool: "netcat" },
+  { pattern: /\bsocat\b/i,                                      tool: "socat" },
+  { pattern: /\bssh\s/i,                                        tool: "ssh" },
+  { pattern: /\bscp\s/i,                                        tool: "scp" },
+  { pattern: /\bsftp\s/i,                                       tool: "sftp" },
+  { pattern: /\brsync\s+\S*@/i,                                 tool: "rsync (remote)" },
+  { pattern: /\bftp\s/i,                                        tool: "ftp" },
+  { pattern: /\btelnet\b/i,                                     tool: "telnet" },
+  { pattern: /\bopenssl\s+s_client\b/i,                         tool: "openssl s_client" },
+  { pattern: /\/dev\/tcp\//,                                     tool: "/dev/tcp" },
+  { pattern: /\bpython[23]?\b[\s\S]*?-c[\s\S]*?socket/i,       tool: "python socket" },
+  { pattern: /\bnode\b[\s\S]*?-e[\s\S]*?(?:http|https|net|tls)\b/i, tool: "node net" },
+  { pattern: /\bperl\b[\s\S]*?-e[\s\S]*?socket/i,              tool: "perl socket" },
+];
+
+/**
+ * Returns the matched tool name if the bash command could make an outbound
+ * network connection, or null if no network tool was detected.
+ * (#1 fix) Prevents exfiltration via bash in guard sessions.
+ */
+function isGuardNetworkCommand(command: string): string | null {
+  for (const { pattern, tool } of GUARD_BASH_NETWORK_PATTERNS) {
+    if (pattern.test(command)) return tool;
   }
   return null;
 }
