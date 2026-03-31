@@ -242,6 +242,32 @@ export function redactSensitiveInfo(text: string, opts?: import("./types.js").Re
 }
 
 /**
+ * Redact text destined for the clean (cloud-visible) transcript during an S3 session.
+ *
+ * Forces ALL opt-in redaction rules on, regardless of user config. The user's own
+ * opts are merged in additively (they can never disable what we force here). This
+ * ensures that even if the user hasn't toggled `email: true` in their config, email
+ * addresses, .env content, internal IPs, credit cards, etc. are stripped before the
+ * text is committed to a track that a future S1/cloud turn could read.
+ */
+export function redactForCleanTranscript(
+  text: string,
+  userOpts?: import("./types.js").RedactionOptions,
+): string {
+  return redactSensitiveInfo(text, {
+    internalIp: true,
+    email: true,
+    envVar: true,
+    creditCard: true,
+    chinesePhone: true,
+    chineseId: true,
+    chineseAddress: true,
+    pin: true,
+    ...userOpts,
+  });
+}
+
+/**
  * Check if a path refers to protected memory/history directories that cloud models should not access.
  */
 export function isProtectedMemoryPath(filePath: string, baseDir: string = "~/.openclaw"): boolean {

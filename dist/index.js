@@ -36,6 +36,7 @@ import {
   levelToNumeric,
   loadInjectionAttemptCounts,
   loadPrompt,
+  loadPromptWithVars,
   markSessionAsPrivate,
   maxLevel,
   pendingBans,
@@ -50,20 +51,24 @@ import {
   setLastSenderId,
   stashDetection,
   trackSessionLevel,
+  triggerDebertaReload,
   updateLiveConfig,
   updateLiveInjectionConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-KZMPKJWE.js";
+} from "./chunk-GMQOMWHV.js";
+import {
+  fireWebhooks
+} from "./chunk-DLV362LL.js";
 
 // index.ts
-import { join as join9 } from "path";
+import { join as join12 } from "path";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
 
 // src/hooks.ts
 import * as fs4 from "fs";
 import * as path3 from "path";
-import { join as join6 } from "path";
+import { join as join8 } from "path";
 
 // src/guard-agent.ts
 function isGuardAgentConfigured(config) {
@@ -160,6 +165,148 @@ function syncDetectByLocalModel(context, config) {
   }
 }
 
+// src/synthesis.ts
+var DEFAULT_SYNTHESIS_PROMPT = `You are a privacy-preserving content transformer. Re-express the content below so it conveys the information needed for the user's task, but contains NO sensitive values (no passwords, keys, tokens, credentials, or raw personal data). Describe sensitive values by type only \u2014 e.g. "[API key]", "[password]", "[RSA private key]". Preserve all structural context (file paths, variable names, config keys, non-sensitive values). Output ONLY the transformed content \u2014 no preamble.
+
+User task context:
+{{TASK_CONTEXT}}
+
+Content to transform:
+{{CONTENT}}`;
+var DEFAULT_VERIFY_PROMPT = `Does the following text contain any sensitive values that should not be sent to a cloud AI? (passwords, API keys, tokens, private keys, raw credentials \u2014 NOT type descriptions like "[API key]" or "[password]"). Respond ONLY with JSON: {"safe":true} or {"safe":false,"reason":"..."}.
+
+Text:
+{{CONTENT}}`;
+var DEFAULT_CONFIG = {
+  fallback: "local-only",
+  verifyOutput: true,
+  maxRetries: 2,
+  maxInputChars: 4e3,
+  timeoutMs: 2e4
+};
+function resolveConfig(config) {
+  const s = config.synthesis;
+  return {
+    fallback: s?.fallback ?? DEFAULT_CONFIG.fallback,
+    verifyOutput: s?.verifyOutput ?? DEFAULT_CONFIG.verifyOutput,
+    maxRetries: s?.maxRetries ?? DEFAULT_CONFIG.maxRetries,
+    maxInputChars: s?.maxInputChars ?? DEFAULT_CONFIG.maxInputChars,
+    timeoutMs: s?.timeoutMs ?? DEFAULT_CONFIG.timeoutMs
+  };
+}
+async function callSynthesis(content, taskContext, config, timeoutMs) {
+  const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
+  const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+  const providerType = config.localModel?.type ?? "openai-compatible";
+  const prompt = loadPromptWithVars("s3-synthesis", DEFAULT_SYNTHESIS_PROMPT, {
+    CONTENT: content,
+    TASK_CONTEXT: taskContext || "General assistance"
+  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const result = await callChatCompletion(
+      endpoint,
+      model,
+      [{ role: "user", content: prompt }],
+      {
+        temperature: 0.15,
+        maxTokens: 1200,
+        providerType,
+        apiKey: config.localModel?.apiKey,
+        customModule: config.localModel?.module,
+        disableThinking: true
+      }
+    );
+    return result.text.trim();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function verifySynthesis(synthetic, config, timeoutMs) {
+  const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
+  const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+  const providerType = config.localModel?.type ?? "openai-compatible";
+  const prompt = loadPromptWithVars("s3-verify", DEFAULT_VERIFY_PROMPT, {
+    CONTENT: synthetic.slice(0, 2e3)
+  });
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let raw;
+    try {
+      const result = await callChatCompletion(
+        endpoint,
+        model,
+        [{ role: "user", content: prompt }],
+        {
+          temperature: 0,
+          maxTokens: 80,
+          stop: ["\n\n"],
+          providerType,
+          apiKey: config.localModel?.apiKey,
+          customModule: config.localModel?.module,
+          disableThinking: true
+        }
+      );
+      raw = result.text.trim();
+    } finally {
+      clearTimeout(timer);
+    }
+    const match = raw.match(/\{[\s\S]*?\}/);
+    if (match) {
+      const parsed = JSON.parse(match[0]);
+      return { safe: parsed.safe !== false, reason: parsed.reason };
+    }
+    return { safe: true };
+  } catch {
+    return { safe: true };
+  }
+}
+async function synthesizeContent(original, taskContext, config, sessionKey) {
+  if (!config.localModel?.enabled) {
+    return { ok: false, reason: "Local model not enabled" };
+  }
+  const cfg = resolveConfig(config);
+  const input = original.slice(0, cfg.maxInputChars);
+  let lastFailReason = "Unknown error";
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      const synthetic = await callSynthesis(input, taskContext, config, cfg.timeoutMs);
+      if (!synthetic) {
+        lastFailReason = "Empty synthesis output";
+        continue;
+      }
+      if (cfg.verifyOutput) {
+        const { safe, reason } = await verifySynthesis(synthetic, config, Math.min(cfg.timeoutMs, 8e3));
+        if (!safe) {
+          lastFailReason = `Verification failed: ${reason ?? "S3 content detected in output"}`;
+          console.warn(`[GuardClaw Synthesis] Attempt ${attempt + 1} failed verification \u2014 retrying`);
+          continue;
+        }
+      }
+      const finalSynthetic = input.length < original.length ? `${synthetic}
+
+[Note: input was truncated to ${cfg.maxInputChars} characters for local processing]` : synthetic;
+      return { ok: true, synthetic: finalSynthetic };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      lastFailReason = message.includes("abort") ? "Synthesis timeout" : message;
+      console.warn(`[GuardClaw Synthesis] Attempt ${attempt + 1} error: ${lastFailReason}`);
+    }
+  }
+  return { ok: false, reason: lastFailReason };
+}
+async function synthesizeToolResult(toolName, toolResult, taskContext, config, sessionKey) {
+  if (!config.localModel?.enabled) {
+    return { ok: false, reason: "Local model not enabled" };
+  }
+  const cfg = resolveConfig(config);
+  const toolContext = `Tool "${toolName}" returned a result. Task context: ${taskContext || "general assistance"}`;
+  const input = toolResult.slice(0, cfg.maxInputChars);
+  return synthesizeContent(input, toolContext, config, sessionKey);
+}
+
 // src/memory-isolation.ts
 import * as fs from "fs";
 import * as path from "path";
@@ -188,24 +335,24 @@ function matchesPathPattern(path4, patterns) {
   }
   return false;
 }
-function extractPathsFromParams(params, _depth = 0) {
+function extractPathsFromParams(params2, _depth = 0) {
   if (_depth > 5) return [];
   const paths = [];
   const pathKeys = ["path", "file", "filepath", "filename", "dir", "directory", "target", "source"];
   for (const key of pathKeys) {
-    const value = params[key];
+    const value = params2[key];
     if (typeof value === "string" && value.trim()) {
       paths.push(value.trim());
     }
   }
   const commandKeys = ["command", "cmd", "script"];
   for (const key of commandKeys) {
-    const value = params[key];
+    const value = params2[key];
     if (typeof value === "string" && value.trim()) {
       paths.push(...extractPathsFromCommand(value));
     }
   }
-  for (const value of Object.values(params)) {
+  for (const value of Object.values(params2)) {
     if (value && typeof value === "object" && !Array.isArray(value)) {
       paths.push(...extractPathsFromParams(value, _depth + 1));
     }
@@ -312,6 +459,19 @@ function redactSensitiveInfo(text, opts) {
     redacted = redacted.replace(rule.pattern, `[REDACTED:${rule.label}]`);
   }
   return redacted;
+}
+function redactForCleanTranscript(text, userOpts) {
+  return redactSensitiveInfo(text, {
+    internalIp: true,
+    email: true,
+    envVar: true,
+    creditCard: true,
+    chinesePhone: true,
+    chineseId: true,
+    chineseAddress: true,
+    pin: true,
+    ...userOpts
+  });
 }
 function isProtectedMemoryPath(filePath, baseDir = "~/.openclaw") {
   const normalizedFile = normalizePath(filePath);
@@ -1103,10 +1263,18 @@ function checkToolType(toolName, config) {
   }
   return { level: "S1" };
 }
-function checkToolParams(params, config) {
-  const paths = extractPathsFromParams(params);
+function checkToolParams(params2, config) {
+  const paths = extractPathsFromParams(params2);
   if (paths.length === 0) {
     return { level: "S1" };
+  }
+  for (const path4 of paths) {
+    if (path4.startsWith("/run/secrets/") || path4.startsWith("/var/run/secrets/")) {
+      return {
+        level: "S2",
+        reason: `Docker/Kubernetes secrets mount detected: ${path4}`
+      };
+    }
   }
   const s3Paths = config.rules?.tools?.S3?.paths ?? [];
   for (const path4 of paths) {
@@ -1304,10 +1472,10 @@ function cleanToolSchemas(tools) {
     const tool = tools[i];
     if (!tool) continue;
     const fn = tool.function;
-    const params = fn?.parameters;
-    if (params && typeof params === "object") {
-      const result = stripUnsupportedSchemaKeywords(params);
-      if (result !== params) {
+    const params2 = fn?.parameters;
+    if (params2 && typeof params2 === "object") {
+      const result = stripUnsupportedSchemaKeywords(params2);
+      if (result !== params2) {
         fn.parameters = result;
         cleaned = true;
       }
@@ -1324,9 +1492,9 @@ function cleanGoogleToolSchemas(tools) {
     if (!Array.isArray(decls)) continue;
     for (const decl of decls) {
       if (!decl || typeof decl !== "object") continue;
-      const params = decl.parameters;
-      if (params && typeof params === "object") {
-        decl.parameters = stripUnsupportedSchemaKeywords(params);
+      const params2 = decl.parameters;
+      if (params2 && typeof params2 === "object") {
+        decl.parameters = stripUnsupportedSchemaKeywords(params2);
         cleaned = true;
       }
     }
@@ -1461,7 +1629,8 @@ function completionToSSE(responseJson) {
   return chunks.join("");
 }
 function buildUpstreamUrl(targetBaseUrl, reqUrl, target) {
-  let baseUrl = targetBaseUrl.replace(/\/+$/, "");
+  let baseUrl = targetBaseUrl;
+  while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
   const rawPath = reqUrl ?? "/v1/chat/completions";
   const api = (target?.api ?? "").toLowerCase();
   const isAnthropic = api === "anthropic-messages" || ANTHROPIC_PATTERNS.some((p) => (target?.provider ?? "").toLowerCase().includes(p));
@@ -1573,7 +1742,7 @@ async function startPrivacyProxy(port, logger) {
       } catch (parseErr) {
         log.warn(`[GuardClaw Proxy] Invalid JSON body: ${String(parseErr)}`);
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: `Invalid JSON: ${String(parseErr)}`, type: "invalid_request" } }));
+        res.end(JSON.stringify({ error: { message: "Invalid JSON in request body", type: "invalid_request" } }));
         return;
       }
       const injectionCfg = getLiveInjectionConfig();
@@ -1768,10 +1937,11 @@ async function startPrivacyProxy(port, logger) {
         });
       } catch (fetchErr) {
         clearTimeout(nonStreamTimeout);
-        const msg = fetchErr instanceof Error && fetchErr.name === "AbortError" ? "Upstream request timed out (120s)" : String(fetchErr);
-        log.error(`[GuardClaw Proxy] Upstream fetch failed: ${msg}`);
+        const isTimeout = fetchErr instanceof Error && fetchErr.name === "AbortError";
+        const clientMsg = isTimeout ? "Upstream request timed out (120s)" : "Upstream request failed";
+        log.error(`[GuardClaw Proxy] Upstream fetch failed: ${String(fetchErr)}`);
         res.writeHead(504, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: msg, type: "proxy_timeout" } }));
+        res.end(JSON.stringify({ error: { message: clientMsg, type: "proxy_timeout" } }));
         return;
       }
       clearTimeout(nonStreamTimeout);
@@ -2130,10 +2300,30 @@ function getGlobalPipeline() {
 import { execFile } from "child_process";
 import { promisify } from "util";
 var execFileAsync = promisify(execFile);
+var MAX_SECRET_BYTES = 8192;
 var MAX_TRACKED_PER_SESSION = 50;
 var MIN_SECRET_LENGTH = 4;
 var trackedSecrets = /* @__PURE__ */ new Map();
 var pendingKeychainFetch = /* @__PURE__ */ new Set();
+async function readKeychainSecret(service, account) {
+  if (!isValidLabel(service) || !isValidLabel(account)) {
+    return { error: "Invalid service or account \u2014 only printable ASCII (1\u2013255 chars) allowed" };
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "security",
+      ["find-generic-password", "-s", service, "-a", account, "-w"],
+      { timeout: 5e3, maxBuffer: MAX_SECRET_BYTES }
+    );
+    return { value: stdout.trim() };
+  } catch (err) {
+    const e = err;
+    return { error: e.stderr?.trim() || e.message || String(err) };
+  }
+}
+function isValidLabel(s) {
+  return typeof s === "string" && s.length > 0 && s.length <= 255 && /^[\x20-\x7E]+$/.test(s);
+}
 function trackSecret(sessionKey, value) {
   if (!value || value.length < MIN_SECRET_LENGTH) return;
   let set = trackedSecrets.get(sessionKey);
@@ -2213,106 +2403,6 @@ function parseKeychainCommand(command) {
   );
   if (m2) return { service: m2[2], account: m2[1] };
   return null;
-}
-
-// src/webhook.ts
-import { createHmac } from "crypto";
-var EVENT_COLORS = {
-  s3_detected: 16729156,
-  s2_detected: 16746496,
-  injection_blocked: 10027263,
-  ban_triggered: 16711680,
-  budget_warning: 16755200,
-  budget_exceeded: 16720384,
-  response_scan_hit: 16737792
-};
-var EVENT_LABELS = {
-  s3_detected: "\u{1F534} S3 Private Data Detected",
-  s2_detected: "\u{1F7E1} S2 Sensitive Data Detected",
-  injection_blocked: "\u{1F7E3} Prompt Injection Blocked",
-  ban_triggered: "\u{1F6AB} Sender Banned",
-  budget_warning: "\u26A0\uFE0F Budget Warning",
-  budget_exceeded: "\u{1F6D1} Budget Cap Exceeded",
-  response_scan_hit: "\u{1F50E} Sensitive Content in Response"
-};
-function buildDiscordBody(payload) {
-  const fields = [];
-  if (payload.sessionKey) {
-    fields.push({ name: "Session", value: `\`${payload.sessionKey.slice(0, 24)}\u2026\``, inline: true });
-  }
-  if (payload.level) {
-    fields.push({ name: "Level", value: payload.level, inline: true });
-  }
-  if (payload.reason) {
-    fields.push({ name: "Reason", value: payload.reason.slice(0, 200) });
-  }
-  if (payload.details) {
-    for (const [k, v] of Object.entries(payload.details).slice(0, 3)) {
-      fields.push({ name: k, value: String(v).slice(0, 100), inline: true });
-    }
-  }
-  return {
-    embeds: [{
-      title: EVENT_LABELS[payload.event],
-      color: EVENT_COLORS[payload.event],
-      timestamp: payload.timestamp,
-      fields,
-      footer: { text: "GuardClaw" }
-    }]
-  };
-}
-function buildSlackBody(payload) {
-  const label = EVENT_LABELS[payload.event];
-  const lines = [`*${label}*`];
-  if (payload.level) lines.push(`Level: ${payload.level}`);
-  if (payload.reason) lines.push(`Reason: ${payload.reason.slice(0, 200)}`);
-  if (payload.sessionKey) lines.push(`Session: \`${payload.sessionKey.slice(0, 24)}\u2026\``);
-  if (payload.details) {
-    for (const [k, v] of Object.entries(payload.details).slice(0, 3)) {
-      lines.push(`${k}: ${String(v).slice(0, 100)}`);
-    }
-  }
-  return { text: lines.join("\n") };
-}
-var WEBHOOK_TIMEOUT_MS = 5e3;
-async function dispatchWebhook(cfg, payload) {
-  if (cfg.events && cfg.events.length > 0 && !cfg.events.includes(payload.event)) return;
-  const format = cfg.format ?? "json";
-  let body;
-  if (format === "discord") {
-    body = buildDiscordBody(payload);
-  } else if (format === "slack") {
-    body = buildSlackBody(payload);
-  } else {
-    body = { ...payload, source: "guardclaw" };
-  }
-  const bodyStr = JSON.stringify(body);
-  const headers = { "Content-Type": "application/json" };
-  if (cfg.secret) {
-    const sig = createHmac("sha256", cfg.secret).update(bodyStr).digest("hex");
-    headers["X-GuardClaw-Signature"] = `sha256=${sig}`;
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
-  try {
-    await fetch(cfg.url, {
-      method: "POST",
-      headers,
-      body: bodyStr,
-      signal: controller.signal
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-function fireWebhooks(event, payload, webhooks) {
-  if (!webhooks || webhooks.length === 0) return;
-  const full = { ...payload, event, timestamp: (/* @__PURE__ */ new Date()).toISOString() };
-  for (const cfg of webhooks) {
-    dispatchWebhook(cfg, full).catch((err) => {
-      console.warn(`[GuardClaw] Webhook dispatch failed (${cfg.url.slice(0, 50)}\u2026): ${String(err)}`);
-    });
-  }
 }
 
 // src/response-scanner.ts
@@ -2504,6 +2594,480 @@ function checkBudget(config) {
     action
   };
 }
+function getBudgetSnapshot() {
+  return _data;
+}
+
+// src/behavioral-log.ts
+import { appendFile, readFile as readFile2, writeFile as writeFile2, rename as rename2 } from "fs/promises";
+import { join as join6 } from "path";
+var HOME2 = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+var LOG_PATH = join6(HOME2, ".openclaw", "guardclaw-behavior.jsonl");
+var _seqCounters = /* @__PURE__ */ new Map();
+var _pendingEvents = /* @__PURE__ */ new Map();
+function fnv32a(str) {
+  let hash = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = hash * 16777619 >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+function categoriseTool(toolName) {
+  const t = toolName.toLowerCase();
+  if (/exec|bash|shell|run_command|system|cmd/.test(t)) return "shell";
+  if (/read_file|read|cat|head|tail|open_file|get_file/.test(t)) return "file_read";
+  if (/write_file|write|edit|patch|create_file|append/.test(t)) return "file_write";
+  if (/web_fetch|http|curl|fetch|request|download/.test(t)) return "web_fetch";
+  if (/memory|remember|recall|retrieve|store/.test(t)) return "memory";
+  if (/search|grep|glob|find|query/.test(t)) return "search";
+  if (/message|send|post|notify|discord|slack/.test(t)) return "message";
+  if (/api|call|invoke|rpc/.test(t)) return "api_call";
+  return "other";
+}
+function agentFromSession(sessionKey) {
+  const parts = sessionKey.split(":");
+  if (parts[0] === "agent" && parts.length >= 2) return parts[1];
+  return parts[0] ?? "unknown";
+}
+function logToolEvent(sessionKey, toolName, params2, sensitivity) {
+  try {
+    const seq = (_seqCounters.get(sessionKey) ?? 0) + 1;
+    _seqCounters.set(sessionKey, seq);
+    const event = {
+      ts: (/* @__PURE__ */ new Date()).toISOString(),
+      session: sessionKey,
+      agent: agentFromSession(sessionKey),
+      seq,
+      tool: toolName,
+      category: categoriseTool(toolName),
+      sensitivity,
+      paramsHash: fnv32a(JSON.stringify(params2)),
+      secretOpMs: null
+    };
+    const pending = _pendingEvents.get(sessionKey) ?? [];
+    pending.push(event);
+    _pendingEvents.set(sessionKey, pending);
+    appendFile(LOG_PATH, JSON.stringify(event) + "\n", "utf-8").catch(() => {
+    });
+  } catch {
+  }
+}
+function clearBehavioralSession(sessionKey) {
+  _seqCounters.delete(sessionKey);
+  _pendingEvents.delete(sessionKey);
+}
+function getRecentEvents(sessionKey, limit = 10) {
+  const pending = _pendingEvents.get(sessionKey) ?? [];
+  return pending.slice(-limit);
+}
+
+// src/secret-ops.ts
+import { readFile as readFile3 } from "fs/promises";
+import { join as join7 } from "path";
+import { execFile as execFile2 } from "child_process";
+import { promisify as promisify2 } from "util";
+
+// src/behavioral-attestation.ts
+function score(events) {
+  if (events.length === 0) return { score: 0, signals: ["no prior tool calls \u2014 no behavioral context"] };
+  let s = 0;
+  const signals = [];
+  const categories = events.map((e) => e.category);
+  const uniqueCategories = new Set(categories);
+  const fileReads = events.filter((e) => e.category === "file_read").length;
+  const webFetches = events.filter((e) => e.category === "web_fetch").length;
+  const s3Events = events.filter((e) => e.sensitivity === "S3").length;
+  const lastCategory = categories[categories.length - 1];
+  if (fileReads >= 4) {
+    s += 0.35;
+    signals.push(`${fileReads} file reads in last ${events.length} calls (bulk read pattern)`);
+  } else if (fileReads >= 2) {
+    s += 0.1;
+    signals.push(`${fileReads} file reads in last ${events.length} calls`);
+  }
+  if (webFetches >= 3) {
+    s += 0.25;
+    signals.push(`${webFetches} web fetches in last ${events.length} calls`);
+  } else if (webFetches >= 2) {
+    s += 0.1;
+    signals.push(`${webFetches} web fetches in last ${events.length} calls`);
+  }
+  if (lastCategory === "shell") {
+    s += 0.2;
+    signals.push("shell call immediately before secret operation");
+  }
+  if (s3Events >= 2) {
+    s += 0.15;
+    signals.push(`${s3Events} S3-sensitivity events in window`);
+  } else if (s3Events === 1) {
+    s += 0.05;
+    signals.push("1 S3-sensitivity event in window");
+  }
+  if (uniqueCategories.size >= 5) {
+    s += 0.1;
+    signals.push(`${uniqueCategories.size} different tool categories (erratic pattern)`);
+  }
+  if (uniqueCategories.size === 1) {
+    s -= 0.2;
+    signals.push(`consistent task \u2014 all ${events.length} calls are ${categories[0]}`);
+  }
+  if (events.length === 1) {
+    s -= 0.1;
+    signals.push("minimal context \u2014 only 1 prior tool call");
+  }
+  return {
+    score: Math.max(0, Math.min(1, s)),
+    signals
+  };
+}
+
+// src/secret-ops.ts
+var execFileAsync2 = promisify2(execFile2);
+var HOME3 = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+var SECRETS_REGISTRY_PATH = join7(HOME3, ".openclaw", "guardclaw-secrets.json");
+var AUTO_DENY_SCORE = 0.75;
+var INTENT_VERIFY_TIMEOUT_MS = 3e3;
+var MAX_HTTP_RESPONSE_BYTES = 32768;
+var INJECT_EXEC_TIMEOUT_MS = 3e4;
+var _registryCache = null;
+var _registryCacheTs = 0;
+var REGISTRY_CACHE_TTL_MS = 3e4;
+async function loadSecretRegistry() {
+  const now = Date.now();
+  if (_registryCache && now - _registryCacheTs < REGISTRY_CACHE_TTL_MS) {
+    return _registryCache;
+  }
+  try {
+    const raw = await readFile3(SECRETS_REGISTRY_PATH, "utf-8");
+    _registryCache = JSON.parse(raw);
+    _registryCacheTs = now;
+    return _registryCache;
+  } catch {
+    _registryCache = { secrets: {} };
+    _registryCacheTs = now;
+    return _registryCache;
+  }
+}
+async function resolveSecret(entry) {
+  const { source } = entry;
+  if (source.type === "keychain") {
+    return readKeychainSecret(source.service, source.account);
+  }
+  if (source.type === "config") {
+    try {
+      const filePath = source.file.replace(/^~/, HOME3);
+      const raw = await readFile3(filePath, "utf-8");
+      const obj = JSON.parse(raw);
+      const parts = source.jsonPath.split(".");
+      let cursor = obj;
+      for (const part of parts) {
+        if (cursor == null || typeof cursor !== "object") {
+          return { error: `Path "${source.jsonPath}" not found in ${filePath}` };
+        }
+        cursor = cursor[part];
+      }
+      if (typeof cursor !== "string" || !cursor) {
+        return { error: `Path "${source.jsonPath}" is not a non-empty string in ${filePath}` };
+      }
+      return { value: cursor };
+    } catch (err) {
+      return { error: String(err) };
+    }
+  }
+  return { error: "Unknown secret source type" };
+}
+async function verifyIntent(secretName, entry, operation, opParams, sessionKey, privacyConfig) {
+  const localModelCfg = privacyConfig.localModel;
+  if (!localModelCfg?.enabled || !localModelCfg.endpoint || !localModelCfg.model) {
+    return { decision: "DENY", reason: "No local model configured for intent verification" };
+  }
+  const recentEvents = getRecentEvents(sessionKey, 10);
+  const eventSummary = recentEvents.length === 0 ? "(no prior tool calls in this session)" : recentEvents.map(
+    (e, i) => `${i + 1}. [${e.category}] ${e.tool}${e.sensitivity ? ` (${e.sensitivity})` : ""}`
+  ).join("\n");
+  const safeParams = sanitizeParamsForVerifier(opParams);
+  const messages = [
+    {
+      role: "system",
+      content: "You are a security intent verifier. An AI agent has requested access to a secret credential. Determine if this request appears legitimate given the recent tool call history. Reply with exactly: ALLOW or DENY on the first line, then a brief reason on the second line. Be conservative \u2014 deny if anything looks suspicious or out of context."
+    },
+    {
+      role: "user",
+      content: `Secret name: ${secretName}
+Description: ${entry.description}
+Operation: ${operation}
+Parameters: ${JSON.stringify(safeParams)}
+
+Recent tool call history (last ${recentEvents.length} calls):
+${eventSummary}
+
+Is this secret access request legitimate? Reply ALLOW or DENY, then brief reason.`
+    }
+  ];
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), INTENT_VERIFY_TIMEOUT_MS);
+    let text = "";
+    try {
+      const result = await Promise.race([
+        callChatCompletion(localModelCfg.endpoint, localModelCfg.model, messages, {
+          temperature: 0,
+          maxTokens: 80,
+          providerType: localModelCfg.type ?? "openai-compatible",
+          apiKey: localModelCfg.apiKey
+        }),
+        new Promise(
+          (_, reject) => setTimeout(() => reject(new Error("intent-verify-timeout")), INTENT_VERIFY_TIMEOUT_MS)
+        )
+      ]);
+      text = result.text.trim();
+    } finally {
+      clearTimeout(timeout);
+    }
+    const firstLine = text.split("\n")[0]?.trim().toUpperCase() ?? "";
+    const reasonLine = text.split("\n").slice(1).join(" ").trim();
+    const decision = firstLine.startsWith("ALLOW") ? "ALLOW" : "DENY";
+    return { decision, reason: reasonLine || (decision === "ALLOW" ? "Looks legitimate" : "Suspicious pattern") };
+  } catch (err) {
+    const msg = String(err);
+    if (msg.includes("intent-verify-timeout")) {
+      return { decision: "DENY", reason: "Intent verifier timed out \u2014 failing closed for safety" };
+    }
+    return { decision: "DENY", reason: `Intent verifier error: ${msg}` };
+  }
+}
+function sanitizeParamsForVerifier(params2) {
+  const out = {};
+  for (const [k, v] of Object.entries(params2)) {
+    if (typeof v === "string" && (v.length > 40 || /key|token|secret|password|bearer/i.test(k))) {
+      out[k] = `[${v.length} chars]`;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+async function opDescribe(entry) {
+  return `Secret: ${entry.description}
+Allowed operations: ${(entry.allowedOps ?? ["describe"]).join(", ")}`;
+}
+async function opMakeHttpRequest(secretValue, entry, params2) {
+  const url = String(params2.url ?? "");
+  if (!url || !/^https?:\/\//.test(url)) {
+    throw new Error("make_http_request requires a valid http(s) url in params.url");
+  }
+  const method = String(params2.method ?? "GET").toUpperCase();
+  const headerName = entry.httpHeader ?? "Authorization";
+  const headerValue = headerName === "Authorization" ? `Bearer ${secretValue}` : secretValue;
+  const headers = {
+    [headerName]: headerValue,
+    "Content-Type": "application/json",
+    ...params2.headers ?? {}
+  };
+  headers[headerName] = headerValue;
+  const body = params2.body != null ? typeof params2.body === "string" ? params2.body : JSON.stringify(params2.body) : void 0;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15e3);
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers,
+      body: method !== "GET" && method !== "HEAD" ? body : void 0,
+      signal: controller.signal
+    });
+    let responseText = await resp.text();
+    if (responseText.length > MAX_HTTP_RESPONSE_BYTES) {
+      responseText = responseText.slice(0, MAX_HTTP_RESPONSE_BYTES) + "\n[truncated]";
+    }
+    return `HTTP ${resp.status} ${resp.statusText}
+${responseText}`;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+async function opInjectEnvVars(secretValue, entry, params2) {
+  const command = String(params2.command ?? "");
+  if (!command) {
+    throw new Error("inject_env_vars requires params.command \u2014 the shell command to run with the secret injected");
+  }
+  const envVarName = entry.envVarName;
+  if (!envVarName) {
+    throw new Error(`Secret entry does not have an envVarName configured \u2014 cannot inject env var`);
+  }
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v != null) env[k] = v;
+  }
+  env[envVarName] = secretValue;
+  const extraEnv = params2.env ?? {};
+  for (const [k, v] of Object.entries(extraEnv)) {
+    if (typeof v === "string" && !k.toLowerCase().includes("secret") && !k.toLowerCase().includes("token") && !k.toLowerCase().includes("key") && !k.toLowerCase().includes("password")) {
+      env[k] = v;
+    }
+  }
+  try {
+    const { stdout, stderr } = await execFileAsync2(
+      "sh",
+      ["-c", command],
+      { env, timeout: INJECT_EXEC_TIMEOUT_MS, maxBuffer: MAX_HTTP_RESPONSE_BYTES }
+    );
+    const out = stdout.trim();
+    const err = stderr.trim();
+    const parts = [];
+    if (out) parts.push(out);
+    if (err) parts.push(`[stderr] ${err}`);
+    return parts.join("\n") || "(command produced no output)";
+  } catch (execErr) {
+    const e = execErr;
+    const msg = e.stderr?.trim() || e.message || String(execErr);
+    throw new Error(`Command failed (exit ${e.code ?? "?"}): ${msg}`);
+  }
+}
+async function handleUseSecret(rawParams, sessionKey, privacyConfig, webhooks, logger) {
+  const name = String(rawParams.name ?? "").trim();
+  const operation = String(rawParams.operation ?? "describe");
+  const opParams = rawParams.params ?? {};
+  const registry = await loadSecretRegistry();
+  const entry = registry.secrets[name];
+  if (!entry) {
+    return {
+      ok: false,
+      reason: `Unknown secret "${name}". Available secrets: ${Object.keys(registry.secrets).join(", ") || "(none registered)"}`
+    };
+  }
+  const allowedOps = entry.allowedOps ?? ["describe"];
+  if (!allowedOps.includes(operation)) {
+    return {
+      ok: false,
+      reason: `Operation "${operation}" is not permitted for secret "${name}". Allowed: ${allowedOps.join(", ")}`
+    };
+  }
+  const baConfig = privacyConfig.behavioralAttestation;
+  const windowSize = baConfig?.windowSize ?? 10;
+  const recentEvents = getRecentEvents(sessionKey, windowSize);
+  const { score: suspicionScore, signals } = score(recentEvents);
+  logger.info(
+    `[GuardClaw:secrets] use_secret "${name}":${operation} \u2014 behavioral score=${suspicionScore.toFixed(2)} signals=[${signals.join("; ")}]`
+  );
+  if (suspicionScore >= AUTO_DENY_SCORE) {
+    const reason = `Behavioral attestation auto-denied: score=${suspicionScore.toFixed(2)} (${signals.join("; ")})`;
+    logger.warn(`[GuardClaw:secrets] DENIED ${name}:${operation} \u2014 ${reason}`);
+    _notify("secret_denied", { name, operation, sessionKey, reason, score: suspicionScore }, webhooks);
+    return { ok: false, reason, notify: true };
+  }
+  if (operation !== "describe") {
+    const { decision, reason: verifierReason } = await verifyIntent(
+      name,
+      entry,
+      operation,
+      opParams,
+      sessionKey,
+      privacyConfig
+    );
+    if (decision === "DENY") {
+      const reason = `Intent verifier denied: ${verifierReason}`;
+      logger.warn(`[GuardClaw:secrets] DENIED ${name}:${operation} \u2014 ${reason}`);
+      _notify("secret_denied", { name, operation, sessionKey, reason, score: suspicionScore }, webhooks);
+      return { ok: false, reason, notify: true };
+    }
+    logger.info(`[GuardClaw:secrets] ALLOWED ${name}:${operation} \u2014 ${verifierReason}`);
+    _notify("secret_allowed", { name, operation, sessionKey, reason: verifierReason, score: suspicionScore }, webhooks);
+  }
+  try {
+    if (operation === "describe") {
+      const result = await opDescribe(entry);
+      return { ok: true, result };
+    }
+    const resolved = await resolveSecret(entry);
+    if ("error" in resolved) {
+      return { ok: false, reason: `Could not resolve secret "${name}": ${resolved.error}` };
+    }
+    if (operation === "make_http_request") {
+      const result = await opMakeHttpRequest(resolved.value, entry, opParams);
+      return { ok: true, result };
+    }
+    if (operation === "inject_env_vars") {
+      const result = await opInjectEnvVars(resolved.value, entry, opParams);
+      return { ok: true, result };
+    }
+    return { ok: false, reason: `Unimplemented operation: ${operation}` };
+  } catch (err) {
+    return { ok: false, reason: `Operation "${operation}" failed: ${String(err)}` };
+  }
+}
+function _notify(event, details, webhooks) {
+  if (!webhooks || webhooks.length === 0) return;
+  import("./webhook-4O4RMVPQ.js").then(({ fireWebhooks: fireWebhooks2 }) => {
+    fireWebhooks2(event, { sessionKey: String(details.sessionKey ?? ""), reason: String(details.reason ?? ""), details }, webhooks);
+  }).catch(() => {
+  });
+}
+
+// src/taint-store.ts
+var MIN_TAINT_LENGTH = 8;
+var MAX_TAINTS_PER_SESSION = 200;
+var _taints = /* @__PURE__ */ new Map();
+var _sources = /* @__PURE__ */ new Map();
+var _pending = /* @__PURE__ */ new Map();
+function registerTaint(sessionKey, value, source, sensitivity, minLength = MIN_TAINT_LENGTH) {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length < minLength) return;
+  let set = _taints.get(sessionKey);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    _taints.set(sessionKey, set);
+  }
+  if (set.size >= MAX_TAINTS_PER_SESSION) return;
+  if (set.has(trimmed)) return;
+  set.add(trimmed);
+  let srcMap = _sources.get(sessionKey);
+  if (!srcMap) {
+    srcMap = /* @__PURE__ */ new Map();
+    _sources.set(sessionKey, srcMap);
+  }
+  srcMap.set(trimmed, `${sensitivity}:${source}`);
+}
+function markPendingTaint(sessionKey, source, sensitivity) {
+  _pending.set(sessionKey, { source, sensitivity });
+}
+function consumePendingTaint(sessionKey) {
+  const val = _pending.get(sessionKey) ?? null;
+  _pending.delete(sessionKey);
+  return val;
+}
+function extractTaintValues(content, minLength = MIN_TAINT_LENGTH) {
+  const collected = /* @__PURE__ */ new Set();
+  const trimmedFull = content.trim();
+  if (!trimmedFull) return [];
+  if (!trimmedFull.includes("\n")) {
+    if (trimmedFull.length >= minLength && trimmedFull.length <= 8192) {
+      collected.add(trimmedFull);
+    }
+    return [...collected];
+  }
+  for (const rawLine of trimmedFull.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith("//")) continue;
+    const envMatch = line.match(/^(?:export\s+)?[A-Z_][A-Z0-9_]*\s*=\s*(.+)$/i);
+    if (envMatch) {
+      const val = envMatch[1].trim().replace(/^["']|["']$/g, "");
+      if (val.length >= minLength) collected.add(val);
+      continue;
+    }
+    if (line.length >= minLength && line.length <= 8192) {
+      collected.add(line);
+    }
+  }
+  if (trimmedFull.length >= minLength && trimmedFull.length <= 8192) {
+    collected.add(trimmedFull);
+  }
+  return [...collected];
+}
+function isSecretsMountPath(filePath) {
+  const normalized = filePath.replace(/\\/g, "/");
+  return normalized.startsWith("/run/secrets/") || normalized.startsWith("/var/run/secrets/");
+}
 
 // src/hooks.ts
 function getPipelineConfig() {
@@ -2524,11 +3088,31 @@ function isToolAllowlisted(toolName) {
   return allowlist.includes(toolName);
 }
 var _cachedWorkspaceDir;
-var _OPENCLAW_DIR2 = join6(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_STATS_PATH = join6(_OPENCLAW_DIR2, "guardclaw-stats.json");
-var GUARDCLAW_INJECTIONS_PATH2 = join6(_OPENCLAW_DIR2, "guardclaw-injections.json");
-var GUARDCLAW_PENDING_CONFIG_PATH = join6(_OPENCLAW_DIR2, "workspace", "dashboard", "guardclaw-pending-config.json");
-var GUARDCLAW_JSON_PATH2 = join6(_OPENCLAW_DIR2, "guardclaw.json");
+var _synthesisPendingQueue = /* @__PURE__ */ new Map();
+function _popSynthesisPending(sessionKey, toolName) {
+  const queue = _synthesisPendingQueue.get(sessionKey);
+  if (!queue || queue.length === 0) return void 0;
+  const idx = queue.findIndex((e) => e.toolName === toolName);
+  if (idx === -1) return void 0;
+  const [entry] = queue.splice(idx, 1);
+  if (queue.length === 0) _synthesisPendingQueue.delete(sessionKey);
+  return entry.synthetic;
+}
+var _injectionPendingQueue = /* @__PURE__ */ new Map();
+function _popInjectionPending(sessionKey, toolName) {
+  const queue = _injectionPendingQueue.get(sessionKey);
+  if (!queue || queue.length === 0) return void 0;
+  const idx = queue.findIndex((e) => e.toolName === toolName);
+  if (idx === -1) return void 0;
+  const [entry] = queue.splice(idx, 1);
+  if (queue.length === 0) _injectionPendingQueue.delete(sessionKey);
+  return entry;
+}
+var _OPENCLAW_DIR2 = join8(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_STATS_PATH = join8(_OPENCLAW_DIR2, "guardclaw-stats.json");
+var GUARDCLAW_INJECTIONS_PATH2 = join8(_OPENCLAW_DIR2, "guardclaw-injections.json");
+var GUARDCLAW_PENDING_CONFIG_PATH = join8(_OPENCLAW_DIR2, "workspace", "dashboard", "guardclaw-pending-config.json");
+var GUARDCLAW_JSON_PATH2 = join8(_OPENCLAW_DIR2, "guardclaw.json");
 async function appendInjectionLog(entry) {
   let entries = [];
   try {
@@ -2566,6 +3150,37 @@ async function updateS0Stats(action) {
     if (action === "block") s0.blocked = (s0.blocked ?? 0) + 1;
     else s0.sanitised = (s0.sanitised ?? 0) + 1;
     s0.total = (s0.total ?? 0) + 1;
+    await writeStatsAtomic(stats);
+  } catch {
+  }
+}
+async function updateSynthesisStats(source, latencyMs, ok) {
+  try {
+    let stats = {};
+    try {
+      const raw = await fs4.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+      Object.assign(stats, JSON.parse(raw));
+    } catch {
+    }
+    if (!stats.synthesis || typeof stats.synthesis !== "object") stats.synthesis = {};
+    const syn = stats.synthesis;
+    if (!syn[source] || typeof syn[source] !== "object") {
+      syn[source] = { count: 0, failCount: 0, totalMs: 0, minMs: null, maxMs: null, lastMs: null, recentSamples: [] };
+    }
+    const bucket = syn[source];
+    if (!ok) {
+      bucket.failCount = (bucket.failCount ?? 0) + 1;
+    } else {
+      bucket.count = (bucket.count ?? 0) + 1;
+      bucket.totalMs = (bucket.totalMs ?? 0) + latencyMs;
+      bucket.minMs = bucket.minMs == null ? latencyMs : Math.min(bucket.minMs, latencyMs);
+      bucket.maxMs = bucket.maxMs == null ? latencyMs : Math.max(bucket.maxMs, latencyMs);
+      bucket.lastMs = latencyMs;
+      const samples = bucket.recentSamples ?? [];
+      samples.push(latencyMs);
+      if (samples.length > 50) samples.shift();
+      bucket.recentSamples = samples;
+    }
     await writeStatsAtomic(stats);
   } catch {
   }
@@ -2816,6 +3431,32 @@ function registerHooks(api) {
             timestamp: Date.now()
           });
           return;
+        } else if (s3Policy === "synthesize") {
+          api.logger.info("[GuardClaw] S3 synthesize mode \u2014 processing locally before cloud");
+          const taskContext = (params.messages ?? []).slice(-4).map((m) => `${m.role}: ${String(m.content).slice(0, 200)}`).join("\n");
+          const _synthT0 = Date.now();
+          const synthResult = await synthesizeContent(
+            userMessage,
+            taskContext,
+            privacyConfig,
+            sessionKey
+          );
+          const _synthLatency = Date.now() - _synthT0;
+          updateSynthesisStats("user_message", _synthLatency, synthResult.ok).catch(() => {
+          });
+          if (synthResult.ok) {
+            api.logger.info(`[GuardClaw] S3 synthesis complete \u2014 forwarding to cloud (${_synthLatency}ms)`);
+            if (sessionMgr) {
+              sessionMgr.appendToFullHistory(sessionKey, { role: "user", content: userMessage });
+              sessionMgr.appendToCleanHistory(sessionKey, { role: "user", content: synthResult.synthetic });
+            }
+            params.messages = (params.messages ?? []).map(
+              (m, i, arr) => i === arr.length - 1 && m.role === "user" ? { ...m, content: synthResult.synthetic } : m
+            );
+          } else {
+            api.logger.warn(`[GuardClaw] S3 synthesis failed (${synthResult.reason}) \u2014 falling back to local-only`);
+            stashDetection(sessionKey, { level: "S3", reason: `synthesis-fallback: ${synthResult.reason}` });
+          }
         }
         setActiveLocalRouting(sessionKey);
         registerGuardSessionParent(sessionKey);
@@ -3079,12 +3720,38 @@ ${GUARDCLAW_S2_CLOSE}`
   });
   api.on("before_tool_call", async (event, ctx) => {
     try {
-      const { toolName, params } = event;
+      const { toolName, params: params2 } = event;
       const sessionKey = ctx.sessionKey ?? "";
       if (!toolName) return;
-      const typedParams = params;
+      const typedParams = params2;
       const privacyConfig = getLiveConfig();
       const baseDir = privacyConfig.session?.baseDir ?? "~/.openclaw";
+      const baConfig = privacyConfig.behavioralAttestation;
+      if (baConfig?.enabled && !isVerifiedGuardSession(sessionKey)) {
+        const currentLevel = getPendingDetection(sessionKey)?.level ?? null;
+        logToolEvent(sessionKey, toolName, typedParams, currentLevel);
+      }
+      if (toolName === "use_secret") {
+        const secretResult = await handleUseSecret(
+          typedParams,
+          sessionKey,
+          privacyConfig,
+          privacyConfig.webhooks,
+          api.logger
+        );
+        if (!secretResult.ok) {
+          return {
+            block: true,
+            blockReason: `[GuardClaw:secrets] Access denied \u2014 ${secretResult.reason}`
+          };
+        }
+        return {
+          block: true,
+          blockReason: `[GuardClaw:secrets] Operation succeeded
+---
+${secretResult.result}`
+        };
+      }
       if (isVerifiedGuardSession(sessionKey)) {
         if (isNetworkTool(toolName)) {
           api.logger.warn(
@@ -3129,6 +3796,16 @@ ${GUARDCLAW_S2_CLOSE}`
           if (isProtectedMemoryPath(p, baseDir)) {
             api.logger.warn(`[GuardClaw] BLOCKED: cloud model tried to access protected path: ${p}`);
             return { block: true, blockReason: `GuardClaw: access to full history/memory is restricted for cloud models (${p})` };
+          }
+        }
+        const _taintBtcCfg = privacyConfig.taintTracking;
+        if (_taintBtcCfg?.enabled !== false) {
+          for (const p of pathValues) {
+            if (isSecretsMountPath(p)) {
+              markPendingTaint(sessionKey, `secrets-file:${p}`, "S3");
+              api.logger.info(`[GuardClaw:taint] Secrets-mount read detected \u2014 result will be taint-tracked (path=${p}, session=${sessionKey})`);
+              break;
+            }
           }
         }
       }
@@ -3215,6 +3892,92 @@ ${GUARDCLAW_S2_CLOSE}`
       api.logger.error(`[GuardClaw] Error in before_tool_call hook: ${String(err)}`);
     }
   });
+  api.on("after_tool_call", async (event, ctx) => {
+    try {
+      const sessionKey = ctx.sessionKey ?? "";
+      if (!sessionKey) return;
+      const privacyConfig = getLiveConfig();
+      if ((privacyConfig.s3Policy ?? "local-only") !== "synthesize") return;
+      if (!privacyConfig.localModel?.enabled) return;
+      if (isActiveLocalRouting(sessionKey)) return;
+      if (isVerifiedGuardSession(sessionKey)) return;
+      if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
+      const ev = event;
+      const raw = ev.output ?? ev.result ?? ev.text ?? ev.content ?? "";
+      const textContent = typeof raw === "string" ? raw : JSON.stringify(raw);
+      if (!textContent || textContent.length < 10) return;
+      const ruleCheck = detectByRules(
+        { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: textContent, sessionKey },
+        privacyConfig
+      );
+      if (ruleCheck.level !== "S3") return;
+      api.logger.info(`[GuardClaw] S3 in tool result \u2014 synthesizing before tool_result_persist (tool=${ctx.toolName ?? "unknown"})`);
+      const taskContext = `Tool "${ctx.toolName ?? "unknown"}" returned a result that needs to stay private.`;
+      const _synthT0 = Date.now();
+      const synthResult = await synthesizeToolResult(
+        ctx.toolName ?? "unknown",
+        textContent,
+        taskContext,
+        privacyConfig,
+        sessionKey
+      );
+      const _synthLatency = Date.now() - _synthT0;
+      updateSynthesisStats("tool_result", _synthLatency, synthResult.ok).catch(() => {
+      });
+      if (synthResult.ok) {
+        const queue = _synthesisPendingQueue.get(sessionKey) ?? [];
+        queue.push({ toolName: ctx.toolName ?? "", synthetic: synthResult.synthetic });
+        _synthesisPendingQueue.set(sessionKey, queue);
+        api.logger.info(`[GuardClaw] Synthesis stashed for tool_result_persist \u2014 ${_synthLatency}ms (tool=${ctx.toolName ?? "unknown"})`);
+      } else {
+        api.logger.warn(`[GuardClaw] Tool result synthesis failed after ${_synthLatency}ms (${synthResult.reason}) \u2014 tool_result_persist will redact normally`);
+      }
+    } catch (err) {
+      api.logger.error(`[GuardClaw] Error in after_tool_call synthesis: ${String(err)}`);
+    }
+  });
+  api.on("after_tool_call", async (event, ctx) => {
+    try {
+      const sessionKey = ctx.sessionKey ?? "";
+      if (!sessionKey) return;
+      if (isActiveLocalRouting(sessionKey)) return;
+      if (isVerifiedGuardSession(sessionKey)) return;
+      if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
+      const injectionCfg = getLiveInjectionConfig();
+      if (injectionCfg.enabled === false) return;
+      const ev = event;
+      const raw = ev.output ?? ev.result ?? ev.text ?? ev.content ?? "";
+      const textContent = typeof raw === "string" ? raw : JSON.stringify(raw);
+      if (!textContent || textContent.length < 20) return;
+      const toolName = ctx.toolName ?? "";
+      let source = "api_response";
+      if (/web.?fetch|http.?fetch/i.test(toolName)) source = "web_fetch";
+      else if (/read.?file|file.?read/i.test(toolName)) source = "file";
+      const injResult = await detectInjection(textContent, source, injectionCfg);
+      if (injResult.action === "block" || injResult.action === "sanitise") {
+        const queue = _injectionPendingQueue.get(sessionKey) ?? [];
+        queue.push({
+          toolName,
+          action: injResult.action,
+          sanitised: injResult.sanitised,
+          reason: injResult.blocked_reason ?? `Injection detected (score ${injResult.score})`
+        });
+        _injectionPendingQueue.set(sessionKey, queue);
+        api.logger.warn(
+          `[GuardClaw S0] Tool result injection ${injResult.action}: tool=${toolName} score=${injResult.score} patterns=${injResult.matches.join(",")} session=${sessionKey}`
+        );
+        recordDetection(
+          sessionKey,
+          "S0",
+          "onToolCallExecuted",
+          injResult.blocked_reason ?? `Tool result injection (score ${injResult.score})`
+        );
+        void updateS0Stats(injResult.action);
+      }
+    } catch (err) {
+      api.logger.error(`[GuardClaw] Error in after_tool_call injection check: ${String(err)}`);
+    }
+  });
   api.on("tool_result_persist", (event, ctx) => {
     try {
       const sessionKey = ctx.sessionKey ?? "";
@@ -3247,7 +4010,7 @@ ${GUARDCLAW_S2_CLOSE}`
             sessionKey
           }).catch(() => {
           });
-          const redacted2 = redactSensitiveInfo(textContent2, getLiveConfig().redaction);
+          const redacted2 = redactForCleanTranscript(textContent2, getLiveConfig().redaction);
           if (redacted2 !== textContent2) {
             api.logger.info(`[GuardClaw] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`);
             sessionManager.writeToClean(sessionKey, {
@@ -3294,10 +4057,42 @@ ${GUARDCLAW_S2_CLOSE}`
         return;
       }
       if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
+      const injPending = _popInjectionPending(sessionKey, ctx.toolName ?? "");
+      if (injPending) {
+        if (injPending.action === "block") {
+          api.logger.warn(`[GuardClaw S0] Tool result blocked (injection): tool=${ctx.toolName ?? "unknown"}`);
+          const blocked = replaceMessageText(
+            msg,
+            `[GuardClaw S0: Tool result blocked \u2014 prompt injection detected. Reason: ${injPending.reason ?? "injection detected"}]`
+          );
+          if (blocked) return { message: blocked };
+        } else if (injPending.action === "sanitise" && injPending.sanitised !== void 0) {
+          api.logger.info(`[GuardClaw S0] Tool result sanitised (injection): tool=${ctx.toolName ?? "unknown"}`);
+          const sanitised = replaceMessageText(msg, injPending.sanitised);
+          if (sanitised) return { message: sanitised };
+        }
+      }
       const textContent = extractMessageText(msg);
       if (!textContent || textContent.length < 10) return;
       const privacyConfig = getLiveConfig();
       const wasPrivateBefore = isSessionMarkedPrivate(sessionKey);
+      const _taintCfg = privacyConfig.taintTracking;
+      const taintEnabled = _taintCfg?.enabled !== false;
+      const taintMinLen = _taintCfg?.minValueLength ?? 8;
+      if (taintEnabled) {
+        const pendingTaint = consumePendingTaint(sessionKey);
+        if (pendingTaint) {
+          const taintVals = extractTaintValues(textContent, taintMinLen);
+          for (const v of taintVals) {
+            registerTaint(sessionKey, v, pendingTaint.source, pendingTaint.sensitivity, taintMinLen);
+          }
+          if (taintVals.length > 0) {
+            api.logger.info(
+              `[GuardClaw:taint] Registered ${taintVals.length} tainted value(s) from ${pendingTaint.source} (session=${sessionKey})`
+            );
+          }
+        }
+      }
       const ruleCheck = detectByRules(
         {
           checkpoint: "onToolCallExecuted",
@@ -3321,7 +4116,33 @@ ${GUARDCLAW_S2_CLOSE}`
           );
         }
       }
-      const redacted = redactSensitiveInfo(textContent, getLiveConfig().redaction);
+      if (taintEnabled && (ruleCheck.level === "S3" || ruleCheck.level === "S2" && _taintCfg?.trackS2)) {
+        const taintValsFromResult = extractTaintValues(textContent, taintMinLen);
+        const taintSource = `${ruleCheck.level.toLowerCase()}-tool-result:${ctx.toolName ?? "unknown"}`;
+        const taintSens = ruleCheck.level === "S3" ? "S3" : "S2";
+        for (const v of taintValsFromResult) {
+          registerTaint(sessionKey, v, taintSource, taintSens, taintMinLen);
+        }
+        if (taintValsFromResult.length > 0) {
+          api.logger.info(
+            `[GuardClaw:taint] Registered ${taintValsFromResult.length} tainted value(s) from ${ruleCheck.level} tool result (tool=${ctx.toolName ?? "unknown"}, session=${sessionKey})`
+          );
+        }
+      }
+      if (ruleCheck.level === "S3" && (privacyConfig.s3Policy ?? "local-only") === "synthesize") {
+        const synthetic = _popSynthesisPending(sessionKey, ctx.toolName ?? "");
+        if (synthetic) {
+          const sessionManager = getDefaultSessionManager();
+          sessionManager.writeToFull(sessionKey, { role: "tool", content: textContent, timestamp: Date.now(), sessionKey }).catch(() => {
+          });
+          sessionManager.writeToClean(sessionKey, { role: "tool", content: synthetic, timestamp: Date.now(), sessionKey }).catch(() => {
+          });
+          api.logger.info(`[GuardClaw] S3 tool result replaced with synthesis (tool=${ctx.toolName ?? "unknown"})`);
+          const modified = replaceMessageText(msg, synthetic);
+          if (modified) return { message: modified };
+        }
+      }
+      const redacted = redactForCleanTranscript(textContent, getLiveConfig().redaction);
       const wasRedacted = redacted !== textContent;
       if (detectedSensitive || wasRedacted || wasPrivateBefore) {
         const sessionManager = getDefaultSessionManager();
@@ -3376,7 +4197,7 @@ ${GUARDCLAW_S2_CLOSE}`
             });
           }
           if (llmResult.level === "S3") {
-            const s3Redacted = wasRedacted ? redacted : redactSensitiveInfo(textContent, getLiveConfig().redaction);
+            const s3Redacted = wasRedacted ? redacted : redactForCleanTranscript(textContent, getLiveConfig().redaction);
             const modified = replaceMessageText(msg, s3Redacted);
             if (modified) return { message: modified };
           }
@@ -3420,7 +4241,7 @@ ${GUARDCLAW_S2_CLOSE}`
           });
         } else if (msgText) {
           if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
-            const redacted = redactSensitiveInfo(msgText, getLiveConfig().redaction);
+            const redacted = redactForCleanTranscript(msgText, getLiveConfig().redaction);
             sessionManager.writeToFull(sessionKey, {
               role: "assistant",
               content: msgText,
@@ -3464,7 +4285,7 @@ ${GUARDCLAW_S2_CLOSE}`
       if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
         const assistantText = extractMessageText(msg);
         if (assistantText && assistantText.length >= 10) {
-          const redacted = redactSensitiveInfo(assistantText, getLiveConfig().redaction);
+          const redacted = redactForCleanTranscript(assistantText, getLiveConfig().redaction);
           if (redacted !== assistantText) {
             api.logger.info("[GuardClaw] PII-redacted local model response before transcript write");
             return { message: { ...msg, content: [{ type: "text", text: redacted }] } };
@@ -3516,6 +4337,7 @@ ${GUARDCLAW_S2_CLOSE}`
       await memMgr.syncAllMemoryToClean(privacyConfig);
       clearSessionState(sessionKey);
       clearSessionSecrets(sessionKey);
+      clearBehavioralSession(sessionKey);
       deregisterGuardSession(sessionKey);
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
@@ -4165,7 +4987,7 @@ var privacyRouter = {
 import { createHash } from "crypto";
 var OPENROUTER_PROVIDER = "openrouter";
 var OPENROUTER_DEFAULT_MODEL = "auto";
-var DEFAULT_CONFIG = {
+var DEFAULT_CONFIG2 = {
   enabled: false,
   judgeEndpoint: "http://localhost:11434",
   judgeModel: "openbmb/minicpm4.1",
@@ -4242,7 +5064,7 @@ function buildDecision(tier, config) {
     confidence: 0.8
   };
 }
-function resolveConfig(pluginConfig) {
+function resolveConfig2(pluginConfig) {
   const routers = pluginConfig?.privacy?.routers;
   const tsConfig = routers?.["token-saver"];
   const options = tsConfig?.options ?? {};
@@ -4252,19 +5074,19 @@ function resolveConfig(pluginConfig) {
   const orProviderName = orCfg.providerName ?? OPENROUTER_PROVIDER;
   const baseTiers = openrouterEnabled && !orCfg.passthrough ? Object.fromEntries(
     Object.entries(OPENROUTER_DEFAULT_TIERS).map(([k, v]) => [k, { ...v, provider: orProviderName }])
-  ) : DEFAULT_CONFIG.tiers;
+  ) : DEFAULT_CONFIG2.tiers;
   return {
-    enabled: tsConfig?.enabled ?? DEFAULT_CONFIG.enabled,
-    judgeEndpoint: options.judgeEndpoint ?? privacyLocalModel?.endpoint ?? DEFAULT_CONFIG.judgeEndpoint,
-    judgeModel: options.judgeModel ?? privacyLocalModel?.model ?? DEFAULT_CONFIG.judgeModel,
-    judgeProviderType: options.judgeProviderType ?? privacyLocalModel?.type ?? DEFAULT_CONFIG.judgeProviderType,
+    enabled: tsConfig?.enabled ?? DEFAULT_CONFIG2.enabled,
+    judgeEndpoint: options.judgeEndpoint ?? privacyLocalModel?.endpoint ?? DEFAULT_CONFIG2.judgeEndpoint,
+    judgeModel: options.judgeModel ?? privacyLocalModel?.model ?? DEFAULT_CONFIG2.judgeModel,
+    judgeProviderType: options.judgeProviderType ?? privacyLocalModel?.type ?? DEFAULT_CONFIG2.judgeProviderType,
     judgeCustomModule: options.judgeCustomModule ?? privacyLocalModel?.module,
     judgeApiKey: options.judgeApiKey ?? privacyLocalModel?.apiKey,
     tiers: {
       ...baseTiers,
       ...options.tiers ?? {}
     },
-    cacheTtlMs: options.cacheTtlMs ?? DEFAULT_CONFIG.cacheTtlMs,
+    cacheTtlMs: options.cacheTtlMs ?? DEFAULT_CONFIG2.cacheTtlMs,
     openrouter: openrouterEnabled ? {
       enabled: true,
       passthrough: orCfg.passthrough === true,
@@ -4276,7 +5098,7 @@ function resolveConfig(pluginConfig) {
 var tokenSaverRouter = {
   id: "token-saver",
   async detect(context, pluginConfig) {
-    const config = resolveConfig(pluginConfig);
+    const config = resolveConfig2(pluginConfig);
     if (!config.enabled && !context.dryRun) {
       return { level: "S1", action: "passthrough" };
     }
@@ -4345,11 +5167,11 @@ var tokenSaverRouter = {
 
 // src/stats-dashboard.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2 } from "fs";
-import { join as join8 } from "path";
+import { join as join11 } from "path";
 
 // src/presets.ts
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { join as join7 } from "path";
+import { join as join9 } from "path";
 var BUILTIN_PRESETS = [
   {
     id: "vllm-qwen35",
@@ -4378,9 +5200,9 @@ var BUILTIN_PRESETS = [
     defaultModel: "minimax/MiniMax-M2.5-highspeed"
   }
 ];
-var OPENCLAW_DIR = join7(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH = join7(OPENCLAW_DIR, "guardclaw.json");
-var OPENCLAW_CONFIG_PATH = join7(OPENCLAW_DIR, "openclaw.json");
+var OPENCLAW_DIR = join9(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH = join9(OPENCLAW_DIR, "guardclaw.json");
+var OPENCLAW_CONFIG_PATH = join9(OPENCLAW_DIR, "openclaw.json");
 function readConfig() {
   try {
     return JSON.parse(readFileSync(GUARDCLAW_CONFIG_PATH, "utf-8"));
@@ -4688,13 +5510,649 @@ function createConfigurableRouter(id) {
   };
 }
 
+// src/model-advisor.ts
+import { readFile as readFile4, writeFile as writeFile3, rename as rename3, statfs } from "fs/promises";
+import { execFile as execFile3 } from "child_process";
+import { promisify as promisify3 } from "util";
+import { join as join10 } from "path";
+import { createHash as createHash2 } from "crypto";
+var execFileAsync3 = promisify3(execFile3);
+var HOME4 = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+var SUGGESTIONS_PATH = join10(HOME4, ".openclaw", "guardclaw-suggestions.json");
+var MS_PER_WEEK = 7 * 24 * 60 * 60 * 1e3;
+var OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
+var HF_PROTECTAI_URL = "https://huggingface.co/api/models?author=protectai&search=prompt-injection";
+var CURRENT_DEBERTA_MODEL = "protectai/deberta-v3-base-prompt-injection-v2";
+var CURRENT_DEBERTA_VERSION = 2;
+var FETCH_TIMEOUT_MS = 15e3;
+var REASONING_KEYWORDS = ["thinking", "reasoning", "qwq", "deepseek-r1", "o1", "o3", "r1-", "r1:"];
+var COMPLEX_KEYWORDS = ["opus", "sonnet", "large", "pro", "plus", "70b", "72b", "34b", "65b", "gemini-2.5"];
+var SMALL_KEYWORDS = ["mini", "haiku", "flash", "lite", "nano", "small", "tiny", "3b", "1b", "0.5b"];
+var BENCHMARK_PROMPTS = [
+  { prompt: "What is the capital of France?", expectedTier: "SIMPLE" },
+  { prompt: "Write a Python function that returns the Fibonacci sequence up to n.", expectedTier: "MEDIUM" },
+  { prompt: "Design a microservices architecture for a hospital management system with departments, doctors, patients, appointments, and billing. Describe the key services and their interactions.", expectedTier: "COMPLEX" },
+  { prompt: "Prove by mathematical induction that the sum of the first n natural numbers equals n(n+1)/2.", expectedTier: "REASONING" }
+];
+var _data2 = { lastCheckedAt: null, suggestions: [] };
+var _config = {};
+var _openrouterApiKey = "";
+var _logger = console;
+var _scheduleTimer = null;
+var _running = false;
+async function loadAdvisorData() {
+  try {
+    const raw = await readFile4(SUGGESTIONS_PATH, "utf-8");
+    _data2 = JSON.parse(raw);
+    const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1e3;
+    _data2.suggestions = _data2.suggestions.filter(
+      (s) => s.status === "pending" || new Date(s.createdAt).getTime() > cutoff
+    );
+  } catch {
+  }
+}
+async function saveAdvisorData() {
+  const tmp = SUGGESTIONS_PATH + ".tmp";
+  try {
+    await writeFile3(tmp, JSON.stringify(_data2, null, 2), "utf-8");
+    await rename3(tmp, SUGGESTIONS_PATH);
+  } catch {
+  }
+}
+function makeSuggestionId(type, value) {
+  return createHash2("sha256").update(`${type}:${value}`).digest("hex").slice(0, 12);
+}
+function hasSuggestion(id) {
+  return _data2.suggestions.some((s) => s.id === id && s.status === "pending");
+}
+async function getFreeDiskGb(checkPath) {
+  const paths = [
+    checkPath,
+    process.env.OLLAMA_MODELS,
+    join10(HOME4, ".ollama"),
+    HOME4
+  ].filter(Boolean);
+  for (const p of paths) {
+    try {
+      const stats = await statfs(p);
+      return stats.bfree * stats.bsize / 1024 ** 3;
+    } catch {
+    }
+  }
+  return 999;
+}
+function blendedCostPer1M(pricing) {
+  const input = parseFloat(pricing.prompt) * 1e6;
+  const output = parseFloat(pricing.completion) * 1e6;
+  if (isNaN(input) || isNaN(output)) return Infinity;
+  return (input + output) / 2;
+}
+function isTierCompatible(model, tier) {
+  const id = model.id.toLowerCase();
+  const name = (model.name ?? "").toLowerCase();
+  const text = `${id} ${name}`;
+  if (model.expiration_date) return false;
+  const cost = blendedCostPer1M(model.pricing);
+  if (cost === 0 || cost === Infinity) return false;
+  const isReasoning = REASONING_KEYWORDS.some((k) => text.includes(k));
+  const isComplex = COMPLEX_KEYWORDS.some((k) => text.includes(k));
+  const isSmall = SMALL_KEYWORDS.some((k) => text.includes(k));
+  switch (tier) {
+    case "SIMPLE":
+      return isSmall && !isReasoning && !isComplex;
+    case "MEDIUM":
+      return !isReasoning && !isComplex && !isSmall;
+    case "COMPLEX":
+      return isComplex && !isReasoning;
+    case "REASONING":
+      return isReasoning && !isSmall;
+  }
+}
+async function checkOpenRouterModels(minSavingsPct) {
+  const apiKey = _openrouterApiKey || _config.openrouterApiKey;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let models = [];
+  try {
+    const headers = {};
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const res = await fetch(OPENROUTER_MODELS_URL, {
+      headers,
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      _logger.warn(`[GuardClaw Advisor] OpenRouter models API returned ${res.status}`);
+      return [];
+    }
+    const body = await res.json();
+    models = body.data ?? [];
+    _logger.info(`[GuardClaw Advisor] OpenRouter: fetched ${models.length} models`);
+  } catch (err) {
+    clearTimeout(timer);
+    _logger.warn(`[GuardClaw Advisor] OpenRouter fetch failed: ${String(err)}`);
+    return [];
+  }
+  if (models.length === 0) {
+    _logger.warn("[GuardClaw Advisor] OpenRouter returned empty model list");
+    return [];
+  }
+  function normalizeVersionId(id) {
+    return id.replace(/-(\d+)$/, ".$1");
+  }
+  const byId = new Map(models.map((m) => [m.id, m]));
+  const byNormalizedId = new Map(models.map((m) => [normalizeVersionId(m.id), m]));
+  const privacy = getLiveConfig();
+  const routers = privacy.routers;
+  const tsOptions = routers?.["token-saver"]?.options ?? {};
+  const currentTiers = tsOptions.tiers ?? {};
+  const DEFAULT_TIERS = {
+    SIMPLE: { provider: "openrouter", model: "openai/gpt-4o-mini" },
+    MEDIUM: { provider: "openrouter", model: "openai/gpt-4o" },
+    COMPLEX: { provider: "anthropic", model: "claude-sonnet-4.6" },
+    REASONING: { provider: "openai", model: "o4-mini" }
+  };
+  const tiers = { ...DEFAULT_TIERS, ...currentTiers };
+  const suggestions = [];
+  for (const [tier, target] of Object.entries(tiers)) {
+    const currentId = target.model.includes("/") ? target.model : `${target.provider}/${target.model}`;
+    const currentModel = byId.get(currentId) ?? byNormalizedId.get(normalizeVersionId(currentId));
+    const currentCost = currentModel ? blendedCostPer1M(currentModel.pricing) : Infinity;
+    if (currentCost === Infinity) continue;
+    let cheapest = null;
+    let bestValue = null;
+    let bestModel = null;
+    for (const model of models) {
+      if (model.id === currentId) continue;
+      if (!isTierCompatible(model, tier)) continue;
+      const cost = blendedCostPer1M(model.pricing);
+      const savings = (currentCost - cost) / currentCost * 100;
+      if (savings >= minSavingsPct) {
+        if (!cheapest || cost < cheapest.cost) cheapest = { model, cost, savings };
+      }
+      if (cost < currentCost) {
+        const ctx = Math.min(model.context_length ?? 4096, 2e5);
+        const valueScore = ctx / cost;
+        if (!bestValue || valueScore > bestValue.valueScore) {
+          bestValue = { model, cost, savings, valueScore };
+        }
+      }
+      if (cost <= currentCost * 3) {
+        if (!bestModel || cost > bestModel.cost) bestModel = { model, cost, savings };
+      }
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const seen = /* @__PURE__ */ new Set();
+    if (cheapest) {
+      const id = makeSuggestionId("openrouter_cheaper", `${tier}:${cheapest.model.id}`);
+      if (!hasSuggestion(id)) {
+        seen.add(cheapest.model.id);
+        suggestions.push({
+          id,
+          type: "openrouter_cheaper",
+          status: "pending",
+          createdAt: now,
+          title: `Cheapest ${tier} option`,
+          description: `${cheapest.model.name ?? cheapest.model.id} costs ${cheapest.savings.toFixed(0)}% less than ${currentId} and passes the ${tier} capability filter.`,
+          currentValue: currentId,
+          suggestedValue: cheapest.model.id,
+          savingsPercent: Math.round(cheapest.savings),
+          details: {
+            tier,
+            category: "cheapest",
+            currentCostPer1M: currentCost.toFixed(4),
+            candidateCostPer1M: cheapest.cost.toFixed(4),
+            contextLength: cheapest.model.context_length
+          }
+        });
+      }
+    }
+    if (bestValue && !seen.has(bestValue.model.id)) {
+      const id = makeSuggestionId("openrouter_best_value", `${tier}:${bestValue.model.id}`);
+      if (!hasSuggestion(id)) {
+        seen.add(bestValue.model.id);
+        const ctxK = ((bestValue.model.context_length ?? 0) / 1e3).toFixed(0);
+        suggestions.push({
+          id,
+          type: "openrouter_best_value",
+          status: "pending",
+          createdAt: now,
+          title: `Best value ${tier} model`,
+          description: `${bestValue.model.name ?? bestValue.model.id} offers the most context per dollar for ${tier} tasks${ctxK !== "0" ? ` (${ctxK}k context)` : ""}, ${bestValue.savings.toFixed(0)}% cheaper than ${currentId}.`,
+          currentValue: currentId,
+          suggestedValue: bestValue.model.id,
+          savingsPercent: Math.round(bestValue.savings),
+          details: {
+            tier,
+            category: "best_value",
+            currentCostPer1M: currentCost.toFixed(4),
+            candidateCostPer1M: bestValue.cost.toFixed(4),
+            contextLength: bestValue.model.context_length
+          }
+        });
+      }
+    }
+    if (bestModel && !seen.has(bestModel.model.id)) {
+      const id = makeSuggestionId("openrouter_best", `${tier}:${bestModel.model.id}`);
+      if (!hasSuggestion(id)) {
+        const savingsStr = bestModel.savings > 0 ? `, ${bestModel.savings.toFixed(0)}% cheaper than ${currentId}` : ` (${((bestModel.cost / currentCost - 1) * 100).toFixed(0)}% more than ${currentId})`;
+        suggestions.push({
+          id,
+          type: "openrouter_best",
+          status: "pending",
+          createdAt: now,
+          title: `Top ${tier} model`,
+          description: `${bestModel.model.name ?? bestModel.model.id} is the highest-rated available model for ${tier} tasks on OpenRouter${savingsStr}.`,
+          currentValue: currentId,
+          suggestedValue: bestModel.model.id,
+          savingsPercent: bestModel.savings > 0 ? Math.round(bestModel.savings) : void 0,
+          details: {
+            tier,
+            category: "best",
+            currentCostPer1M: currentCost.toFixed(4),
+            candidateCostPer1M: bestModel.cost.toFixed(4),
+            contextLength: bestModel.model.context_length
+          }
+        });
+      }
+    }
+  }
+  _logger.info(`[GuardClaw Advisor] OpenRouter: ${suggestions.length} suggestion(s) after filtering`);
+  return suggestions;
+}
+async function checkLLMFitModels(minDiskGb) {
+  try {
+    await execFileAsync3("llmfit", ["--version"], { timeout: 5e3 });
+  } catch {
+    return [];
+  }
+  let raw;
+  try {
+    const { stdout } = await execFileAsync3("llmfit", ["recommend", "--json", "--limit", "10"], {
+      timeout: 3e4
+    });
+    raw = stdout;
+  } catch (err) {
+    _logger.warn(`[GuardClaw Advisor] LLMFit command failed: ${String(err)}`);
+    return [];
+  }
+  let entries = [];
+  try {
+    const parsed = JSON.parse(raw);
+    const arr = Array.isArray(parsed) ? parsed : parsed?.models;
+    if (!Array.isArray(arr)) {
+      _logger.warn(`[GuardClaw Advisor] LLMFit: unexpected output format`);
+      return [];
+    }
+    _logger.info(`[GuardClaw Advisor] LLMFit: parsed ${arr.length} candidate(s)`);
+    entries = arr.map((e) => ({
+      name: e.name ?? e.model,
+      model: e.model,
+      fit: (e.fit ?? e.fit_level)?.toLowerCase(),
+      tokens_per_sec: e.tokens_per_sec ?? e.estimated_tps,
+      memory_gb: e.memory_gb ?? e.memory_required_gb,
+      context_length: e.context_length ?? e.context,
+      quantization: e.quantization ?? e.quant,
+      rank: e.rank,
+      score: e.score,
+      category: e.category
+    }));
+  } catch {
+    return [];
+  }
+  const currentJudge = getLiveConfig().localModel?.model ?? "openbmb/minicpm4.1";
+  const freeDiskGb = await getFreeDiskGb();
+  const suggestions = [];
+  for (const entry of entries.slice(0, 5)) {
+    const modelName = entry.name ?? entry.model;
+    if (!modelName) continue;
+    if (modelName === currentJudge) continue;
+    if (entry.fit && entry.fit !== "perfect" && entry.fit !== "good") continue;
+    const tps = entry.tokens_per_sec ?? entry.tps;
+    const id = makeSuggestionId("local_model", modelName);
+    if (hasSuggestion(id)) continue;
+    const estimatedGb = entry.memory_gb ?? (entry.score ? Math.max(2, 10 - entry.score / 15) : 5);
+    if (freeDiskGb < minDiskGb) {
+      _logger.warn(`[GuardClaw Advisor] Skipping local model suggestion \u2014 only ${freeDiskGb.toFixed(1)} GB free (need ${minDiskGb} GB)`);
+      continue;
+    }
+    suggestions.push({
+      id,
+      type: "local_model",
+      status: "pending",
+      createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+      title: `Better local model: ${modelName}`,
+      description: `LLMFit rates ${modelName} as "${entry.fit ?? "suitable"}" for your hardware${tps ? ` (~${Math.round(tps)} tokens/sec)` : ""}. This could replace your current judge model (${currentJudge}).`,
+      currentValue: currentJudge,
+      suggestedValue: modelName,
+      diskRequiredGb: estimatedGb,
+      pullCommand: `ollama pull ${modelName}`,
+      details: {
+        fit: entry.fit,
+        tokensPerSec: tps,
+        contextLength: entry.context_length ?? entry.context,
+        quantization: entry.quantization ?? entry.quant,
+        freeDiskGb: freeDiskGb.toFixed(1)
+      }
+    });
+  }
+  return suggestions;
+}
+async function checkDebertaUpdates() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let hfModels = [];
+  try {
+    const res = await fetch(HF_PROTECTAI_URL, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return [];
+    hfModels = await res.json();
+    if (!Array.isArray(hfModels)) return [];
+  } catch {
+    clearTimeout(timer);
+    return [];
+  }
+  const basePattern = /^protectai\/deberta-v3-base-prompt-injection(?:-v(\d+))?$/;
+  let latestVersion = CURRENT_DEBERTA_VERSION;
+  let latestId = CURRENT_DEBERTA_MODEL;
+  for (const model of hfModels) {
+    const m = model.id.match(basePattern);
+    if (!m) continue;
+    const ver = m[1] ? parseInt(m[1], 10) : 1;
+    if (ver > latestVersion) {
+      latestVersion = ver;
+      latestId = model.id;
+    }
+  }
+  if (latestId === CURRENT_DEBERTA_MODEL) return [];
+  const id = makeSuggestionId("deberta_update", latestId);
+  if (hasSuggestion(id)) return [];
+  return [{
+    id,
+    type: "deberta_update",
+    status: "pending",
+    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+    title: `Newer injection detection model: v${latestVersion}`,
+    description: `${latestId} is available on HuggingFace. Accepting updates the injection config \u2014 the new model is downloaded automatically on next startup.`,
+    currentValue: CURRENT_DEBERTA_MODEL,
+    suggestedValue: latestId,
+    details: { currentVersion: CURRENT_DEBERTA_VERSION, latestVersion }
+  }];
+}
+async function benchmarkModel(endpoint, model, providerType, runs) {
+  let successes = 0;
+  let totalMs = 0;
+  let errors = 0;
+  for (const { prompt } of BENCHMARK_PROMPTS.slice(0, runs)) {
+    const start = Date.now();
+    try {
+      const result = await callChatCompletion(
+        endpoint,
+        model,
+        [
+          { role: "system", content: DEFAULT_JUDGE_PROMPT },
+          { role: "user", content: prompt }
+        ],
+        { temperature: 0, maxTokens: 128, providerType }
+      );
+      totalMs += Date.now() - start;
+      const cleaned = result.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+      const match = cleaned.match(/\{"tier"\s*:\s*"([A-Z]+)"\}/);
+      if (match && ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"].includes(match[1])) {
+        successes++;
+      }
+    } catch {
+      totalMs += Date.now() - start;
+      errors++;
+    }
+  }
+  if (errors === runs) {
+    throw new Error(`All ${runs} benchmark calls failed \u2014 model likely unavailable`);
+  }
+  return {
+    jsonSuccessRate: successes / BENCHMARK_PROMPTS.slice(0, runs).length,
+    avgLatencyMs: Math.round(totalMs / BENCHMARK_PROMPTS.slice(0, runs).length),
+    runs
+  };
+}
+async function runAdvisorChecks() {
+  if (_running) return;
+  if (!_config.enabled) return;
+  _running = true;
+  _logger.info("[GuardClaw Advisor] Starting model checks\u2026");
+  try {
+    const minSavings = _config.minSavingsPercent ?? 20;
+    const minDisk = _config.minDiskSpaceGb ?? 10;
+    const allNew = [];
+    if (_config.openrouter?.enabled !== false) {
+      try {
+        const orSuggestions = await checkOpenRouterModels(minSavings);
+        allNew.push(...orSuggestions);
+        if (orSuggestions.length > 0) {
+          _logger.info(`[GuardClaw Advisor] OpenRouter: ${orSuggestions.length} suggestion(s)`);
+        }
+      } catch (err) {
+        _logger.warn(`[GuardClaw Advisor] OpenRouter check failed: ${String(err)}`);
+      }
+    }
+    if (_config.llmfit?.enabled !== false) {
+      try {
+        const lfSuggestions = await checkLLMFitModels(minDisk);
+        allNew.push(...lfSuggestions);
+        if (lfSuggestions.length > 0) {
+          _logger.info(`[GuardClaw Advisor] LLMFit: ${lfSuggestions.length} suggestion(s)`);
+        }
+      } catch (err) {
+        _logger.warn(`[GuardClaw Advisor] LLMFit check failed: ${String(err)}`);
+      }
+    }
+    if (_config.deberta?.enabled !== false) {
+      try {
+        const dbSuggestions = await checkDebertaUpdates();
+        if (dbSuggestions.length > 0) {
+          _logger.info(`[GuardClaw Advisor] DeBERTa: ${dbSuggestions.length} update suggestion(s)`);
+          if (_config.deberta?.autoUpdate !== false) {
+            for (const s of dbSuggestions) {
+              _data2.suggestions.push(s);
+              const result = await acceptSuggestion(s.id);
+              if (result.ok) {
+                _logger.info(
+                  `[GuardClaw Advisor] DeBERTa auto-updated to ${s.suggestedValue}. Restart the injection service (port 8404) to load the new model.`
+                );
+              } else {
+                _logger.warn(`[GuardClaw Advisor] DeBERTa auto-update failed: ${result.message}`);
+              }
+            }
+          } else {
+            allNew.push(...dbSuggestions);
+          }
+        }
+      } catch (err) {
+        _logger.warn(`[GuardClaw Advisor] DeBERTa check failed: ${String(err)}`);
+      }
+    }
+    const benchmarkEnabled = _config.benchmark?.enabled !== false;
+    const benchmarkRuns = Math.min(_config.benchmark?.runs ?? 3, BENCHMARK_PROMPTS.length);
+    if (benchmarkEnabled) {
+      const privacy = getLiveConfig();
+      const localEndpoint = privacy.localModel?.endpoint ?? "http://localhost:11434";
+      const localModel = privacy.localModel?.model ?? "openbmb/minicpm4.1";
+      const providerType = privacy.localModel?.type ?? "openai-compatible";
+      let currentBenchmark;
+      try {
+        currentBenchmark = await benchmarkModel(localEndpoint, localModel, providerType, benchmarkRuns);
+        _logger.info(`[GuardClaw Advisor] Current judge benchmark: ${(currentBenchmark.jsonSuccessRate * 100).toFixed(0)}% JSON success, ${currentBenchmark.avgLatencyMs}ms avg`);
+      } catch (err) {
+        _logger.warn(`[GuardClaw Advisor] Benchmark of current model failed: ${String(err)}`);
+      }
+      for (const s of allNew.filter((s2) => s2.type === "local_model")) {
+        const candidateModel = s.suggestedValue ?? "";
+        if (!candidateModel) continue;
+        try {
+          const candidateBenchmark = await benchmarkModel(localEndpoint, candidateModel, providerType, benchmarkRuns);
+          s.benchmarkCandidate = candidateBenchmark;
+          if (currentBenchmark) s.benchmarkCurrent = currentBenchmark;
+          _logger.info(
+            `[GuardClaw Advisor] Candidate ${candidateModel} benchmark: ${(candidateBenchmark.jsonSuccessRate * 100).toFixed(0)}% JSON success, ${candidateBenchmark.avgLatencyMs}ms avg`
+          );
+          if (currentBenchmark && candidateBenchmark.jsonSuccessRate < currentBenchmark.jsonSuccessRate * 0.95 && candidateBenchmark.avgLatencyMs > currentBenchmark.avgLatencyMs * 1.05) {
+            s.status = "dismissed";
+            _logger.info(`[GuardClaw Advisor] Dismissed ${candidateModel} \u2014 benchmark below current model`);
+          }
+        } catch {
+        }
+      }
+    }
+    for (const s of allNew) {
+      if (s.status !== "dismissed") {
+        _data2.suggestions.push(s);
+      }
+    }
+    _data2.lastCheckedAt = (/* @__PURE__ */ new Date()).toISOString();
+    await saveAdvisorData();
+    const pending = _data2.suggestions.filter((s) => s.status === "pending").length;
+    _logger.info(`[GuardClaw Advisor] Check complete \u2014 ${pending} pending suggestion(s)`);
+  } finally {
+    _running = false;
+  }
+}
+async function acceptSuggestion(id) {
+  const suggestion = _data2.suggestions.find((s) => s.id === id);
+  if (!suggestion) return { ok: false, message: "Suggestion not found" };
+  if (suggestion.status !== "pending") return { ok: false, message: `Already ${suggestion.status}` };
+  try {
+    if (suggestion.type === "openrouter_cheaper" || suggestion.type === "openrouter_best_value" || suggestion.type === "openrouter_best") {
+      const details = suggestion.details;
+      const tier = details?.tier;
+      const newModel = suggestion.suggestedValue;
+      if (!tier || !newModel) return { ok: false, message: "Missing tier or model in suggestion" };
+      const cfg = getLiveConfig();
+      const routers = cfg.routers ?? {};
+      if (!routers["token-saver"]) routers["token-saver"] = {};
+      if (!routers["token-saver"].options) routers["token-saver"].options = {};
+      const tiers = routers["token-saver"].options.tiers ?? {};
+      tiers[tier] = { provider: "openrouter", model: newModel };
+      routers["token-saver"].options.tiers = tiers;
+      updateLiveConfig({ routers });
+      const configPath = join10(HOME4, ".openclaw", "guardclaw.json");
+      let fileCfg = {};
+      try {
+        fileCfg = JSON.parse(await readFile4(configPath, "utf-8"));
+      } catch {
+      }
+      if (!fileCfg.privacy) fileCfg.privacy = {};
+      const priv = fileCfg.privacy;
+      if (!priv.routers) priv.routers = {};
+      const fileRouters = priv.routers;
+      if (!fileRouters["token-saver"]) fileRouters["token-saver"] = {};
+      if (!fileRouters["token-saver"].options) fileRouters["token-saver"].options = {};
+      const fileTiers = fileRouters["token-saver"].options.tiers ?? {};
+      fileTiers[tier] = { provider: "openrouter", model: newModel };
+      fileRouters["token-saver"].options.tiers = fileTiers;
+      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      suggestion.status = "accepted";
+      await saveAdvisorData();
+      return { ok: true, message: `Token-saver ${tier} tier updated to ${newModel}. Config saved.` };
+    }
+    if (suggestion.type === "local_model") {
+      const newModel = suggestion.suggestedValue;
+      if (!newModel) return { ok: false, message: "Missing model name" };
+      updateLiveConfig({ localModel: { ...getLiveConfig().localModel, model: newModel } });
+      const configPath = join10(HOME4, ".openclaw", "guardclaw.json");
+      let fileCfg = {};
+      try {
+        fileCfg = JSON.parse(await readFile4(configPath, "utf-8"));
+      } catch {
+      }
+      if (!fileCfg.privacy) fileCfg.privacy = {};
+      const priv = fileCfg.privacy;
+      if (!priv.localModel) priv.localModel = {};
+      priv.localModel.model = newModel;
+      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      suggestion.status = "accepted";
+      await saveAdvisorData();
+      return {
+        ok: true,
+        message: `Local model updated to ${newModel}. ${suggestion.pullCommand ? `Pull it with: ${suggestion.pullCommand}` : "Pull the model before use."}`
+      };
+    }
+    if (suggestion.type === "deberta_update") {
+      const newModel = suggestion.suggestedValue;
+      if (!newModel) return { ok: false, message: "Missing model ID" };
+      const configPath = join10(HOME4, ".openclaw", "guardclaw.json");
+      let fileCfg = {};
+      try {
+        fileCfg = JSON.parse(await readFile4(configPath, "utf-8"));
+      } catch {
+      }
+      if (!fileCfg.injection) fileCfg.injection = {};
+      fileCfg.injection.deberta_model = newModel;
+      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      suggestion.status = "accepted";
+      await saveAdvisorData();
+      triggerDebertaReload(newModel).then((r) => {
+        if (r.ok) {
+          _logger?.info(`[GuardClaw Advisor] DeBERTa hot-swap complete: ${r.message}`);
+        } else {
+          _logger?.info(`[GuardClaw Advisor] DeBERTa service unreachable (${r.message}) \u2014 new model active on next startup`);
+        }
+      }).catch(() => {
+      });
+      return { ok: true, message: `DeBERTa model updated to ${newModel}. Hot-reloading injection service\u2026` };
+    }
+    return { ok: false, message: `Unknown suggestion type: ${suggestion.type}` };
+  } catch (err) {
+    return { ok: false, message: String(err) };
+  }
+}
+function dismissSuggestion(id) {
+  const s = _data2.suggestions.find((s2) => s2.id === id);
+  if (s) {
+    s.status = "dismissed";
+    saveAdvisorData().catch(() => {
+    });
+  }
+}
+function getSuggestions(statusFilter) {
+  return _data2.suggestions.filter((s) => !statusFilter || s.status === statusFilter);
+}
+function getLastCheckedAt() {
+  return _data2.lastCheckedAt;
+}
+async function initModelAdvisor(config, openrouterApiKey, logger) {
+  if (!config.enabled) return;
+  _config = config;
+  _openrouterApiKey = openrouterApiKey;
+  _logger = logger;
+  await loadAdvisorData();
+  const intervalWeeks = config.checkIntervalWeeks ?? 2;
+  const intervalMs = intervalWeeks * MS_PER_WEEK;
+  const lastChecked = _data2.lastCheckedAt ? new Date(_data2.lastCheckedAt).getTime() : 0;
+  if (Date.now() - lastChecked > intervalMs) {
+    setTimeout(() => runAdvisorChecks().catch((err) => {
+      _logger.warn(`[GuardClaw Advisor] Startup check failed: ${String(err)}`);
+    }), 1e4);
+  }
+  if (_scheduleTimer) clearInterval(_scheduleTimer);
+  _scheduleTimer = setInterval(() => {
+    runAdvisorChecks().catch((err) => {
+      _logger.warn(`[GuardClaw Advisor] Scheduled check failed: ${String(err)}`);
+    });
+  }, intervalMs);
+  if (_scheduleTimer && typeof _scheduleTimer === "object" && "unref" in _scheduleTimer) {
+    _scheduleTimer.unref();
+  }
+  logger.info(`[GuardClaw Advisor] Initialized (interval: ${intervalWeeks}w, ${getSuggestions("pending").length} pending suggestion(s))`);
+}
+
 // src/stats-dashboard.ts
-var GUARDCLAW_CONFIG_PATH2 = join8(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
-var GUARDCLAW_INJECTIONS_PATH3 = join8(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-injections.json");
+var GUARDCLAW_CONFIG_PATH2 = join11(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw.json");
+var GUARDCLAW_INJECTIONS_PATH3 = join11(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-injections.json");
+var GUARDCLAW_STATS_PATH2 = join11(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
 var CENTRASE_LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAAA/IAAAFrCAYAAABylLKaAAChMElEQVR4nO3dCZwcZZk/8N/7VvdMLm4mMwTIwS1RQY4Aopj1WvHcdU3WC4n/VW5BbhKQNFcOLgVBhFUJqOuarPeueAsKCHKJAiJnDiAzGSCQe6a76v1/nup6e96uqZ7pmenu6e75fTVMn9XVVdXd9bzH8yhjoEFERERERETUpGYtxgnQeB8aWIvBwnvm41G5zCCeiIiIiIiIqIEwkCciIiIiIiJqIAzkiYiIiIiIiBoIA3kiIiIiIiKiBsJAnoiIiIiIiKiBMJAnIiIiIiIiaiAM5ImIiIiIiIgaCAN5IiIiIiIiogbCQJ6IiIiIiIiogTCQJyIiIiIiImogDOSJiIiIiIiIGggDeSIiIiIiIqIGwkCeiIiIiIiIqIEwkCciIiIiIiJqIAzkiYiIiIiIiBoIA3kiIiIiIiKiBsJAnoiIiIiIiKiBMJAnIiIiIiIiaiAM5ImIiIiIiIgaCAN5IiIiIiIiogbCQJ6ogpRCMNDnKrq/5HWxYgVUiafz80pEREREREhxGxBVjjFhsB0McH/KvT96fJE5c2Ccq+79JZdLRERERERjBwN5ohqJet8DN3g//TuYFASYaXxM1h68XoP12xv8/ap5WBc9hME7EREREREVYSBPVB2FnnkJ4CV4twG8XP/Ct3Egsvi4DxwEDa21RPj5D+QWBZx2G1b7Cj9653j8PtZDT0REREREYxzn3BJVhzt8PmXnvnd1d6pTluE038fSnMoH8UrBxLvdDTBVG5xx50ZcuWAFdpHPaoZ7ioiIiIiIGMgT1UQYpy9dD33ZHR2XauCf5bpSfQ1pEszHn6Q0lPaw3+tbcfW5y7ArA3kiIiIiIhLskSeq/ucq7E0/ehw+bwze7Pa+Gx322Kvwny5+sgnyPfUmwI5bFC6ameFUGCIiIiIiYiBPVFGZEgnqur6JfXMGx9qednu7ch5pL8efHPXcTztmOj7K3UVEREREROyRJ6qgSxLqwmeAINWC4+D0tJezLDvcXmloA/gA/nXeMrRwhxERERERjW0M5IkqKKku/JTfYDs/wBuHsayw594ECBTgKYXWndI4tFLrSkREREREjYmBPFGVPdaJN0ggPtLlKCDVu3XoDQJERERERNRcGMgTVdnWALuWykw/FMbAz3loc2+TknYjXT8iIiIiImosDOSJqqzFh+crBHao/LApmJRXvIw5c0bWOEBERERERI2HgTxRhcV7yVs9vOaZigyt91QWr410OURERERE1NgYyBNVWLyX3O/FkzIyvhLLTmk8ZS8rJ0M+h9gTEREREY0dDOSJquy6z6FbBXhuqM8zpriUnR8gN74Vf3bu1zaY5xB7IiIiIqKxg4E8UQ1s1fhB0u1JCfBM9KlUqvjzmVK4a/En8fpg5e6IiIiIiKi5MQggqoH3TcA9RuHx+O2SAE/p4jn1qqgfPnpcgE3bt+J71V1LIiIiIiJqBAzkiaogE7ssQ993SGFpoNBtP3Q6+meCgefPGxlVn8KSRZ9AN3cWERERERExkCeqIDtnPR7ICxkWP1HhAj/AczJ8Xh7oR/PgZT689MzH5sUr6YkPNBZ+/Tj8jTuKiIiIiIgEA3miGrr6OLw8WeF842OZMdioFDwJ6mU+vPTM23nxEtAbg1/uOAmnM4gnIiIiIiJXqugaEY1IlHxO/iXMdM/LzEMvgB/NW4b/28HDm4IcDs4ptMl8eU/h9RbgqdYu3L/kfGzk7iAiIiIiojgG8kQVtmIFzJw5/W/PxIbcL8sH9A8BeCQp8Jdh+sxKT0REREREcRxaT1RhkthuxQqoeODuXhbyGPlng/j4/W6deCIiIiIiIos98kRVCubnlPEY93o8kBfskSciIiIiojj2yBMRERERERE1EAbyRERERERERA2EgTwRERERERFRA2EgT0RERERERNRAGMgTERERERERNRAG8kREREREREQNhIE8ERERERERUQNhIE9ERERERETUQBjIExERERERETUQBvJEREREREREDYSBPBEREREREVEDYSBPRERERERE1EAYyBMRERERERE1EAbyRERERERERA2EgTwRERERERFRA2EgT+RQCsGKFVBJGyUT/XXu1+59mej58c9VdBs/h0REREREVBEM5IkcxkDPmQOT9BmZmQ/gw/ujYD6IB/LyfLndbQyIbuvHeUy4nFINCERERERERC4G8kQDKwTrEsBnouuxYL9f7/vcufDjPfnxz118GaWWSURERERE5EoVXSMiEfaqxzdFZhla1ucw8wyNN2c19kxpTA2AccYgpQJsDTReOe1WrD35W/jHx7+BhwF0SmCf0CM/2FB7IiIiIiKiklSpYb9ElHfuMkzeDPwLDN6BFCapKAxX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yw7wLHbpvT5sSHA8FNXDYx15IiIiIqLmwUCeqLLCXu+bb4aPTavnw6iVkFC+0sJOeSgoz8BgHSYGZ5uzXuiJB/KHhin0WUeeiIiIiKiZMJAnqhLzFWyA2XoafDxX2SV70Qh7GPi9L2Jb7ynmwtVdSbXtiYiIiIio+TCQJ6owO4xdAmqzqPMVzNjnJJjg7miUe3ECPLeMXBE1wP1hJ7tkqP8LVPZEc81LLw5Y256IiIiIiJoKT/iJqpC5Pgzio4DanPCbjeaK1eciyC0FsDF8kE2AF5aOi0beS9BeCNyjefC2zJzL97fCx9eue/vq08OGgkh8WD0RERERETUnBvJEFfYhwIuC+OLP1+JVP8SmlR+Db26DUpsKtwcwCKJ68G7gHu+NN8E2aG8Ftuv5d7N45bdPPxZ9Je4YyBMRERERjRmsK01UYTbBXLzcWxTcbwBWff3YY/HNXxy059uRVkcjUG+BVrv1qyoXBvboBmQIfepP7TutvLPzHGyVu2yPvwzjj5WYIyIiIiKiJsdAnqiK3CH2Ebkc3HEHfKXW/MYY/E5unHkjJjzxwuTJaO2dBH+iwrbxm3ZRz6x7+UpsTlqu7fGfMyd/1V02dygRERERUXNjIE9URRJwZ5z560ohFwXhhQA/Cva3AOtW5h/1WrmLjwftDOKJiIiIiMYAzpEnqhEJ5hcmZJRnlnkiIiIiIhoKBvJEVTYzKkfn9swPVrpuMKwVT0REREQ0djGQJ6qyoSSjK/ex7MUnIiIiIhq7GMgTERERERERNRAG8kREREREREQNhIE8ERERERERUQNhIE9ERERERETUQBjIExERERERETUQBvJEREREREREDYSBPBEREREREVEDYSBPRERERERE1EAYyBMRERERERE1EAbyRERERERERA2EgTwRERERERFRA2EgT0RERERERNRAGMgTERERERERNRAG8kREREREREQNhIE8ERERERERUQNhIE9ERERERETUQBjIExERERERETUQBvJEREREREREDYSBPBEREREREVEDYSBPRERERERE1EAYyBMRERERERGhcfx/gRHitOKGg5wAAAAASUVORK5CYII=";
 function saveGuardClawConfig(privacy) {
   try {
-    const dir = join8(process.env.HOME ?? "/tmp", ".openclaw");
+    const dir = join11(process.env.HOME ?? "/tmp", ".openclaw");
     mkdirSync2(dir, { recursive: true });
     let existing = {};
     try {
@@ -4769,6 +6227,16 @@ async function statsHttpHandler(req, res) {
       return true;
     }
     json(res, collector.getSessionStats());
+    return true;
+  }
+  if (req.method === "GET" && sub === "/api/synthesis-stats") {
+    try {
+      const raw = readFileSync2(GUARDCLAW_STATS_PATH2, "utf-8");
+      const stats = JSON.parse(raw);
+      json(res, stats.synthesis ?? {});
+    } catch {
+      json(res, {});
+    }
     return true;
   }
   if (req.method === "GET" && sub === "/api/current-loop-highest-level") {
@@ -4867,7 +6335,10 @@ async function statsHttpHandler(req, res) {
         modelPricing: liveConfig.modelPricing,
         session: liveConfig.session,
         routers: cfgAny.routers,
-        pipeline: cfgAny.pipeline
+        pipeline: cfgAny.pipeline,
+        injection: liveConfig.injection,
+        budget: liveConfig.budget,
+        modelAdvisor: liveConfig.modelAdvisor
       }
     });
     return true;
@@ -5197,11 +6668,113 @@ async function statsHttpHandler(req, res) {
     }
     return true;
   }
+  if (req.method === "GET" && sub === "/api/suggestions") {
+    const statusFilter = parsedUrl.searchParams.get("status");
+    const suggestions = getSuggestions(statusFilter ?? void 0);
+    json(res, { suggestions, lastCheckedAt: getLastCheckedAt() });
+    return true;
+  }
+  if (req.method === "POST" && sub.startsWith("/api/suggestions/") && sub.endsWith("/accept")) {
+    const id = sub.slice("/api/suggestions/".length, -"/accept".length);
+    if (!id) {
+      json(res, { error: "id required" }, 400);
+      return true;
+    }
+    try {
+      const result = await acceptSuggestion(id);
+      json(res, result, result.ok ? 200 : 400);
+    } catch (err) {
+      json(res, { error: String(err) }, 500);
+    }
+    return true;
+  }
+  if (req.method === "POST" && sub.startsWith("/api/suggestions/") && sub.endsWith("/dismiss")) {
+    const id = sub.slice("/api/suggestions/".length, -"/dismiss".length);
+    if (!id) {
+      json(res, { error: "id required" }, 400);
+      return true;
+    }
+    dismissSuggestion(id);
+    json(res, { ok: true });
+    return true;
+  }
+  if (req.method === "POST" && sub === "/api/advisor/run") {
+    runAdvisorChecks().catch(() => {
+    });
+    json(res, { ok: true, message: "Advisor check triggered" });
+    return true;
+  }
+  if (req.method === "GET" && sub === "/api/budget") {
+    const cfg = getLiveConfig().budget;
+    const snapshot = getBudgetSnapshot();
+    json(res, {
+      enabled: cfg?.enabled ?? false,
+      dailyCap: cfg?.dailyCap ?? null,
+      monthlyCap: cfg?.monthlyCap ?? null,
+      warnAt: cfg?.warnAt ?? null,
+      action: cfg?.action ?? "warn",
+      dailyCost: getDailyCost(),
+      monthlyCost: getMonthlyCost(),
+      raw: snapshot
+    });
+    return true;
+  }
+  if (req.method === "GET" && sub === "/api/models") {
+    const liveConfig = getLiveConfig();
+    const endpoint = parsedUrl.searchParams.get("endpoint") ?? liveConfig.localModel?.endpoint ?? "http://localhost:11434";
+    const type = parsedUrl.searchParams.get("type") ?? liveConfig.localModel?.type ?? "openai-compatible";
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5e3);
+      let models = [];
+      if (type === "ollama-native") {
+        const r = await fetch(`${endpoint}/api/tags`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (r.ok) {
+          const data = await r.json();
+          models = (data.models ?? []).map((m) => m.name);
+        }
+      } else {
+        const r = await fetch(`${endpoint}/v1/models`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (r.ok) {
+          const data = await r.json();
+          models = (data.data ?? []).map((m) => m.id);
+        }
+      }
+      json(res, { models });
+    } catch {
+      json(res, { models: [], error: "Could not reach model endpoint" });
+    }
+    return true;
+  }
+  if (req.method === "GET" && sub === "/api/prices/openrouter") {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8e3);
+      const r = await fetch("https://openrouter.ai/api/v1/models", { signal: controller.signal });
+      clearTimeout(timer);
+      if (!r.ok) {
+        json(res, { error: `HTTP ${r.status}` }, 502);
+        return true;
+      }
+      const data = await r.json();
+      const models = (data.data ?? []).filter((m) => m.pricing?.prompt || m.pricing?.completion).map((m) => ({
+        id: m.id,
+        inputPer1M: m.pricing?.prompt ? parseFloat(m.pricing.prompt) * 1e6 : null,
+        outputPer1M: m.pricing?.completion ? parseFloat(m.pricing.completion) * 1e6 : null
+      }));
+      json(res, { models, fetchedAt: (/* @__PURE__ */ new Date()).toISOString() });
+    } catch {
+      json(res, { error: "Could not reach OpenRouter" }, 502);
+    }
+    return true;
+  }
   return false;
 }
 function dashboardHtml() {
   return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -5394,6 +6967,27 @@ function dashboardHtml() {
   .tag.pipe-tag.dragging{opacity:.4}
   .adv-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:12px;color:var(--text-tertiary);margin:18px 0 10px;padding:6px 0;font-weight:500}
   .adv-toggle:hover{color:var(--text-secondary)}
+
+  .suggestion-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);padding:18px 20px;margin-bottom:12px;box-shadow:var(--shadow-sm);transition:border-color .15s}
+  .suggestion-card:hover{border-color:#d1d5db}
+  .suggestion-card.accepted{opacity:.55}
+  .suggestion-card.dismissed{opacity:.4}
+  .suggestion-card .sc-head{display:flex;align-items:flex-start;gap:12px}
+  .suggestion-card .sc-icon{width:36px;height:36px;border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;background:var(--bg-surface)}
+  .suggestion-card .sc-title{font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:3px}
+  .suggestion-card .sc-desc{font-size:12px;color:var(--text-secondary);line-height:1.5}
+  .suggestion-card .sc-actions{margin-left:auto;display:flex;gap:8px;flex-shrink:0}
+  .suggestion-card .sc-meta{display:flex;gap:16px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border-subtle);flex-wrap:wrap}
+  .suggestion-card .sc-meta-item{font-size:11px;color:var(--text-tertiary)}
+  .suggestion-card .sc-meta-item strong{color:var(--text-primary);font-weight:600}
+  .suggestion-card .sc-bench{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+  .suggestion-card .sc-bench-col{background:var(--bg-surface);border-radius:var(--radius-sm);padding:8px 12px;font-size:11px}
+  .suggestion-card .sc-bench-col .sc-bench-label{color:var(--text-tertiary);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+  .suggestion-card .sc-bench-col .sc-bench-val{color:var(--text-primary);font-size:13px;font-weight:700}
+  .suggestion-card code{font-family:var(--font-mono);font-size:11px;background:var(--bg-input);padding:2px 6px;border-radius:3px;color:var(--accent)}
+  .saving-pill{display:inline-block;font-size:11px;font-weight:700;padding:3px 10px;border-radius:99px;background:rgba(141,198,63,.15);color:#8DC63F;margin-left:8px}
+  .budget-bar-warn .budget-bar-fill{background:#f59e0b !important}
+  .budget-bar-over .budget-bar-fill{background:#ef4444 !important}
   .adv-toggle .adv-arrow{font-size:10px;transition:transform .2s;display:inline-block}
   .adv-toggle.open .adv-arrow{transform:rotate(90deg)}
   .adv-body{display:none}
@@ -5418,8 +7012,7 @@ function dashboardHtml() {
     <span class="status-dot warn" id="status-dot"></span>
     <span id="status-text" data-i18n="header.connecting">Connecting...</span>
     <span id="last-updated"></span>
-    <button class="btn btn-sm btn-outline" onclick="refreshAll()" data-i18n="header.refresh">Refresh</button>
-    <button class="btn btn-sm btn-outline" id="lang-toggle" onclick="setLang(LANG==='en'?'zh':'en')">\u4E2D\u6587</button>
+    <button class="btn btn-sm btn-outline" onclick="refreshAll()">Refresh</button>
   </div>
 </div>
 
@@ -5430,6 +7023,7 @@ function dashboardHtml() {
   <div class="tab" data-tab="rules"><span data-i18n="tab.rules">Router Rules</span> <span class="badge badge-hot">live</span></div>
   <div class="tab" data-tab="config"><span data-i18n="tab.config">Configuration</span> <span class="badge badge-hot">live</span></div>
   <div class="tab" data-tab="banned">Access Control</div>
+  <div class="tab" data-tab="advisor">Advisor <span class="badge badge-hot" id="advisor-badge" style="display:none">!</span></div>
 </div>
 
 <!-- Overview -->
@@ -5461,6 +7055,16 @@ function dashboardHtml() {
       <div class="card-sub" id="cloud-cost-sub" data-i18n="overview.cost_sub">estimated cloud API cost</div>
     </div>
   </div>
+
+  <!-- Synthesis Latency -->
+  <div id="synthesis-stats-section" style="display:none;margin:18px 0 0;">
+    <h3 style="margin-bottom:10px;font-size:14px;color:var(--text-secondary);">S3 Synthesis Latency</h3>
+    <table class="data-table">
+      <thead><tr><th>Source</th><th>Count</th><th>Avg</th><th>Min</th><th>Max</th><th>p95</th><th>Failures</th></tr></thead>
+      <tbody id="synthesis-stats-body"><tr><td colspan="7" class="empty-state">No synthesis data yet \u2014 enable s3Policy: synthesize to start collecting</td></tr></tbody>
+    </table>
+  </div>
+
   <div class="chart-wrap">
     <h3 data-i18n="overview.chart">Hourly Token Usage</h3>
     <canvas id="hourlyChart" height="80"></canvas>
@@ -5501,6 +7105,137 @@ function dashboardHtml() {
     <thead><tr><th data-i18n="det.time">Time</th><th data-i18n="det.session">Session</th><th data-i18n="det.level">Level</th><th data-i18n="det.checkpoint">Checkpoint</th><th data-i18n="det.reason">Reason</th></tr></thead>
     <tbody id="detections-body"><tr><td colspan="5" class="empty-state" data-i18n="det.empty">No detections yet</td></tr></tbody>
   </table>
+</div>
+
+<!-- Advisor -->
+<div id="advisor-panel" class="panel">
+  <!-- Budget -->
+  <div class="config-section" id="budget-section" style="display:none">
+    <h3>Cloud Budget</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+      <div>
+        <div class="card-label">Today</div>
+        <div style="margin-top:6px">
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+            <span id="budget-daily-cost" style="font-weight:700;color:var(--text-primary)">$0.00</span>
+            <span id="budget-daily-cap" style="color:var(--text-tertiary)">cap: \u2014</span>
+          </div>
+          <div style="height:8px;background:var(--bg-input);border-radius:4px;overflow:hidden">
+            <div id="budget-daily-bar" style="height:100%;width:0%;border-radius:4px;background:var(--accent);transition:width .4s"></div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="card-label">This Month</div>
+        <div style="margin-top:6px">
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+            <span id="budget-monthly-cost" style="font-weight:700;color:var(--text-primary)">$0.00</span>
+            <span id="budget-monthly-cap" style="color:var(--text-tertiary)">cap: \u2014</span>
+          </div>
+          <div style="height:8px;background:var(--bg-input);border-radius:4px;overflow:hidden">
+            <div id="budget-monthly-bar" style="height:100%;width:0%;border-radius:4px;background:var(--accent);transition:width .4s"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--text-tertiary)" id="budget-action-label"></div>
+    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border-subtle);display:flex;flex-direction:column;gap:10px">
+      <div style="font-size:12px;font-weight:600;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.05em">Budget Limits</div>
+      <div class="form-row">
+        <label>Daily Cap (USD) <span class="hint-inline">Leave empty to disable</span></label>
+        <input type="number" id="cfg-budget-daily" min="0" step="0.01" placeholder="e.g. 5.00" class="input-sm">
+      </div>
+      <div class="form-row">
+        <label>Monthly Cap (USD)</label>
+        <input type="number" id="cfg-budget-monthly" min="0" step="0.01" placeholder="e.g. 50.00" class="input-sm">
+      </div>
+      <div class="form-row">
+        <label>Warn At (%) <span class="hint-inline">Show warning when this % of cap is reached</span></label>
+        <input type="number" id="cfg-budget-warn" min="50" max="99" step="5" value="80" class="input-sm">
+      </div>
+      <div class="form-row">
+        <label>When Cap Reached</label>
+        <select id="cfg-budget-action" class="input-sm">
+          <option value="warn">Warn only</option>
+          <option value="block">Block requests</option>
+        </select>
+      </div>
+      <button onclick="saveBudgetSettings()" class="btn btn-primary" style="align-self:flex-start">Save Budget</button>
+    </div>
+  </div>
+
+  <!-- Advisor Settings -->
+  <details style="margin-bottom:20px">
+    <summary style="cursor:pointer;font-weight:600;font-size:13px;color:var(--text-secondary);padding:10px 0;list-style:none">&#9881; Advisor Settings</summary>
+    <div style="padding:14px 0;display:flex;flex-direction:column;gap:12px">
+      <div class="form-row">
+        <label>Enabled</label>
+        <div class="toggle-wrap"><input type="checkbox" id="cfg-adv-enabled" class="toggle"><label for="cfg-adv-enabled" class="toggle-label"></label></div>
+      </div>
+      <div class="form-row">
+        <label>Check Interval (weeks)</label>
+        <input type="number" id="cfg-adv-interval" min="1" max="52" step="1" class="input-sm" value="2">
+      </div>
+      <div class="form-row">
+        <label>Min Savings to Suggest (%)</label>
+        <input type="number" id="cfg-adv-savings" min="5" max="90" step="5" class="input-sm" value="20">
+      </div>
+      <div class="form-row">
+        <label>Min Free Disk Space (GB)</label>
+        <input type="number" id="cfg-adv-disk" min="1" max="500" step="1" class="input-sm" value="10">
+      </div>
+      <div class="form-row">
+        <label>OpenRouter API Key <span class="hint-inline">Required for cloud model pricing suggestions</span></label>
+        <input type="password" id="cfg-adv-orkey" placeholder="sk-or-..." class="input-full">
+      </div>
+      <div class="form-row">
+        <label>Check OpenRouter Models</label>
+        <div class="toggle-wrap"><input type="checkbox" id="cfg-adv-or" class="toggle" checked><label for="cfg-adv-or" class="toggle-label"></label></div>
+      </div>
+      <div class="form-row">
+        <label>Check Local Models (LLMFit)</label>
+        <div class="toggle-wrap"><input type="checkbox" id="cfg-adv-llmfit" class="toggle" checked><label for="cfg-adv-llmfit" class="toggle-label"></label></div>
+      </div>
+      <div class="form-row">
+        <label>Check DeBERTa Updates</label>
+        <div class="toggle-wrap"><input type="checkbox" id="cfg-adv-deberta" class="toggle" checked><label for="cfg-adv-deberta" class="toggle-label"></label></div>
+      </div>
+      <div class="form-row">
+        <label>Auto-apply DeBERTa Updates <span class="hint-inline">Apply new classifier models in-place without confirmation</span></label>
+        <div class="toggle-wrap"><input type="checkbox" id="cfg-adv-autoupdate" class="toggle" checked><label for="cfg-adv-autoupdate" class="toggle-label"></label></div>
+      </div>
+      <button onclick="saveAdvisorSettings()" class="btn btn-primary" style="align-self:flex-start">Save Advisor Settings</button>
+    </div>
+  </details>
+
+  <!-- Not enabled notice -->
+  <div id="advisor-disabled-notice" class="config-section" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:16px">
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px">Model Advisor is disabled</div>
+        <div style="font-size:12px;color:var(--text-tertiary)">Enable it in <code style="font-family:var(--font-mono);color:var(--accent)">guardclaw.json</code> \u2192 <code style="font-family:var(--font-mono)">privacy.modelAdvisor.enabled: true</code></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Suggestions header -->
+  <div id="advisor-header" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;display:none">
+    <div>
+      <div style="font-size:14px;font-weight:700;color:var(--text-primary)">Model Suggestions</div>
+      <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px" id="advisor-last-checked">Last checked: \u2014</div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <div class="filter-bar" style="margin-bottom:0">
+        <button class="filter-btn active" onclick="setAdvisorFilter('pending')">Pending</button>
+        <button class="filter-btn" onclick="setAdvisorFilter('accepted')">Accepted</button>
+        <button class="filter-btn" onclick="setAdvisorFilter('dismissed')">Dismissed</button>
+        <button class="filter-btn" onclick="setAdvisorFilter(null)">All</button>
+      </div>
+      <button class="btn btn-sm btn-outline" id="advisor-run-btn" onclick="runAdvisor()">Run Check Now</button>
+    </div>
+  </div>
+
+  <div id="advisor-list"></div>
 </div>
 
 <!-- Access Control (Exempt + Banned) -->
@@ -5761,23 +7496,62 @@ function dashboardHtml() {
           <div class="field">
             <div style="display:flex;flex-direction:column;gap:10px;">
               <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
-                <input type="radio" name="s3policy" id="s3policy-local" value="local-only" style="margin-top:3px;" onchange="document.getElementById('s3policy-warning').style.display='none'">
+                <input type="radio" name="s3policy" id="s3policy-local" value="local-only" style="margin-top:3px;" onchange="updateS3PolicyUI()">
                 <div>
                   <div style="font-weight:600;" data-i18n="priv.s3policy_local">Local Only (default)</div>
                   <div class="hint" data-i18n="priv.s3policy_local_hint">S3 content stays on device. Routes to local guard agent for reasoning. Requires 64 GB+ or distributed setup.</div>
                 </div>
               </label>
               <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
-                <input type="radio" name="s3policy" id="s3policy-redact" value="redact-and-forward" style="margin-top:3px;" onchange="document.getElementById('s3policy-warning').style.display='block'">
+                <input type="radio" name="s3policy" id="s3policy-redact" value="redact-and-forward" style="margin-top:3px;" onchange="updateS3PolicyUI()">
                 <div>
-                  <div style="font-weight:600;" data-i18n="priv.s3policy_redact">Redact &amp; Forward \u26A0\uFE0F</div>
-                  <div class="hint" data-i18n="priv.s3policy_redact_hint">Strips all credentials &amp; secrets locally, then forwards sanitised content to cloud. Works on 16 GB standalone. Security depends on redaction quality.</div>
+                  <div style="font-weight:600;">Redact &amp; Forward \u26A0\uFE0F</div>
+                  <div class="hint">Strips all credentials &amp; secrets locally, then forwards sanitised content to cloud. Works on 16 GB standalone. Security depends on redaction quality.</div>
+                </div>
+              </label>
+              <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+                <input type="radio" name="s3policy" id="s3policy-synthesize" value="synthesize" style="margin-top:3px;" onchange="updateS3PolicyUI()">
+                <div>
+                  <div style="font-weight:600;">Synthesize (transparent) \u2728</div>
+                  <div class="hint">Local model rewrites S3 content into a natural-language description before sending to cloud. Neither the cloud model nor the user sees that interception occurred. Requires local model to be enabled. Falls back to Local Only on failure.</div>
                 </div>
               </label>
             </div>
           </div>
           <div id="s3policy-warning" style="display:none;margin-top:10px;padding:10px 14px;background:rgba(255,160,0,0.12);border:1px solid rgba(255,160,0,0.4);border-radius:6px;font-size:12px;color:#ffb347;">
-            \u26A0\uFE0F <strong>Redact &amp; Forward</strong> sends sanitised S3 content to your cloud provider. Security depends on redaction quality. Centrase recommends testing with your data before enabling in production. <a href="https://github.com/list3r/guardclaw-openclaw-plugin#s3-policy" target="_blank" style="color:#ffb347;">Learn more</a>
+            \u26A0\uFE0F <strong>Redact &amp; Forward</strong> sends sanitised S3 content to your cloud provider. Security depends on redaction quality. Centrase recommends testing with your data before enabling in production.
+          </div>
+          <!-- Synthesis config panel \u2014 shown only when synthesize is selected -->
+          <div id="synthesis-config" style="display:none;margin-top:14px;padding:12px 14px;background:rgba(100,200,255,0.06);border:1px solid rgba(100,200,255,0.2);border-radius:6px;">
+            <div style="font-weight:600;margin-bottom:10px;font-size:13px;">Synthesis Settings</div>
+            <div class="field">
+              <label class="field-label">Fallback on failure</label>
+              <select id="cfg-syn-fallback" style="width:200px;background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:4px 8px;">
+                <option value="local-only">Local Only (safe default)</option>
+                <option value="block">Block message</option>
+              </select>
+              <div class="hint">What to do if synthesis fails or local model is unreachable.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Verify output</label>
+              <input type="checkbox" id="cfg-syn-verify" checked>
+              <span style="font-size:12px;color:#aaa;margin-left:6px;">Re-run S3 detector on synthesis output before sending (recommended)</span>
+            </div>
+            <div class="field">
+              <label class="field-label">Max retries</label>
+              <input type="number" id="cfg-syn-retries" value="2" min="0" max="5" style="width:80px;background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:4px 8px;">
+              <div class="hint">Retry attempts if verification finds S3 content in output. Default: 2.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Max input chars</label>
+              <input type="number" id="cfg-syn-maxchars" value="4000" min="500" max="20000" style="width:100px;background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:4px 8px;">
+              <div class="hint">Truncate S3 content to this length before synthesis to avoid token overruns. Default: 4000.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Timeout (ms)</label>
+              <input type="number" id="cfg-syn-timeout" value="20000" min="5000" max="120000" step="1000" style="width:100px;background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:4px 8px;">
+              <div class="hint">Per-attempt timeout for the local synthesis call. Default: 20000.</div>
+            </div>
           </div>
         </div>
 
@@ -5923,24 +7697,34 @@ function dashboardHtml() {
       </select>
     </div>
     <div class="field"><label data-i18n="cfg.provider">Provider</label><input id="cfg-lm-provider" placeholder="ollama"></div>
-    <div class="field"><label data-i18n="cfg.endpoint">Endpoint</label><input id="cfg-lm-endpoint" placeholder="http://localhost:11434"></div>
-    <div class="field"><label data-i18n="cfg.model">Model</label><input id="cfg-lm-model" placeholder="openbmb/minicpm4.1"></div>
+    <div class="field"><label>Endpoint</label><input id="cfg-lm-endpoint" placeholder="http://localhost:11434"><div class="hint" style="margin-top:4px">Full URL of your local model server \u2014 e.g. Ollama: http://localhost:11434 \xB7 LM Studio: http://localhost:1234 \xB7 vLLM: http://localhost:8000 \xB7 SGLang: http://localhost:30000 \xB7 Remote: http://192.168.1.10:11434</div></div>
+    <div class="field"><label>Model</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-lm-model" placeholder="openbmb/minicpm4.1" style="flex:1"><button type="button" onclick="fetchAndPickModel('lm')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div></div>
     <div class="field"><label data-i18n="cfg.api_key">API Key</label><input id="cfg-lm-apikey" type="password" placeholder="sk-..."></div>
-    <div class="field" id="cfg-lm-module-wrap" style="display:none"><label data-i18n="cfg.custom_mod">Custom Module Path</label><input id="cfg-lm-module" placeholder="./my-provider.js"></div>
+    <div class="field" id="cfg-lm-module-wrap" style="display:none"><label>Custom Module Path</label><input id="cfg-lm-module" placeholder="./my-provider.js"></div>
   </div>
 
   <div class="config-section">
-    <h3><span data-i18n="cfg.cls">Cost-Optimizer Classifier</span> <span class="badge badge-hot">instant</span></h3>
-    <div class="hint" style="margin-bottom:14px" data-i18n="cfg.cls_desc">LLM used by the Cost-Optimizer to determine task complexity. Falls back to the Local Model settings above if empty.</div>
-    <div class="field"><label data-i18n="cfg.endpoint">Endpoint</label><input id="cfg-ts-endpoint" placeholder="(inherits from Local Model)"></div>
-    <div class="field"><label data-i18n="cfg.model">Model</label><input id="cfg-ts-model" placeholder="(inherits from Local Model)"></div>
-    <div class="field">
-      <label data-i18n="cfg.api_proto">API Protocol</label>
-      <select id="cfg-ts-providertype">
-        <option value="openai-compatible">openai-compatible</option>
-        <option value="ollama-native">ollama-native</option>
-        <option value="custom">custom</option>
-      </select>
+    <h3>Prompt Injection Detection (S0) <span class="badge badge-hot">instant</span></h3>
+    <div class="hint" style="margin-bottom:14px">Controls the local DeBERTa classifier service running on port 8404. Blocks or sanitises injection attempts before they reach the LLM.</div>
+    <div class="form-row">
+      <label>Enabled</label>
+      <div class="toggle-wrap"><input type="checkbox" id="cfg-inj-enabled" class="toggle"><label for="cfg-inj-enabled" class="toggle-label"></label></div>
+    </div>
+    <div class="form-row">
+      <label>Block Threshold <span class="hint-inline">0\u20131 \u2014 score above this is blocked (default 0.85)</span></label>
+      <input type="number" id="cfg-inj-block" min="0" max="1" step="0.01" class="input-sm">
+    </div>
+    <div class="form-row">
+      <label>Sanitise Threshold <span class="hint-inline">0\u20131 \u2014 score above this is sanitised but allowed through (default 0.6)</span></label>
+      <input type="number" id="cfg-inj-sanitise" min="0" max="1" step="0.01" class="input-sm">
+    </div>
+    <div class="form-row">
+      <label>Heuristics Only <span class="hint-inline">Skip the DeBERTa model, use pattern matching only (faster, lower accuracy)</span></label>
+      <div class="toggle-wrap"><input type="checkbox" id="cfg-inj-heuristics" class="toggle"><label for="cfg-inj-heuristics" class="toggle-label"></label></div>
+    </div>
+    <div class="form-row">
+      <label>DeBERTa Endpoint <span class="hint-inline">Override the classifier service URL (default: http://127.0.0.1:8404)</span></label>
+      <input type="text" id="cfg-inj-endpoint" placeholder="http://127.0.0.1:8404" class="input-full">
     </div>
   </div>
 
@@ -5954,7 +7738,7 @@ function dashboardHtml() {
     <div class="hint" style="margin-bottom:14px" data-i18n="cfg.guard_desc">A local agent that handles sensitive tasks entirely on-device.</div>
     <div class="field"><label data-i18n="cfg.agent_id">Agent ID</label><input id="cfg-ga-id" placeholder="guard"></div>
     <div class="field"><label data-i18n="cfg.workspace">Workspace</label><input id="cfg-ga-workspace" placeholder="~/.openclaw/workspace-guard"></div>
-    <div class="field"><label data-i18n="cfg.model_prov">Model (provider/model)</label><input id="cfg-ga-model" placeholder="ollama/qwen3.5-27b"></div>
+    <div class="field"><label>Model (provider/model)</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-ga-model" placeholder="ollama/qwen3.5-27b" style="flex:1"><button type="button" onclick="fetchAndPickModel('ga')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div><div class="hint" style="margin-top:4px">Format: provider/model-name \u2014 e.g. ollama-server/qwen3.5:35b \xB7 lmstudio-server/qwen3.5-35b</div></div>
   </div>
 
   <div class="config-section">
@@ -5986,7 +7770,7 @@ function dashboardHtml() {
 
   <div class="config-section">
     <h3><span data-i18n="cfg.redaction">Rule-based Redaction</span> <span class="badge badge-hot">instant</span></h3>
-    <div class="hint" style="margin-bottom:14px" data-i18n="cfg.redaction_desc">Toggle individual PII pattern rules. Off by default to reduce false positives.</div>
+    <div class="hint" style="margin-bottom:14px">These toggles control which PII patterns are stripped from S2 (proxy) requests before forwarding to the cloud. S3 content is always fully redacted regardless of these settings.</div>
     <div class="field-toggle"><label data-i18n="cfg.rd_ip">Internal IP Addresses (10.x, 172.x, 192.168.x)</label><label class="toggle"><input type="checkbox" id="cfg-rd-internalIp"><span class="slider"></span></label></div>
     <div class="field-toggle"><label data-i18n="cfg.rd_email">Email Addresses</label><label class="toggle"><input type="checkbox" id="cfg-rd-email"><span class="slider"></span></label></div>
     <div class="field-toggle"><label data-i18n="cfg.rd_env">Environment Variables (.env KEY=VALUE)</label><label class="toggle"><input type="checkbox" id="cfg-rd-envVar"><span class="slider"></span></label></div>
@@ -5998,14 +7782,15 @@ function dashboardHtml() {
   </div>
 
   <div class="config-section">
-    <h3><span data-i18n="cfg.local_prov">Local Providers</span> <span class="badge badge-hot">instant</span></h3>
+    <h3>Local Providers <span class="badge badge-hot">instant</span></h3>
     <div class="field">
-      <label data-i18n="cfg.local_prov_hint">Additional providers treated as &quot;local&quot; (safe for confidential data routing)</label>
+      <label>Local Providers</label>
       <div class="tag-list" id="cfg-tags-lp"></div>
       <div class="add-row">
-        <input id="cfg-tags-lp-input" placeholder="e.g. my-inference-server" onkeydown="if(event.key==='Enter'){event.preventDefault();addTag('lp')}">
+        <input id="cfg-tags-lp-input" placeholder="e.g. ollama" onkeydown="if(event.key==='Enter'){event.preventDefault();addTag('lp')}">
         <button class="btn btn-sm btn-outline" onclick="addTag('lp')">Add</button>
       </div>
+      <div class="hint" style="margin-top:6px">Provider IDs treated as local (safe for confidential data). Use the provider name, not a URL \u2014 e.g. ollama, lmstudio, vllm. Must match the provider field in your local model config.</div>
     </div>
   </div>
 
@@ -6024,8 +7809,9 @@ function dashboardHtml() {
       <input id="pricing-new-output" type="number" step="0.01" placeholder="Output $/1M" style="flex:1;padding:10px 14px;background:var(--bg-input);border:1px solid transparent;border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;outline:none">
       <button class="btn btn-sm btn-outline" onclick="addPricingRow()" data-i18n="cfg.pricing_add">Add Model</button>
     </div>
-    <div style="margin-top:10px">
-      <button class="btn btn-sm btn-outline" onclick="loadDefaultPricing()" data-i18n="cfg.pricing_load">Load Defaults</button>
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <button class="btn btn-sm btn-outline" onclick="loadDefaultPricing()">Load Defaults</button>
+      <button onclick="fetchOpenRouterPrices()" class="btn btn-outline" id="fetch-prices-btn">Fetch Live Prices (OpenRouter)</button>
     </div>
   </div>
 
@@ -6042,256 +7828,7 @@ var hourlyChart = null;
 var _detections = [];
 var _detectionFilter = 'all';
 
-// \u2500\u2500 i18n \u2500\u2500
-var LANG = localStorage.getItem('gc-lang') || 'en';
-var T = {
-  'tab.overview':{en:'Overview',zh:'\u6982\u89C8'},
-  'tab.sessions':{en:'Sessions',zh:'\u4F1A\u8BDD'},
-  'tab.detections':{en:'Detection Log',zh:'\u68C0\u6D4B\u65E5\u5FD7'},
-  'tab.rules':{en:'Router Rules',zh:'\u8DEF\u7531\u89C4\u5219'},
-  'tab.config':{en:'Configuration',zh:'\u914D\u7F6E'},
-  'header.title':{en:'GuardClaw Dashboard',zh:'GuardClaw \u63A7\u5236\u53F0'},
-  'header.connecting':{en:'Connecting...',zh:'\u8FDE\u63A5\u4E2D...'},
-  'header.refresh':{en:'Refresh',zh:'\u5237\u65B0'},
-  'header.online':{en:'Online',zh:'\u5728\u7EBF'},
-  'overview.cloud':{en:'Cloud Tokens',zh:'\u4E91\u7AEF Tokens'},
-  'overview.local':{en:'Local Tokens',zh:'\u672C\u5730 Tokens'},
-  'overview.redacted':{en:'Redacted Tokens',zh:'\u8131\u654F Tokens'},
-  'overview.protection':{en:'Data Protection Rate',zh:'\u6570\u636E\u4FDD\u62A4\u7387'},
-  'overview.cost':{en:'Cloud Cost',zh:'\u4E91\u7AEF\u8D39\u7528'},
-  'overview.cost_sub':{en:'estimated cloud API cost',zh:'\u4F30\u7B97\u4E91\u7AEF API \u8D39\u7528'},
-  'overview.sub':{en:'of total tokens protected',zh:'\u53D7\u4FDD\u62A4\u7684 Token \u5360\u6BD4'},
-  'overview.chart':{en:'Hourly Token Usage',zh:'\u6BCF\u5C0F\u65F6 Token \u7528\u91CF'},
-  'overview.requests':{en:'requests',zh:'\u8BF7\u6C42'},
-  'overview.no_data':{en:'No data yet',zh:'\u6682\u65E0\u6570\u636E'},
-  'overview.reset_btn':{en:'Reset Stats',zh:'\u91CD\u7F6E\u7EDF\u8BA1'},
-  'overview.reset_confirm':{en:'Reset all token statistics? This cannot be undone.',zh:'\u786E\u5B9A\u8981\u91CD\u7F6E\u6240\u6709 Token \u7EDF\u8BA1\u6570\u636E\u5417\uFF1F\u6B64\u64CD\u4F5C\u4E0D\u53EF\u64A4\u9500\u3002'},
-  'overview.reset_ok':{en:'Stats reset successfully',zh:'\u7EDF\u8BA1\u6570\u636E\u5DF2\u91CD\u7F6E'},
-  'overview.reset_fail':{en:'Failed to reset stats: ',zh:'\u91CD\u7F6E\u7EDF\u8BA1\u5931\u8D25\uFF1A'},
-  'table.category':{en:'Category',zh:'\u5206\u7C7B'},
-  'table.input':{en:'Input',zh:'\u8F93\u5165'},
-  'table.output':{en:'Output',zh:'\u8F93\u51FA'},
-  'table.cache':{en:'Cache Read',zh:'\u7F13\u5B58\u8BFB\u53D6'},
-  'table.total':{en:'Total',zh:'\u603B\u8BA1'},
-  'table.requests':{en:'Requests',zh:'\u8BF7\u6C42\u6570'},
-  'table.cost':{en:'Cost',zh:'\u8D39\u7528'},
-  'table.by_source':{en:'By Source (Router vs Task)',zh:'\u6309\u6765\u6E90\uFF08\u8DEF\u7531\u5F00\u9500 vs \u4EFB\u52A1\u6267\u884C\uFF09'},
-  'table.source':{en:'Source',zh:'\u6765\u6E90'},
-  'sessions.session':{en:'Session',zh:'\u4F1A\u8BDD'},
-  'sessions.level':{en:'Level',zh:'\u7B49\u7EA7'},
-  'sessions.cloud':{en:'Cloud',zh:'\u4E91\u7AEF'},
-  'sessions.local':{en:'Local',zh:'\u672C\u5730'},
-  'sessions.redacted':{en:'Redacted',zh:'\u8131\u654F'},
-  'sessions.cost':{en:'Cost',zh:'\u8D39\u7528'},
-  'sessions.total':{en:'Total',zh:'\u603B\u8BA1'},
-  'sessions.requests':{en:'Requests',zh:'\u8BF7\u6C42\u6570'},
-  'sessions.last_active':{en:'Last Active',zh:'\u6700\u8FD1\u6D3B\u8DC3'},
-  'sessions.empty':{en:'No session data yet',zh:'\u6682\u65E0\u4F1A\u8BDD\u6570\u636E'},
-  'det.time':{en:'Time',zh:'\u65F6\u95F4'},
-  'det.session':{en:'Session',zh:'\u4F1A\u8BDD'},
-  'det.level':{en:'Level',zh:'\u7B49\u7EA7'},
-  'det.checkpoint':{en:'Checkpoint',zh:'\u68C0\u67E5\u70B9'},
-  'det.reason':{en:'Reason',zh:'\u539F\u56E0'},
-  'det.empty':{en:'No detections yet',zh:'\u6682\u65E0\u68C0\u6D4B\u8BB0\u5F55'},
-  'det.empty_for':{en:'No detections for ',zh:'\u6682\u65E0\u68C0\u6D4B\u8BB0\u5F55\uFF1A'},
-  'det.all':{en:'All',zh:'\u5168\u90E8'},
-  'test.title':{en:'Test Classification',zh:'\u5206\u7C7B\u6D4B\u8BD5'},
-  'test.hint':{en:'Test how the router pipeline would classify a message (no changes applied).',zh:'\u6D4B\u8BD5\u8DEF\u7531\u7BA1\u9053\u5982\u4F55\u5BF9\u6D88\u606F\u8FDB\u884C\u5206\u7C7B\uFF08\u4E0D\u4F1A\u5B9E\u9645\u751F\u6548\uFF09\u3002'},
-  'test.placeholder':{en:'e.g. "\u5E2E\u6211\u5206\u6790\u4E00\u4E0B\u8FD9\u4E2A\u6708\u7684\u5DE5\u8D44\u5355" or "write a poem about spring"',zh:'\u4F8B\u5982 "\u5E2E\u6211\u5206\u6790\u4E00\u4E0B\u8FD9\u4E2A\u6708\u7684\u5DE5\u8D44\u5355" \u6216 "write a poem about spring"'},
-  'test.run':{en:'Run Test',zh:'\u8FD0\u884C\u6D4B\u8BD5'},
-  'test.merged':{en:'Merged Result',zh:'\u5408\u5E76\u7ED3\u679C'},
-  'test.level':{en:'Level',zh:'\u7B49\u7EA7'},
-  'test.action':{en:'Action',zh:'\u52A8\u4F5C'},
-  'test.target':{en:'Target',zh:'\u76EE\u6807'},
-  'test.deciding':{en:'Deciding Router',zh:'\u51B3\u7B56\u8DEF\u7531'},
-  'test.reason':{en:'Reason',zh:'\u539F\u56E0'},
-  'test.confidence':{en:'Confidence',zh:'\u7F6E\u4FE1\u5EA6'},
-  'test.classifying':{en:'Classifying...',zh:'\u5206\u7C7B\u4E2D...'},
-  'test.testing':{en:'Testing...',zh:'\u6D4B\u8BD5\u4E2D...'},
-  'test.individual':{en:'Individual Router Results',zh:'\u5404\u8DEF\u7531\u72EC\u7ACB\u7ED3\u679C'},
-  'test.enter_msg':{en:'Enter a test message',zh:'\u8BF7\u8F93\u5165\u6D4B\u8BD5\u6D88\u606F'},
-  'test.failed':{en:'Test failed: ',zh:'\u6D4B\u8BD5\u5931\u8D25\uFF1A'},
-  'ck.user_message':{en:'User Message',zh:'\u7528\u6237\u6D88\u606F'},
-  'ck.before_tool':{en:'Before Tool Runs',zh:'\u5DE5\u5177\u6267\u884C\u524D'},
-  'ck.after_tool':{en:'After Tool Runs',zh:'\u5DE5\u5177\u6267\u884C\u540E'},
-  'pipe.title':{en:'Router Execution Order (Advanced)',zh:'\u8DEF\u7531\u6267\u884C\u987A\u5E8F\uFF08\u9AD8\u7EA7\uFF09'},
-  'pipe.hint':{en:'Click a router to add it to a stage. Drag tags to reorder. Click \\u00d7 to remove.',zh:'\u70B9\u51FB\u8DEF\u7531\u6DFB\u52A0\u5230\u5BF9\u5E94\u9636\u6BB5\u3002\u62D6\u62FD\u6807\u7B7E\u8C03\u6574\u987A\u5E8F\uFF0C\u70B9\u51FB \\u00d7 \u79FB\u9664\u3002'},
-  'pipe.save':{en:'Save Execution Order',zh:'\u4FDD\u5B58\u6267\u884C\u987A\u5E8F'},
-  'pipe.saved':{en:'Execution order saved',zh:'\u6267\u884C\u987A\u5E8F\u5DF2\u4FDD\u5B58'},
-  'priv.title':{en:'Privacy Router',zh:'\u9690\u79C1\u8DEF\u7531'},
-  'priv.desc':{en:'Detects sensitive data in messages and routes to local or redacted cloud models.',zh:'\u68C0\u6D4B\u6D88\u606F\u4E2D\u7684\u654F\u611F\u6570\u636E\uFF0C\u8DEF\u7531\u5230\u672C\u5730\u6A21\u578B\u6216\u8131\u654F\u540E\u53D1\u9001\u4E91\u7AEF\u3002'},
-  'priv.keywords':{en:'Keywords',zh:'\u5173\u952E\u8BCD'},
-  'priv.s2':{en:'S2 \\u2014 Sensitive (Redact \\u2192 Cloud)',zh:'S2 \\u2014 \u654F\u611F\uFF08\u8131\u654F\u540E\u8D70\u4E91\u7AEF\uFF09'},
-  'priv.s3':{en:'S3 \\u2014 Confidential (Local Model Only)',zh:'S3 \\u2014 \u673A\u5BC6\uFF08\u4EC5\u672C\u5730\u6A21\u578B\uFF09'},
-  'priv.llm_prompt':{en:'LLM Prompt',zh:'LLM \u63D0\u793A\u8BCD'},
-  'priv.llm_hint':{en:'Prompt used by the local LLM to classify data sensitivity (S1/S2/S3).',zh:'\u672C\u5730 LLM \u7528\u4E8E\u5206\u7C7B\u6570\u636E\u654F\u611F\u7B49\u7EA7\uFF08S1/S2/S3\uFF09\u7684\u63D0\u793A\u8BCD\u3002'},
-  'priv.test_title':{en:'Test (Privacy Router Only)',zh:'\u6D4B\u8BD5\uFF08\u4EC5\u9690\u79C1\u8DEF\u7531\uFF09'},
-  'priv.test_ph':{en:'Enter a message to test the privacy router alone...',zh:'\u8F93\u5165\u6D88\u606F\u4EE5\u5355\u72EC\u6D4B\u8BD5\u9690\u79C1\u8DEF\u7531...'},
-  'priv.test_btn':{en:'Test Privacy Router',zh:'\u6D4B\u8BD5\u9690\u79C1\u8DEF\u7531'},
-  'priv.save':{en:'Save Privacy Router',zh:'\u4FDD\u5B58\u9690\u79C1\u8DEF\u7531'},
-  'priv.saved':{en:'Privacy Router saved',zh:'\u9690\u79C1\u8DEF\u7531\u5DF2\u4FDD\u5B58'},
-  'priv.adv':{en:'Advanced Configuration',zh:'\u9AD8\u7EA7\u914D\u7F6E'},
-  'priv.when':{en:'When to Run',zh:'\u4F55\u65F6\u8FD0\u884C'},
-  'priv.when_hint':{en:'Select which detectors run at each stage for the privacy router.',zh:'\u9009\u62E9\u9690\u79C1\u8DEF\u7531\u5728\u6BCF\u4E2A\u9636\u6BB5\u8FD0\u884C\u7684\u68C0\u6D4B\u5668\u3002'},
-  'priv.kw_regex':{en:'Keyword \\u0026 Regex',zh:'\u5173\u952E\u8BCD\u548C\u6B63\u5219'},
-  'priv.llm_cls':{en:'LLM Classifier',zh:'LLM \u5206\u7C7B\u5668'},
-  'priv.det_rules':{en:'Detection Rules (Regex \\u0026 Tool Filters)',zh:'\u68C0\u6D4B\u89C4\u5219\uFF08\u6B63\u5219\u548C\u5DE5\u5177\u8FC7\u6EE4\uFF09'},
-  'priv.regex':{en:'Regex Patterns',zh:'\u6B63\u5219\u8868\u8FBE\u5F0F'},
-  'priv.tools':{en:'Sensitive Tool Names',zh:'\u654F\u611F\u5DE5\u5177\u540D'},
-  'priv.paths':{en:'Sensitive File Paths',zh:'\u654F\u611F\u6587\u4EF6\u8DEF\u5F84'},
-  'priv.pii':{en:'Personal Info Redaction Prompt',zh:'\u4E2A\u4EBA\u4FE1\u606F\u8131\u654F\u63D0\u793A\u8BCD'},
-  'priv.pii_hint':{en:'Prompt used by the local LLM to extract and redact personal info.',zh:'\u672C\u5730 LLM \u7528\u4E8E\u63D0\u53D6\u548C\u8131\u654F\u4E2A\u4EBA\u4FE1\u606F\u7684\u63D0\u793A\u8BCD\u3002'},
-  'co.title':{en:'Cost-Optimizer Router',zh:'\u6210\u672C\u4F18\u5316\u8DEF\u7531'},
-  'co.desc':{en:'Classifies task complexity and routes to the most cost-effective model.',zh:'\u5224\u65AD\u4EFB\u52A1\u590D\u6742\u5EA6\uFF0C\u81EA\u52A8\u9009\u62E9\u6027\u4EF7\u6BD4\u6700\u9AD8\u7684\u6A21\u578B\u3002'},
-  'co.tier':{en:'Complexity Level \\u2192 Model',zh:'\u590D\u6742\u5EA6\u7B49\u7EA7 \\u2192 \u6A21\u578B'},
-  'co.complexity':{en:'Complexity',zh:'\u590D\u6742\u5EA6'},
-  'co.provider':{en:'Provider',zh:'\u4F9B\u5E94\u5546'},
-  'co.model':{en:'Model',zh:'\u6A21\u578B'},
-  'co.llm_prompt':{en:'LLM Prompt',zh:'LLM \u63D0\u793A\u8BCD'},
-  'co.llm_hint':{en:'Prompt used by the classifier LLM to determine task complexity.',zh:'\u5206\u7C7B LLM \u7528\u4E8E\u5224\u65AD\u4EFB\u52A1\u590D\u6742\u5EA6\u7684\u63D0\u793A\u8BCD\u3002'},
-  'co.test_title':{en:'Test (Cost-Optimizer Only)',zh:'\u6D4B\u8BD5\uFF08\u4EC5\u6210\u672C\u4F18\u5316\uFF09'},
-  'co.test_ph':{en:'Enter a message to test the cost-optimizer router alone...',zh:'\u8F93\u5165\u6D88\u606F\u4EE5\u5355\u72EC\u6D4B\u8BD5\u6210\u672C\u4F18\u5316\u8DEF\u7531...'},
-  'co.test_btn':{en:'Test Cost-Optimizer',zh:'\u6D4B\u8BD5\u6210\u672C\u4F18\u5316'},
-  'co.save':{en:'Save Cost-Optimizer',zh:'\u4FDD\u5B58\u6210\u672C\u4F18\u5316'},
-  'co.saved':{en:'Cost-Optimizer config saved',zh:'\u6210\u672C\u4F18\u5316\u914D\u7F6E\u5DF2\u4FDD\u5B58'},
-  'co.adv':{en:'Advanced Configuration',zh:'\u9AD8\u7EA7\u914D\u7F6E'},
-  'co.cache':{en:'Cache',zh:'\u7F13\u5B58'},
-  'co.cache_dur':{en:'Cache Duration (ms)',zh:'\u7F13\u5B58\u65F6\u957F\uFF08\u6BEB\u79D2\uFF09'},
-  'cr.add_ph':{en:'Router ID (e.g. content-filter)',zh:'\u8DEF\u7531 ID\uFF08\u5982 content-filter\uFF09'},
-  'cr.add_btn':{en:'+ Add Custom Router',zh:'+ \u6DFB\u52A0\u81EA\u5B9A\u4E49\u8DEF\u7531'},
-  'cr.add_hint':{en:'Create a new router with keyword rules and an optional LLM classification prompt. Added routers appear above and can be included in Router Execution Order.',zh:'\u521B\u5EFA\u4E00\u4E2A\u5E26\u6709\u5173\u952E\u8BCD\u89C4\u5219\u548C\u53EF\u9009 LLM \u5206\u7C7B\u63D0\u793A\u8BCD\u7684\u65B0\u8DEF\u7531\u3002\u6DFB\u52A0\u540E\u663E\u793A\u5728\u4E0A\u65B9\uFF0C\u53EF\u52A0\u5165\u8DEF\u7531\u6267\u884C\u987A\u5E8F\u3002'},
-  'cr.kw_rules':{en:'Keyword Rules',zh:'\u5173\u952E\u8BCD\u89C4\u5219'},
-  'cr.s2_kw':{en:'S2 \\u2014 Sensitive Keywords',zh:'S2 \\u2014 \u654F\u611F\u5173\u952E\u8BCD'},
-  'cr.s3_kw':{en:'S3 \\u2014 Confidential Keywords',zh:'S3 \\u2014 \u673A\u5BC6\u5173\u952E\u8BCD'},
-  'cr.s2_pat':{en:'S2 \\u2014 Sensitive Patterns (regex)',zh:'S2 \\u2014 \u654F\u611F\u6A21\u5F0F\uFF08\u6B63\u5219\uFF09'},
-  'cr.s3_pat':{en:'S3 \\u2014 Confidential Patterns (regex)',zh:'S3 \\u2014 \u673A\u5BC6\u6A21\u5F0F\uFF08\u6B63\u5219\uFF09'},
-  'cr.cls_prompt':{en:'Classification Prompt',zh:'\u5206\u7C7B\u63D0\u793A\u8BCD'},
-  'cr.cls_hint':{en:'If set, the local LLM will classify messages using this prompt. Should output JSON with {level, reason}.',zh:'\u5982\u679C\u8BBE\u7F6E\uFF0C\u672C\u5730 LLM \u5C06\u4F7F\u7528\u6B64\u63D0\u793A\u8BCD\u5206\u7C7B\u6D88\u606F\u3002\u5E94\u8F93\u51FA\u5305\u542B {level, reason} \u7684 JSON\u3002'},
-  'cr.enter_id':{en:'Enter a router ID',zh:'\u8BF7\u8F93\u5165\u8DEF\u7531 ID'},
-  'cr.exists':{en:'" already exists',zh:'" \u5DF2\u5B58\u5728'},
-  'cr.created':{en:'" created \\u2014 configure and save it below',zh:'" \u5DF2\u521B\u5EFA \\u2014 \u8BF7\u5728\u4E0B\u65B9\u914D\u7F6E\u5E76\u4FDD\u5B58'},
-  'cr.del_pre':{en:'Delete router "',zh:'\u786E\u8BA4\u5220\u9664\u8DEF\u7531 "'},
-  'cr.del_suf':{en:'"? This cannot be undone.',zh:'"\uFF1F\u6B64\u64CD\u4F5C\u4E0D\u53EF\u64A4\u9500\u3002'},
-  'cr.deleted':{en:'" deleted',zh:'" \u5DF2\u5220\u9664'},
-  'cr.saved':{en:'" saved',zh:'" \u5DF2\u4FDD\u5B58'},
-  'cfg.enabled':{en:'GuardClaw Enabled',zh:'GuardClaw \u542F\u7528'},
-  'cfg.lm':{en:'Local Model',zh:'\u672C\u5730\u6A21\u578B'},
-  'cfg.lm_desc':{en:'Configure the LLM used locally for privacy classification and PII redaction.',zh:'\u914D\u7F6E\u7528\u4E8E\u9690\u79C1\u5206\u7C7B\u548C\u4E2A\u4EBA\u4FE1\u606F\u8131\u654F\u7684\u672C\u5730 LLM\u3002'},
-  'cfg.lm_enabled':{en:'Enabled',zh:'\u542F\u7528'},
-  'cfg.api_proto':{en:'API Protocol',zh:'API \u534F\u8BAE'},
-  'cfg.provider':{en:'Provider',zh:'\u4F9B\u5E94\u5546'},
-  'cfg.endpoint':{en:'Endpoint',zh:'\u7AEF\u70B9'},
-  'cfg.model':{en:'Model',zh:'\u6A21\u578B'},
-  'cfg.api_key':{en:'API Key',zh:'API \u5BC6\u94A5'},
-  'cfg.custom_mod':{en:'Custom Module Path',zh:'\u81EA\u5B9A\u4E49\u6A21\u5757\u8DEF\u5F84'},
-  'cfg.cls':{en:'Cost-Optimizer Classifier',zh:'\u6210\u672C\u4F18\u5316\u5206\u7C7B\u5668'},
-  'cfg.cls_desc':{en:'LLM used by the Cost-Optimizer to determine task complexity. Falls back to the Local Model settings above if empty.',zh:'\u6210\u672C\u4F18\u5316\u8DEF\u7531\u7528\u4E8E\u5224\u65AD\u4EFB\u52A1\u590D\u6742\u5EA6\u7684 LLM\u3002\u7559\u7A7A\u5219\u4F7F\u7528\u4E0A\u65B9\u672C\u5730\u6A21\u578B\u914D\u7F6E\u3002'},
-  'cfg.adv':{en:'Advanced Settings',zh:'\u9AD8\u7EA7\u8BBE\u7F6E'},
-  'cfg.guard':{en:'Privacy Guard Agent',zh:'\u9690\u79C1\u5B88\u62A4 Agent'},
-  'cfg.guard_desc':{en:'A local agent that handles sensitive tasks entirely on-device.',zh:'\u5B8C\u5168\u5728\u672C\u5730\u8FD0\u884C\u7684\u9690\u79C1\u5B88\u62A4 Agent\u3002'},
-  'cfg.agent_id':{en:'Agent ID',zh:'Agent ID'},
-  'cfg.workspace':{en:'Workspace',zh:'\u5DE5\u4F5C\u76EE\u5F55'},
-  'cfg.model_prov':{en:'Model (provider/model)',zh:'\u6A21\u578B\uFF08\u4F9B\u5E94\u5546/\u6A21\u578B\uFF09'},
-  'cfg.routing':{en:'Routing Policy',zh:'\u8DEF\u7531\u7B56\u7565'},
-  'cfg.routing_desc':{en:'How S2-level sensitive data is handled before reaching the cloud.',zh:'S2 \u7EA7\u654F\u611F\u6570\u636E\u53D1\u9001\u4E91\u7AEF\u524D\u7684\u5904\u7406\u7B56\u7565\u3002'},
-  'cfg.sens_route':{en:'Sensitive Data Routing',zh:'\u654F\u611F\u6570\u636E\u8DEF\u7531'},
-  'cfg.s2_proxy':{en:'Proxy (redact personal info before sending)',zh:'\u4EE3\u7406\uFF08\u53D1\u9001\u524D\u8131\u654F\u4E2A\u4EBA\u4FE1\u606F\uFF09'},
-  'cfg.s2_local':{en:'Local only (process on-device, no cloud)',zh:'\u4EC5\u672C\u5730\uFF08\u8BBE\u5907\u7AEF\u5904\u7406\uFF0C\u4E0D\u4E0A\u4E91\uFF09'},
-  'cfg.proxy_port':{en:'Proxy Port',zh:'\u4EE3\u7406\u7AEF\u53E3'},
-  'cfg.restart_hint':{en:'Requires restart to take effect',zh:'\u9700\u8981\u91CD\u542F\u751F\u6548'},
-  'cfg.session':{en:'Session Settings',zh:'\u4F1A\u8BDD\u8BBE\u7F6E'},
-  'cfg.session_desc':{en:'Manage isolation and storage of guard-related session data.',zh:'\u7BA1\u7406\u9694\u79BB\u4E0E\u5B58\u50A8\u5B88\u62A4\u76F8\u5173\u7684\u4F1A\u8BDD\u6570\u636E\u3002'},
-  'cfg.isolate':{en:'Separate Guard Chat History',zh:'\u9694\u79BB\u5B88\u62A4\u804A\u5929\u8BB0\u5F55'},
-  'cfg.base_dir':{en:'Base Directory',zh:'\u57FA\u7840\u76EE\u5F55'},
-  'cfg.local_prov':{en:'Local Providers',zh:'\u672C\u5730\u4F9B\u5E94\u5546'},
-  'cfg.local_prov_hint':{en:'Additional providers treated as "local" (safe for confidential data routing)',zh:'\u989D\u5916\u89C6\u4E3A"\u672C\u5730"\u7684\u4F9B\u5E94\u5546\uFF08\u53EF\u5B89\u5168\u8DEF\u7531\u673A\u5BC6\u6570\u636E\uFF09'},
-  'cfg.pricing':{en:'Model Pricing',zh:'\u6A21\u578B\u5B9A\u4EF7'},
-  'cfg.pricing_desc':{en:'Configure per-model pricing for cloud API cost estimation (USD per 1M tokens). Only cloud models are tracked.',zh:'\u914D\u7F6E\u4E91\u7AEF\u6A21\u578B\u7684\u5355\u4EF7\u7528\u4E8E\u8D39\u7528\u4F30\u7B97\uFF08\u7F8E\u5143/\u767E\u4E07 Token\uFF09\u3002\u4EC5\u7EDF\u8BA1\u4E91\u7AEF\u6A21\u578B\u3002'},
-  'cfg.pricing_model':{en:'Model',zh:'\u6A21\u578B'},
-  'cfg.pricing_input':{en:'Input $/1M',zh:'\u8F93\u5165 $/1M'},
-  'cfg.pricing_output':{en:'Output $/1M',zh:'\u8F93\u51FA $/1M'},
-  'cfg.pricing_add':{en:'Add Model',zh:'\u6DFB\u52A0\u6A21\u578B'},
-  'cfg.pricing_load':{en:'Load Defaults',zh:'\u52A0\u8F7D\u9ED8\u8BA4'},
-  'cfg.redaction':{en:'Rule-based Redaction',zh:'\u89C4\u5219\u8131\u654F'},
-  'cfg.redaction_desc':{en:'Toggle individual PII pattern rules. Off by default to reduce false positives.',zh:'\u63A7\u5236\u5404\u6761 PII \u6B63\u5219\u89C4\u5219\u7684\u542F\u505C\uFF0C\u9ED8\u8BA4\u5173\u95ED\u4EE5\u51CF\u5C11\u8BEF\u62A5\u3002'},
-  'cfg.rd_ip':{en:'Internal IP Addresses (10.x, 172.x, 192.168.x)',zh:'\u5185\u7F51 IP \u5730\u5740 (10.x, 172.x, 192.168.x)'},
-  'cfg.rd_email':{en:'Email Addresses',zh:'\u7535\u5B50\u90AE\u7BB1'},
-  'cfg.rd_env':{en:'Environment Variables (.env KEY=VALUE)',zh:'\u73AF\u5883\u53D8\u91CF (.env KEY=VALUE)'},
-  'cfg.rd_card':{en:'Credit Card Numbers (13-19 digits)',zh:'\u4FE1\u7528\u5361\u53F7 (13-19 \u4F4D)'},
-  'cfg.rd_phone':{en:'Chinese Mobile Phone (1[3-9]x)',zh:'\u4E2D\u56FD\u624B\u673A\u53F7 (1[3-9]x)'},
-  'cfg.rd_id':{en:'Chinese ID Card (18 digits)',zh:'\u4E2D\u56FD\u8EAB\u4EFD\u8BC1 (18 \u4F4D)'},
-  'cfg.rd_addr':{en:'Chinese Addresses',zh:'\u4E2D\u56FD\u5730\u5740'},
-  'cfg.rd_pin':{en:'PIN / Pin Code',zh:'PIN \u7801'},
-  'cfg.save':{en:'Save Configuration',zh:'\u4FDD\u5B58\u914D\u7F6E'},
-  'cfg.saved':{en:'Configuration saved',zh:'\u914D\u7F6E\u5DF2\u4FDD\u5B58'},
-  'preset.title':{en:'Quick Switch',zh:'\u5FEB\u901F\u5207\u6362'},
-  'preset.desc':{en:'Switch between preconfigured LLM provider setups for Local Model and Guard Agent.',zh:'\u5728\u9884\u914D\u7F6E\u7684 LLM \u4F9B\u5E94\u5546\u7EC4\u5408\u4E4B\u95F4\u5FEB\u901F\u5207\u6362\uFF08\u672C\u5730\u6A21\u578B + \u5B88\u62A4 Agent\uFF09\u3002'},
-  'preset.apply':{en:'Apply',zh:'\u5E94\u7528'},
-  'preset.delete':{en:'Delete',zh:'\u5220\u9664'},
-  'preset.save_as':{en:'Save Current',zh:'\u4FDD\u5B58\u5F53\u524D'},
-  'preset.name_ph':{en:'New preset name...',zh:'\u65B0\u9884\u8BBE\u540D\u79F0...'},
-  'preset.select_ph':{en:'-- Select a preset --',zh:'-- \u9009\u62E9\u9884\u8BBE --'},
-  'preset.select_first':{en:'Please select a preset first',zh:'\u8BF7\u5148\u9009\u62E9\u4E00\u4E2A\u9884\u8BBE'},
-  'preset.applied':{en:'Preset applied',zh:'\u9884\u8BBE\u5DF2\u5E94\u7528'},
-  'preset.saved':{en:'Preset saved',zh:'\u9884\u8BBE\u5DF2\u4FDD\u5B58'},
-  'preset.deleted':{en:'Preset deleted',zh:'\u9884\u8BBE\u5DF2\u5220\u9664'},
-  'preset.delete_confirm':{en:'Delete this custom preset?',zh:'\u786E\u5B9A\u8981\u5220\u9664\u8FD9\u4E2A\u81EA\u5B9A\u4E49\u9884\u8BBE\u5417\uFF1F'},
-  'preset.name_required':{en:'Please enter a preset name',zh:'\u8BF7\u8F93\u5165\u9884\u8BBE\u540D\u79F0'},
-  'preset.builtin':{en:'Built-in',zh:'\u5185\u7F6E'},
-  'preset.custom':{en:'Custom',zh:'\u81EA\u5B9A\u4E49'},
-  'preset.includes_default':{en:'Default model: ',zh:'\u9ED8\u8BA4\u6A21\u578B\uFF1A'},
-  'preset.confirm_default_1':{en:'This preset will also change the default model to ',zh:'\u6B64\u9884\u8BBE\u8FD8\u5C06\u628A\u9ED8\u8BA4\u6A21\u578B\u5207\u6362\u4E3A '},
-  'preset.confirm_default_2':{en:'. This requires a gateway restart. Apply default model change?',zh:'\u3002\u6B64\u64CD\u4F5C\u9700\u8981\u91CD\u542F Gateway \u624D\u80FD\u751F\u6548\u3002\u662F\u5426\u540C\u65F6\u5207\u6362\u9ED8\u8BA4\u6A21\u578B\uFF1F'},
-  'preset.applied_restart':{en:'Preset applied. Restart gateway for default model change.',zh:'\u9884\u8BBE\u5DF2\u5E94\u7528\u3002\u8BF7\u91CD\u542F Gateway \u4EE5\u4F7F\u9ED8\u8BA4\u6A21\u578B\u751F\u6548\u3002'},
-  'common.add':{en:'Add',zh:'\u6DFB\u52A0'},
-  'common.save':{en:'Save',zh:'\u4FDD\u5B58'},
-  'common.delete':{en:'Delete',zh:'\u5220\u9664'},
-  'common.test':{en:'Test',zh:'\u6D4B\u8BD5'},
-  'common.enabled':{en:'Enabled',zh:'\u542F\u7528'},
-  'common.optional':{en:'(optional)',zh:'\uFF08\u53EF\u9009\uFF09'},
-  'common.none':{en:'(none)',zh:'\uFF08\u65E0\uFF09'},
-  'common.customized':{en:'customized',zh:'\u5DF2\u81EA\u5B9A\u4E49'},
-  'common.reset':{en:'Reset Default',zh:'\u6062\u590D\u9ED8\u8BA4'},
-  'common.save_failed':{en:'Save failed: ',zh:'\u4FDD\u5B58\u5931\u8D25\uFF1A'},
-  'common.loading':{en:'Loading prompts...',zh:'\u52A0\u8F7D\u63D0\u793A\u8BCD\u4E2D...'},
-  'common.prompt_saved':{en:'" saved & applied',zh:'" \u5DF2\u4FDD\u5B58\u5E76\u751F\u6548'},
-  'chart.cloud':{en:'Cloud',zh:'\u4E91\u7AEF'},
-  'chart.local':{en:'Local',zh:'\u672C\u5730'},
-  'chart.redacted':{en:'Redacted',zh:'\u8131\u654F'},
-  'status.uptime':{en:'Uptime: ',zh:'\u8FD0\u884C\u65F6\u95F4\uFF1A'},
-  'status.activity':{en:'Last activity: ',zh:'\u6700\u8FD1\u6D3B\u52A8\uFF1A'},
-  'status.updated':{en:'Updated ',zh:'\u5DF2\u66F4\u65B0 '},
-  'status.error':{en:'Error: ',zh:'\u9519\u8BEF\uFF1A'},
-};
-function t(k){return(T[k]&&T[k][LANG])||k;}
 
-function setLang(lang){
-  LANG=lang;
-  localStorage.setItem('gc-lang',lang);
-  document.querySelectorAll('[data-i18n]').forEach(function(el){
-    var k=el.getAttribute('data-i18n');
-    if(T[k]) el.textContent=t(k);
-  });
-  document.querySelectorAll('[data-i18n-html]').forEach(function(el){
-    var k=el.getAttribute('data-i18n-html');
-    if(T[k]) el.innerHTML=t(k);
-  });
-  document.querySelectorAll('[data-i18n-ph]').forEach(function(el){
-    var k=el.getAttribute('data-i18n-ph');
-    if(T[k]) el.placeholder=t(k);
-  });
-  document.querySelectorAll('[data-i18n-opt]').forEach(function(el){
-    var k=el.getAttribute('data-i18n-opt');
-    if(T[k]) el.textContent=t(k);
-  });
-  document.getElementById('lang-toggle').textContent=lang==='en'?'\u4E2D\u6587':'EN';
-  document.querySelectorAll('.add-row .btn-outline').forEach(function(el){el.textContent=t('common.add');});
-  hourlyChart=null;
-  refreshAll();
-  renderCustomRouterCards();
-  updateAvailableRouters();
-  loadPrompts();
-}
 // \u2500\u2500 Generic tag management \u2500\u2500
 var _tags = {
   'kw-s2': [], 'kw-s3': [], 'pat-s2': [], 'pat-s3': [],
@@ -6480,6 +8017,33 @@ function loadDefaultPricing() {
   renderPricing();
 }
 
+async function fetchOpenRouterPrices() {
+  var btn = document.getElementById('fetch-prices-btn');
+  btn.textContent = 'Fetching\u2026'; btn.disabled = true;
+  try {
+    var r = await fetch(BASE + '/prices/openrouter');
+    var data = await r.json();
+    if (data.error) { showToast('Could not reach OpenRouter: ' + data.error, true); return; }
+    // Update prices for any models already in the pricing table
+    var rows = document.querySelectorAll('#pricing-table tbody tr');
+    var updated = 0;
+    rows.forEach(function(row) {
+      var modelCell = row.querySelector('td:first-child');
+      if (!modelCell) return;
+      var modelId = modelCell.textContent.trim();
+      var match = data.models.find(function(m) { return m.id === modelId || m.id.endsWith('/' + modelId); });
+      if (match) {
+        var inputs = row.querySelectorAll('input[type=number]');
+        if (inputs[0] && match.inputPer1M !== null) inputs[0].value = match.inputPer1M.toFixed(4);
+        if (inputs[1] && match.outputPer1M !== null) inputs[1].value = match.outputPer1M.toFixed(4);
+        updated++;
+      }
+    });
+    showToast(updated > 0 ? 'Updated prices for ' + updated + ' model(s)' : 'No matching models in your pricing table. Add OpenRouter model IDs first.');
+  } catch(e) { showToast('Failed to fetch prices', true); }
+  finally { btn.textContent = 'Fetch Live Prices (OpenRouter)'; btn.disabled = false; }
+}
+
 // \u2500\u2500 Tabs \u2500\u2500
 document.querySelectorAll('.tab').forEach(function(t) {
   t.addEventListener('click', function() {
@@ -6490,6 +8054,7 @@ document.querySelectorAll('.tab').forEach(function(t) {
     // Refresh data for tabs that show live state
     if (t.dataset.tab === 'banned') refreshAccessControl();
     if (t.dataset.tab === 'detections') refreshDetections();
+    if (t.dataset.tab === 'advisor') refreshAdvisor();
   });
 });
 
@@ -6534,33 +8099,35 @@ async function refreshStats() {
     var results = await Promise.all([
       fetch(BASE + '/summary').then(function(r) { return r.json(); }),
       fetch(BASE + '/hourly').then(function(r) { return r.json(); }),
+      fetch(BASE + '/synthesis-stats').then(function(r) { return r.json(); }).catch(function() { return {}; }),
     ]);
     var summary = results[0];
     var hourly = results[1];
+    var synthStats = results[2] || {};
     if (summary.error) throw new Error(summary.error);
 
     var lt = summary.lifetime;
     document.getElementById('cloud-tokens').textContent = fmt(lt.cloud.totalTokens);
-    document.getElementById('cloud-reqs').textContent = lt.cloud.requestCount + ' ' + t('overview.requests');
+    document.getElementById('cloud-reqs').textContent = lt.cloud.requestCount + ' ' + 'requests';
     document.getElementById('local-tokens').textContent = fmt(lt.local.totalTokens);
-    document.getElementById('local-reqs').textContent = lt.local.requestCount + ' ' + t('overview.requests');
+    document.getElementById('local-reqs').textContent = lt.local.requestCount + ' ' + 'requests';
     document.getElementById('proxy-tokens').textContent = fmt(lt.proxy.totalTokens);
-    document.getElementById('proxy-reqs').textContent = lt.proxy.requestCount + ' ' + t('overview.requests');
+    document.getElementById('proxy-reqs').textContent = lt.proxy.requestCount + ' ' + 'requests';
 
     var total = lt.cloud.totalTokens + lt.local.totalTokens + lt.proxy.totalTokens;
     var prot = lt.local.totalTokens + lt.proxy.totalTokens;
     var rate = total > 0 ? (prot / total * 100).toFixed(1) + '%' : '--';
     document.getElementById('privacy-rate').textContent = rate;
     document.getElementById('privacy-sub').textContent = total > 0
-      ? fmt(prot) + ' / ' + fmt(total) + ' ' + t('overview.sub')
-      : t('overview.no_data');
+      ? fmt(prot) + ' / ' + fmt(total) + ' ' + 'of total tokens protected'
+      : 'No data yet';
 
     var cloudCost = (lt.cloud.estimatedCost || 0) + (lt.proxy.estimatedCost || 0);
     document.getElementById('cloud-cost').textContent = fmtCost(cloudCost);
-    document.getElementById('cloud-cost-sub').textContent = t('overview.cost_sub');
+    document.getElementById('cloud-cost-sub').textContent = 'estimated cloud API cost';
 
     document.getElementById('detail-body').innerHTML =
-      fillRow(t('chart.cloud'), lt.cloud) + fillRow(t('chart.local'), lt.local) + fillRow(t('chart.redacted'), lt.proxy);
+      fillRow('Cloud', lt.cloud) + fillRow('Local', lt.local) + fillRow('Redacted', lt.proxy);
 
     var bs = summary.bySource || {};
     var routerB = bs.router || {inputTokens:0,outputTokens:0,cacheReadTokens:0,totalTokens:0,requestCount:0};
@@ -6569,32 +8136,72 @@ async function refreshStats() {
       fillRow('\u{1F500} Router (overhead)', routerB) + fillRow('\u26A1 Task (execution)', taskB);
 
     var infoHtml = '';
-    if (summary.startedAt) infoHtml += t('status.uptime') + timeAgo(summary.startedAt);
-    if (summary.lastUpdatedAt) infoHtml += ' &middot; ' + t('status.activity') + timeAgo(summary.lastUpdatedAt);
+    if (summary.startedAt) infoHtml += 'Uptime: ' + timeAgo(summary.startedAt);
+    if (summary.lastUpdatedAt) infoHtml += ' &middot; ' + 'Last activity: ' + timeAgo(summary.lastUpdatedAt);
     document.getElementById('info-bar').innerHTML = infoHtml;
 
     document.getElementById('status-dot').className = 'status-dot';
-    document.getElementById('status-text').textContent = t('header.online');
-    document.getElementById('last-updated').textContent = t('status.updated') + fmtTime(Date.now());
+    document.getElementById('status-text').textContent = 'Online';
+    document.getElementById('last-updated').textContent = 'Updated ' + fmtTime(Date.now());
 
     updateChart(hourly);
+    renderSynthesisStats(synthStats);
   } catch (e) {
     document.getElementById('status-dot').className = 'status-dot err';
-    document.getElementById('status-text').textContent = t('status.error') + (e.message || 'unavailable');
+    document.getElementById('status-text').textContent = 'Error: ' + (e.message || 'unavailable');
   }
 }
 
+function p95(samples) {
+  if (!samples || samples.length === 0) return null;
+  var sorted = samples.slice().sort(function(a, b) { return a - b; });
+  var idx = Math.floor(sorted.length * 0.95);
+  return sorted[Math.min(idx, sorted.length - 1)];
+}
+
+function fmtMs(ms) {
+  if (ms == null) return '\u2014';
+  return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+}
+
+function renderSynthesisStats(syn) {
+  var section = document.getElementById('synthesis-stats-section');
+  var body = document.getElementById('synthesis-stats-body');
+  var sources = ['user_message', 'tool_result'];
+  var labels = { user_message: 'User message', tool_result: 'Tool result' };
+  var hasData = sources.some(function(s) { return syn[s] && syn[s].count > 0; });
+
+  section.style.display = hasData ? 'block' : 'none';
+  if (!hasData) return;
+
+  body.innerHTML = sources.map(function(s) {
+    var b = syn[s] || {};
+    if (!b.count && !b.failCount) return '';
+    var avg = b.count > 0 ? Math.round(b.totalMs / b.count) : null;
+    var est = p95(b.recentSamples);
+    return '<tr>' +
+      '<td>' + labels[s] + '</td>' +
+      '<td>' + (b.count || 0) + '</td>' +
+      '<td>' + fmtMs(avg) + '</td>' +
+      '<td>' + fmtMs(b.minMs) + '</td>' +
+      '<td>' + fmtMs(b.maxMs) + '</td>' +
+      '<td>' + fmtMs(est) + '</td>' +
+      '<td style="color:' + ((b.failCount || 0) > 0 ? '#ff6b6b' : 'inherit') + '">' + (b.failCount || 0) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
 async function resetStats() {
-  if (!confirm(t('overview.reset_confirm'))) return;
+  if (!confirm('Reset all token statistics? This cannot be undone.')) return;
   try {
     var r = await fetch(BASE + '/reset', { method: 'POST' });
     var body = await r.json();
     if (body.error) throw new Error(body.error);
-    showToast(t('overview.reset_ok'));
+    showToast('Stats reset successfully');
     refreshStats();
     refreshSessions();
   } catch (e) {
-    showToast(t('overview.reset_fail') + (e.message || ''), true);
+    showToast('Failed to reset stats: ' + (e.message || ''), true);
   }
 }
 
@@ -6617,9 +8224,9 @@ function updateChart(hourly) {
       data: {
         labels: labels,
         datasets: [
-          { label: t('chart.cloud'), data: cloudData, borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.06)', fill: true, tension: 0.4, borderWidth: 2 },
-          { label: t('chart.local'), data: localData, borderColor: '#059669', backgroundColor: 'rgba(5,150,105,0.06)', fill: true, tension: 0.4, borderWidth: 2 },
-          { label: t('chart.redacted'), data: proxyData, borderColor: '#d97706', backgroundColor: 'rgba(217,119,6,0.06)', fill: true, tension: 0.4, borderWidth: 2 },
+          { label: 'Cloud', data: cloudData, borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.06)', fill: true, tension: 0.4, borderWidth: 2 },
+          { label: 'Local', data: localData, borderColor: '#059669', backgroundColor: 'rgba(5,150,105,0.06)', fill: true, tension: 0.4, borderWidth: 2 },
+          { label: 'Redacted', data: proxyData, borderColor: '#d97706', backgroundColor: 'rgba(217,119,6,0.06)', fill: true, tension: 0.4, borderWidth: 2 },
         ],
       },
       options: {
@@ -6647,7 +8254,7 @@ async function refreshSessions() {
     var sessions = await fetch(BASE + '/sessions').then(function(r) { return r.json(); });
     var tbody = document.getElementById('sessions-body');
     if (!sessions || !sessions.length) {
-      tbody.innerHTML = '<tr><td colspan="11" class="empty-state">' + t('sessions.empty') + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="11" class="empty-state">' + 'No session data yet' + '</td></tr>';
       return;
     }
     tbody.innerHTML = sessions.map(function(s) {
@@ -6695,7 +8302,7 @@ function renderDetections() {
     : _detections.filter(function(d) { return d.level === _detectionFilter; });
   if (!filtered || !filtered.length) {
     tbody.innerHTML = '<tr><td colspan="5" class="empty-state">' +
-      (_detectionFilter !== 'all' ? t('det.empty_for') + _detectionFilter : t('det.empty')) + '</td></tr>';
+      (_detectionFilter !== 'all' ? 'No detections for ' + _detectionFilter : 'No detections yet') + '</td></tr>';
     return;
   }
   tbody.innerHTML = filtered.slice(0, 100).map(function(d) {
@@ -6708,6 +8315,53 @@ function renderDetections() {
       '<td>' + escHtml(d.reason || '--') + '</td>' +
       '</tr>';
   }).join('');
+}
+
+// \u2500\u2500 Model Picker \u2500\u2500
+async function fetchAndPickModel(target) {
+  const endpoint = document.getElementById('cfg-lm-endpoint').value;
+  const type = target === 'lm' ? document.getElementById('cfg-lm-type').value : 'openai-compatible';
+  const btn = event.target;
+  btn.textContent = '\u2026';
+  btn.disabled = true;
+  try {
+    const r = await fetch(BASE + '/models?endpoint=' + encodeURIComponent(endpoint) + '&type=' + encodeURIComponent(type));
+    const data = await r.json();
+    if (!data.models || data.models.length === 0) { alert('No models found at that endpoint. Is the server running?'); return; }
+    const chosen = await showModelPicker(data.models);
+    if (!chosen) return;
+    const inputId = target === 'lm' ? 'cfg-lm-model' : 'cfg-ga-model';
+    document.getElementById(inputId).value = chosen;
+  } catch { alert('Could not reach model endpoint.'); }
+  finally { btn.textContent = 'Browse'; btn.disabled = false; }
+}
+
+function showModelPicker(models) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#2a2e32;border:1px solid #4a5058;border-radius:12px;padding:20px;min-width:320px;max-width:480px;max-height:60vh;display:flex;flex-direction:column;gap:12px';
+    box.innerHTML = \`<div style="font-weight:600;font-size:14px;color:#f0f0f0">Select a model</div><input id="model-picker-filter" placeholder="Filter..." style="background:#3a3f44;border:1px solid #4a5058;border-radius:6px;padding:7px 10px;color:#f0f0f0;font-size:13px;outline:none"><div id="model-picker-list" style="overflow-y:auto;display:flex;flex-direction:column;gap:4px"></div><button onclick="this.closest('div[style*=inset]').remove();window._pickerResolve(null)" style="align-self:flex-end;padding:6px 14px;border-radius:6px;background:#353a3e;border:1px solid #4a5058;color:#a8b0b8;cursor:pointer;font-size:13px">Cancel</button>\`;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    window._pickerResolve = resolve;
+    const list = box.querySelector('#model-picker-list');
+    const renderList = (filter) => {
+      list.innerHTML = '';
+      models.filter(m => m.toLowerCase().includes(filter.toLowerCase())).forEach(m => {
+        const btn = document.createElement('button');
+        btn.textContent = m;
+        btn.style.cssText = 'text-align:left;padding:8px 10px;border-radius:6px;background:#353a3e;border:1px solid #4a5058;color:#f0f0f0;cursor:pointer;font-size:13px';
+        btn.onmouseover = () => btn.style.background = '#3a3f44';
+        btn.onmouseout = () => btn.style.background = '#353a3e';
+        btn.onclick = () => { overlay.remove(); resolve(m); };
+        list.appendChild(btn);
+      });
+    };
+    renderList('');
+    box.querySelector('#model-picker-filter').oninput = (e) => renderList(e.target.value);
+  });
 }
 
 // \u2500\u2500 Config \u2500\u2500
@@ -6748,8 +8402,20 @@ async function loadConfig() {
     var s3pol = p.s3Policy || 'local-only';
     var s3Radio = document.querySelector('input[name="s3policy"][value="' + s3pol + '"]');
     if (s3Radio) s3Radio.checked = true;
-    var s3warn = document.getElementById('s3policy-warning');
-    if (s3warn) s3warn.style.display = (s3pol === 'redact-and-forward') ? 'block' : 'none';
+    updateS3PolicyUI();
+
+    // synthesis config
+    var syn = p.synthesis || {};
+    var synFallback = document.getElementById('cfg-syn-fallback');
+    if (synFallback) synFallback.value = syn.fallback || 'local-only';
+    var synVerify = document.getElementById('cfg-syn-verify');
+    if (synVerify) synVerify.checked = syn.verifyOutput !== false;
+    var synRetries = document.getElementById('cfg-syn-retries');
+    if (synRetries) synRetries.value = syn.maxRetries != null ? syn.maxRetries : 2;
+    var synChars = document.getElementById('cfg-syn-maxchars');
+    if (synChars) synChars.value = syn.maxInputChars || 4000;
+    var synTimeout = document.getElementById('cfg-syn-timeout');
+    if (synTimeout) synTimeout.value = syn.timeoutMs || 20000;
 
     document.getElementById('cfg-sess-isolate').checked = sess.isolateGuardHistory !== false;
     document.getElementById('cfg-sess-basedir').value = sess.baseDir || '';
@@ -6759,6 +8425,19 @@ async function loadConfig() {
       var el = document.getElementById('cfg-rd-' + k);
       if (el) el.checked = !!rd[k];
     });
+
+    // Injection Detection fields
+    var inj = p.injection || {};
+    var injEl = document.getElementById('cfg-inj-enabled');
+    if (injEl) injEl.checked = inj.enabled !== false;
+    var injBlock = document.getElementById('cfg-inj-block');
+    if (injBlock) injBlock.value = inj.block_threshold != null ? inj.block_threshold : 0.85;
+    var injSan = document.getElementById('cfg-inj-sanitise');
+    if (injSan) injSan.value = inj.sanitise_threshold != null ? inj.sanitise_threshold : 0.6;
+    var injHeur = document.getElementById('cfg-inj-heuristics');
+    if (injHeur) injHeur.checked = !!inj.heuristics_only;
+    var injEp = document.getElementById('cfg-inj-endpoint');
+    if (injEp) injEp.value = inj.deberta_endpoint || '';
 
     _checkpoints.um = Array.isArray(ck.onUserMessage) ? ck.onUserMessage.slice() : [];
     _checkpoints.tcp = Array.isArray(ck.onToolCallProposed) ? ck.onToolCallProposed.slice() : [];
@@ -6831,9 +8510,9 @@ function renderPresetSelect() {
   var sel = document.getElementById('preset-select');
   var builtins = _presets.filter(function(p) { return p.builtin; });
   var customs = _presets.filter(function(p) { return !p.builtin; });
-  var html = '<option value="">' + t('preset.select_ph') + '</option>';
+  var html = '<option value="">' + '-- Select a preset --' + '</option>';
   if (builtins.length) {
-    html += '<optgroup label="' + t('preset.builtin') + '">';
+    html += '<optgroup label="' + 'Built-in' + '">';
     builtins.forEach(function(p) {
       var dm = p.defaultModel ? ' [' + p.defaultModel + ']' : '';
       html += '<option value="' + p.id + '"' + (p.id === _activePreset ? ' selected' : '') + '>' + escHtml(p.name) + escHtml(dm) + '</option>';
@@ -6841,7 +8520,7 @@ function renderPresetSelect() {
     html += '</optgroup>';
   }
   if (customs.length) {
-    html += '<optgroup label="' + t('preset.custom') + '">';
+    html += '<optgroup label="' + 'Custom' + '">';
     customs.forEach(function(p) {
       var dm = p.defaultModel ? ' [' + p.defaultModel + ']' : '';
       html += '<option value="' + p.id + '"' + (p.id === _activePreset ? ' selected' : '') + '>' + escHtml(p.name) + escHtml(dm) + '</option>';
@@ -6859,7 +8538,7 @@ function onPresetSelectChange() {
   deleteBtn.style.display = (preset && !preset.builtin) ? 'inline-block' : 'none';
   var infoEl = document.getElementById('preset-info');
   if (preset && preset.defaultModel) {
-    infoEl.textContent = t('preset.includes_default') + preset.defaultModel;
+    infoEl.textContent = 'Default model: ' + preset.defaultModel;
     infoEl.style.display = 'block';
   } else {
     infoEl.style.display = 'none';
@@ -6868,14 +8547,14 @@ function onPresetSelectChange() {
 
 async function applyPreset() {
   var id = document.getElementById('preset-select').value;
-  if (!id) { showToast(t('preset.select_first'), true); return; }
+  if (!id) { showToast('Please select a preset first', true); return; }
   var preset = _presets.find(function(p) { return p.id === id; });
   var applyDefaultModel = false;
 
   if (preset && preset.defaultModel && preset.defaultModel !== _currentDefaultModel) {
     applyDefaultModel = confirm(
-      t('preset.confirm_default_1') + preset.defaultModel +
-      t('preset.confirm_default_2')
+      'This preset will also change the default model to ' + preset.defaultModel +
+      '. This requires a gateway restart. Apply default model change?'
     );
   }
 
@@ -6889,25 +8568,25 @@ async function applyPreset() {
     if (result.ok) {
       _activePreset = id;
       if (result.needsRestart) {
-        showToast(t('preset.applied_restart'));
+        showToast('Preset applied. Restart gateway for default model change.');
       } else if (result.defaultModelError) {
-        showToast(t('preset.applied') + ' (' + result.defaultModelError + ')', true);
+        showToast('Preset applied' + ' (' + result.defaultModelError + ')', true);
       } else {
-        showToast(t('preset.applied'));
+        showToast('Preset applied');
       }
       loadConfig();
       loadPresets();
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
 async function saveAsPreset() {
   var name = document.getElementById('preset-save-name').value.trim();
-  if (!name) { showToast(t('preset.name_required'), true); return; }
+  if (!name) { showToast('Please enter a preset name', true); return; }
   try {
     var res = await fetch(BASE + '/presets/save', {
       method: 'POST',
@@ -6917,33 +8596,33 @@ async function saveAsPreset() {
     var result = await res.json();
     if (result.ok) {
       document.getElementById('preset-save-name').value = '';
-      showToast(t('preset.saved'));
+      showToast('Preset saved');
       loadPresets();
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
 async function deletePreset() {
   var id = document.getElementById('preset-select').value;
   if (!id) return;
-  if (!confirm(t('preset.delete_confirm'))) return;
+  if (!confirm('Delete this custom preset?')) return;
   try {
     var res = await fetch(BASE + '/presets/' + encodeURIComponent(id), {
       method: 'DELETE',
     });
     var result = await res.json();
     if (result.ok) {
-      showToast(t('preset.deleted'));
+      showToast('Preset deleted');
       loadPresets();
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
@@ -6985,6 +8664,13 @@ async function saveConfig() {
           });
           return rd;
         })(),
+        injection: {
+          enabled: document.getElementById('cfg-inj-enabled').checked,
+          block_threshold: parseFloat(document.getElementById('cfg-inj-block').value) || 0.85,
+          sanitise_threshold: parseFloat(document.getElementById('cfg-inj-sanitise').value) || 0.6,
+          heuristics_only: document.getElementById('cfg-inj-heuristics').checked,
+          ...(document.getElementById('cfg-inj-endpoint').value ? { deberta_endpoint: document.getElementById('cfg-inj-endpoint').value } : {}),
+        },
       },
     };
     var res = await fetch(BASE + '/config', {
@@ -6994,14 +8680,23 @@ async function saveConfig() {
     });
     var result = await res.json();
     if (result.ok) {
-      showToast(t('cfg.saved'));
+      showToast('Configuration saved');
       loadPresets();
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
+}
+
+function updateS3PolicyUI() {
+  var s3PolicyEl = document.querySelector('input[name="s3policy"]:checked');
+  var pol = s3PolicyEl ? s3PolicyEl.value : 'local-only';
+  var warn = document.getElementById('s3policy-warning');
+  var synPanel = document.getElementById('synthesis-config');
+  if (warn) warn.style.display = (pol === 'redact-and-forward') ? 'block' : 'none';
+  if (synPanel) synPanel.style.display = (pol === 'synthesize') ? 'block' : 'none';
 }
 
 function showToast(msg, isError) {
@@ -7142,13 +8837,13 @@ async function savePrompt(name) {
     });
     var result = await res.json();
     if (result.ok) {
-      showToast('"' + name + t('common.prompt_saved'));
+      showToast('"' + name + '" saved & applied');
       loadPrompts();
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
@@ -7162,7 +8857,7 @@ function resetPrompt(name) {
 
 async function runTestClassify() {
   var msg = document.getElementById('test-message').value.trim();
-  if (!msg) { showToast(t('test.enter_msg'), true); return; }
+  if (!msg) { showToast('Enter a test message', true); return; }
   var checkpoint = document.getElementById('test-checkpoint').value;
   var resultEl = document.getElementById('test-result');
   var loadingEl = document.getElementById('test-loading');
@@ -7177,19 +8872,19 @@ async function runTestClassify() {
     var data = await res.json();
     loadingEl.style.display = 'none';
     if (data.error) {
-      showToast(t('test.failed') + data.error, true);
+      showToast('Test failed: ' + data.error, true);
       return;
     }
     document.getElementById('tr-level').innerHTML = '<span class="level-tag level-' + data.level + '">' + data.level + '</span>';
     document.getElementById('tr-action').textContent = data.action || 'passthrough';
-    document.getElementById('tr-target').textContent = data.target ? (data.target.provider + '/' + data.target.model) : t('common.none');
-    document.getElementById('tr-router').textContent = data.routerId || t('common.none');
-    document.getElementById('tr-reason').textContent = data.reason || t('common.none');
+    document.getElementById('tr-target').textContent = data.target ? (data.target.provider + '/' + data.target.model) : '(none)';
+    document.getElementById('tr-router').textContent = data.routerId || '(none)';
+    document.getElementById('tr-reason').textContent = data.reason || '(none)';
     document.getElementById('tr-confidence').textContent = data.confidence != null ? (data.confidence * 100).toFixed(0) + '%' : '-';
     var perEl = document.getElementById('tr-per-router');
     if (data.routers && data.routers.length > 0) {
       var html = '<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border-subtle)">' +
-        '<div style="font-size:11px;text-transform:uppercase;color:var(--text-tertiary);letter-spacing:.06em;font-weight:700;margin-bottom:10px">' + t('test.individual') + '</div>';
+        '<div style="font-size:11px;text-transform:uppercase;color:var(--text-tertiary);letter-spacing:.06em;font-weight:700;margin-bottom:10px">' + 'Individual Router Results' + '</div>';
       data.routers.forEach(function(r) {
         html += '<div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:8px;padding:12px 16px;margin-bottom:6px">' +
           '<div style="display:flex;justify-content:space-between;align-items:center">' +
@@ -7210,7 +8905,7 @@ async function runTestClassify() {
     resultEl.classList.add('visible');
   } catch (e) {
     loadingEl.style.display = 'none';
-    showToast(t('test.failed') + e.message, true);
+    showToast('Test failed: ' + e.message, true);
   }
 }
 
@@ -7241,19 +8936,19 @@ function renderRouterPrompts(containerId, promptNames) {
   promptNames.forEach(function(name) {
     var p = _prompts[name];
     if (!p) return;
-    var customBadge = p.isCustom ? '<span class="custom-badge">' + t('common.customized') + '</span>' : '';
+    var customBadge = p.isCustom ? '<span class="custom-badge">' + 'customized' + '</span>' : '';
     html += '<div style="margin-bottom:16px">' +
       '<div class="prompt-header">' +
         '<h4>' + escHtml(p.label) + customBadge + '</h4>' +
         '<div class="prompt-actions">' +
-          '<button class="btn btn-sm btn-outline" onclick="resetPrompt(\\'' + escHtml(name) + '\\')">' + t('common.reset') + '</button>' +
-          '<button class="btn btn-sm btn-primary" onclick="savePrompt(\\'' + escHtml(name) + '\\')">' + t('common.save') + '</button>' +
+          '<button class="btn btn-sm btn-outline" onclick="resetPrompt(\\'' + escHtml(name) + '\\')">' + 'Reset Default' + '</button>' +
+          '<button class="btn btn-sm btn-primary" onclick="savePrompt(\\'' + escHtml(name) + '\\')">' + 'Save' + '</button>' +
         '</div>' +
       '</div>' +
       '<textarea class="prompt-editor" id="prompt-' + escHtml(name) + '">' + escHtml(p.content) + '</textarea>' +
     '</div>';
   });
-  c.innerHTML = html || '<div style="color:var(--text-tertiary);font-size:13px">' + t('common.loading') + '</div>';
+  c.innerHTML = html || '<div style="color:var(--text-tertiary);font-size:13px">' + 'Loading prompts...' + '</div>';
 }
 
 // \u2500\u2500 Per-Router Test \u2500\u2500
@@ -7261,7 +8956,7 @@ function renderRouterPrompts(containerId, promptNames) {
 async function runRouterTest(routerId) {
   var msgEl = document.getElementById('test-' + routerId + '-message');
   var msg = msgEl ? msgEl.value.trim() : '';
-  if (!msg) { showToast(t('test.enter_msg'), true); return; }
+  if (!msg) { showToast('Enter a test message', true); return; }
   var resultEl = document.getElementById('test-' + routerId + '-result');
   var loadingEl = document.getElementById('test-' + routerId + '-loading');
   resultEl.classList.remove('visible');
@@ -7275,18 +8970,18 @@ async function runRouterTest(routerId) {
     var data = await res.json();
     loadingEl.style.display = 'none';
     if (data.error) {
-      showToast(t('test.failed') + data.error, true);
+      showToast('Test failed: ' + data.error, true);
       return;
     }
     document.getElementById('tr-' + routerId + '-level').innerHTML = '<span class="level-tag level-' + data.level + '">' + data.level + '</span>';
     document.getElementById('tr-' + routerId + '-action').textContent = data.action || 'passthrough';
-    document.getElementById('tr-' + routerId + '-target').textContent = data.target ? (data.target.provider + '/' + data.target.model) : t('common.none');
-    document.getElementById('tr-' + routerId + '-reason').textContent = data.reason || t('common.none');
+    document.getElementById('tr-' + routerId + '-target').textContent = data.target ? (data.target.provider + '/' + data.target.model) : '(none)';
+    document.getElementById('tr-' + routerId + '-reason').textContent = data.reason || '(none)';
     document.getElementById('tr-' + routerId + '-confidence').textContent = data.confidence != null ? (data.confidence * 100).toFixed(0) + '%' : '-';
     resultEl.classList.add('visible');
   } catch (e) {
     loadingEl.style.display = 'none';
-    showToast(t('test.failed') + e.message, true);
+    showToast('Test failed: ' + e.message, true);
   }
 }
 
@@ -7296,9 +8991,21 @@ async function savePrivacyRouter() {
   try {
     var s3PolicyEl = document.querySelector('input[name="s3policy"]:checked');
     var s3Policy = s3PolicyEl ? s3PolicyEl.value : 'local-only';
+    var synthesis = undefined;
+    if (s3Policy === 'synthesize') {
+      synthesis = {
+        fallback: document.getElementById('cfg-syn-fallback').value || 'local-only',
+        verifyOutput: document.getElementById('cfg-syn-verify').checked,
+        maxRetries: parseInt(document.getElementById('cfg-syn-retries').value, 10) || 2,
+        maxInputChars: parseInt(document.getElementById('cfg-syn-maxchars').value, 10) || 4000,
+        timeoutMs: parseInt(document.getElementById('cfg-syn-timeout').value, 10) || 20000,
+      };
+    }
     var payload = {
       privacy: {
+        enabled: document.getElementById('cfg-privacy-enabled').checked,
         s3Policy: s3Policy,
+        synthesis: synthesis,
         checkpoints: {
           onUserMessage: _checkpoints.um.length ? _checkpoints.um : undefined,
           onToolCallProposed: _checkpoints.tcp.length ? _checkpoints.tcp : undefined,
@@ -7321,12 +9028,12 @@ async function savePrivacyRouter() {
     });
     var result = await res.json();
     if (result.ok) {
-      showToast(t('priv.saved'));
+      showToast('Privacy Router saved');
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
@@ -7378,13 +9085,13 @@ async function saveTokenSaverConfig() {
     });
     var result = await res.json();
     if (result.ok) {
-      showToast(t('co.saved') || 'Cost-Optimizer saved');
+      showToast('Cost-Optimizer config saved');
       loadConfig();
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
@@ -7408,12 +9115,12 @@ async function savePipelineOrder() {
     });
     var result = await res.json();
     if (result.ok) {
-      showToast(t('pipe.saved'));
+      showToast('Execution order saved');
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
@@ -7455,36 +9162,36 @@ function renderCustomRouterCards() {
         '<span class="section-arrow">&#9660;</span>' +
         '<h3>' + escHtml(id) + '</h3>' +
         '<span class="router-id-badge">configurable</span>' +
-        '<button class="btn btn-sm btn-danger" style="margin-left:auto" onclick="event.stopPropagation();removeCustomRouter(\\'' + escHtml(id) + '\\')">' + t('common.delete') + '</button>' +
+        '<button class="btn btn-sm btn-danger" style="margin-left:auto" onclick="event.stopPropagation();removeCustomRouter(\\'' + escHtml(id) + '\\')">' + 'Delete' + '</button>' +
       '</div>' +
       '<div class="router-section-body">' +
         '<div class="field-toggle" style="margin-bottom:18px">' +
-          '<label>' + t('common.enabled') + '</label>' +
+          '<label>' + 'Enabled' + '</label>' +
           '<label class="toggle"><input type="checkbox" id="cfg-cr-enabled-' + escHtml(id) + '"' + checked + '><span class="slider"></span></label>' +
         '</div>' +
 
         '<div class="subsection">' +
-          '<h4>' + t('cr.kw_rules') + '</h4>' +
+          '<h4>' + 'Keyword Rules' + '</h4>' +
           '<div class="rules-grid">' +
             '<div class="rules-col">' +
-              '<h4>' + t('cr.s2_kw') + '</h4>' +
+              '<h4>' + 'S2 \u2014 Sensitive Keywords' + '</h4>' +
               '<div class="tag-list" id="cfg-tags-cr-kw-s2-' + escHtml(id) + '"></div>' +
               '<div class="add-row">' +
                 '<input id="cfg-tags-cr-kw-s2-' + escHtml(id) + '-input" placeholder="Add S2 keyword" onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();addTag(\\'cr-kw-s2-' + escHtml(id) + '\\')}"><button class="btn btn-sm btn-outline" onclick="addTag(\\'cr-kw-s2-' + escHtml(id) + '\\')">Add</button>' +
               '</div>' +
-              '<div style="margin-top:14px"><h4 style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em;font-weight:700">' + t('cr.s2_pat') + '</h4></div>' +
+              '<div style="margin-top:14px"><h4 style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em;font-weight:700">' + 'S2 \u2014 Sensitive Patterns (regex)' + '</h4></div>' +
               '<div class="tag-list" id="cfg-tags-cr-pat-s2-' + escHtml(id) + '"></div>' +
               '<div class="add-row">' +
                 '<input id="cfg-tags-cr-pat-s2-' + escHtml(id) + '-input" placeholder="Add S2 pattern" onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();addTag(\\'cr-pat-s2-' + escHtml(id) + '\\')}"><button class="btn btn-sm btn-outline" onclick="addTag(\\'cr-pat-s2-' + escHtml(id) + '\\')">Add</button>' +
               '</div>' +
             '</div>' +
             '<div class="rules-col">' +
-              '<h4>' + t('cr.s3_kw') + '</h4>' +
+              '<h4>' + 'S3 \u2014 Confidential Keywords' + '</h4>' +
               '<div class="tag-list" id="cfg-tags-cr-kw-s3-' + escHtml(id) + '"></div>' +
               '<div class="add-row">' +
                 '<input id="cfg-tags-cr-kw-s3-' + escHtml(id) + '-input" placeholder="Add S3 keyword" onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();addTag(\\'cr-kw-s3-' + escHtml(id) + '\\')}"><button class="btn btn-sm btn-outline" onclick="addTag(\\'cr-kw-s3-' + escHtml(id) + '\\')">Add</button>' +
               '</div>' +
-              '<div style="margin-top:14px"><h4 style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em;font-weight:700">' + t('cr.s3_pat') + '</h4></div>' +
+              '<div style="margin-top:14px"><h4 style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em;font-weight:700">' + 'S3 \u2014 Confidential Patterns (regex)' + '</h4></div>' +
               '<div class="tag-list" id="cfg-tags-cr-pat-s3-' + escHtml(id) + '"></div>' +
               '<div class="add-row">' +
                 '<input id="cfg-tags-cr-pat-s3-' + escHtml(id) + '-input" placeholder="Add S3 pattern" onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();addTag(\\'cr-pat-s3-' + escHtml(id) + '\\')}"><button class="btn btn-sm btn-outline" onclick="addTag(\\'cr-pat-s3-' + escHtml(id) + '\\')">Add</button>' +
@@ -7494,28 +9201,28 @@ function renderCustomRouterCards() {
         '</div>' +
 
         '<div class="subsection">' +
-          '<h4>' + t('cr.cls_prompt') + ' <span style="font-size:11px;color:var(--text-tertiary);text-transform:none;letter-spacing:0;font-weight:400">' + t('common.optional') + '</span></h4>' +
-          '<div class="hint" style="margin-bottom:10px">' + t('cr.cls_hint') + '</div>' +
+          '<h4>' + 'Classification Prompt' + ' <span style="font-size:11px;color:var(--text-tertiary);text-transform:none;letter-spacing:0;font-weight:400">' + '(optional)' + '</span></h4>' +
+          '<div class="hint" style="margin-bottom:10px">' + 'If set, the local LLM will classify messages using this prompt. Should output JSON with {level, reason}.' + '</div>' +
           '<textarea class="prompt-editor" id="cr-prompt-' + escHtml(id) + '">' + escHtml(prompt) + '</textarea>' +
         '</div>' +
 
         '<div class="subsection">' +
-          '<h4>' + t('common.test') + ' (' + escHtml(id) + ')</h4>' +
-          '<textarea class="test-input" id="test-' + escHtml(id) + '-message" placeholder="' + escHtml(t('test.enter_msg')) + '..."></textarea>' +
+          '<h4>' + 'Test' + ' (' + escHtml(id) + ')</h4>' +
+          '<textarea class="test-input" id="test-' + escHtml(id) + '-message" placeholder="' + escHtml('Enter a test message') + '..."></textarea>' +
           '<div style="display:flex;gap:8px;margin-top:10px;align-items:center">' +
-            '<button class="btn btn-primary btn-sm" onclick="runRouterTest(\\'' + escHtml(id) + '\\')">' + t('common.test') + '</button>' +
+            '<button class="btn btn-primary btn-sm" onclick="runRouterTest(\\'' + escHtml(id) + '\\')">' + 'Test' + '</button>' +
           '</div>' +
           '<div class="test-result" id="test-' + escHtml(id) + '-result">' +
-            '<div class="test-result-row"><span class="test-result-label">' + t('test.level') + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-level">-</span></div>' +
-            '<div class="test-result-row"><span class="test-result-label">' + t('test.action') + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-action">-</span></div>' +
-            '<div class="test-result-row"><span class="test-result-label">' + t('test.target') + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-target">-</span></div>' +
-            '<div class="test-result-row"><span class="test-result-label">' + t('test.reason') + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-reason">-</span></div>' +
-            '<div class="test-result-row"><span class="test-result-label">' + t('test.confidence') + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-confidence">-</span></div>' +
+            '<div class="test-result-row"><span class="test-result-label">' + 'Level' + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-level">-</span></div>' +
+            '<div class="test-result-row"><span class="test-result-label">' + 'Action' + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-action">-</span></div>' +
+            '<div class="test-result-row"><span class="test-result-label">' + 'Target' + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-target">-</span></div>' +
+            '<div class="test-result-row"><span class="test-result-label">' + 'Reason' + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-reason">-</span></div>' +
+            '<div class="test-result-row"><span class="test-result-label">' + 'Confidence' + '</span><span class="test-result-value" id="tr-' + escHtml(id) + '-confidence">-</span></div>' +
           '</div>' +
-          '<div class="test-loading" id="test-' + escHtml(id) + '-loading" style="display:none">' + t('test.testing') + '</div>' +
+          '<div class="test-loading" id="test-' + escHtml(id) + '-loading" style="display:none">' + 'Testing...' + '</div>' +
         '</div>' +
 
-        '<div class="save-bar"><button class="btn btn-primary" onclick="saveCustomRouter(\\'' + escHtml(id) + '\\')">' + t('common.save') + ' ' + escHtml(id) + '</button></div>' +
+        '<div class="save-bar"><button class="btn btn-primary" onclick="saveCustomRouter(\\'' + escHtml(id) + '\\')">' + 'Save' + ' ' + escHtml(id) + '</button></div>' +
       '</div>' +
     '</div>';
   }).join('');
@@ -7620,8 +9327,8 @@ function updateAvailableRouters() {
 function addCustomRouter() {
   var idInput = document.getElementById('new-router-id');
   var id = idInput.value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-  if (!id) { showToast(t('cr.enter_id'), true); return; }
-  if (_routers[id]) { showToast('"' + id + t('cr.exists'), true); return; }
+  if (!id) { showToast('Enter a router ID', true); return; }
+  if (_routers[id]) { showToast('"' + id + '" already exists', true); return; }
   _routers[id] = {
     enabled: true,
     type: 'configurable',
@@ -7630,11 +9337,11 @@ function addCustomRouter() {
   idInput.value = '';
   renderCustomRouterCards();
   updateAvailableRouters();
-  showToast('"' + id + t('cr.created'));
+  showToast('"' + id + '" created \u2014 configure and save it below');
 }
 
 function removeCustomRouter(id) {
-  if (!confirm(t('cr.del_pre') + id + t('cr.del_suf'))) return;
+  if (!confirm('Delete router "' + id + '"? This cannot be undone.')) return;
   delete _routers[id];
   // Clean up tag arrays
   delete _tags['cr-kw-s2-' + id];
@@ -7651,13 +9358,13 @@ function removeCustomRouter(id) {
     body: JSON.stringify(payload),
   }).then(function(r) { return r.json(); }).then(function(result) {
     if (result.ok) {
-      showToast('"' + id + t('cr.deleted'));
+      showToast('"' + id + '" deleted');
       renderCustomRouterCards();
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   }).catch(function(e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   });
 }
 
@@ -7694,12 +9401,12 @@ async function saveCustomRouter(id) {
     });
     var result = await res.json();
     if (result.ok) {
-      showToast('"' + id + t('cr.saved'));
+      showToast('"' + id + '" saved');
     } else {
-      showToast(t('common.save_failed') + (result.error || 'unknown'), true);
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
     }
   } catch (e) {
-    showToast(t('common.save_failed') + e.message, true);
+    showToast('Save failed: ' + e.message, true);
   }
 }
 
@@ -7709,16 +9416,279 @@ loadConfig();
 loadPresets();
 loadPrompts();
 setInterval(refreshAll, 30000);
-if (LANG !== 'en') setLang(LANG);
+
+// \u2500\u2500 Advisor + Budget \u2500\u2500
+var _advisorFilter = 'pending';
+
+function setAdvisorFilter(status) {
+  _advisorFilter = status;
+  document.querySelectorAll('#advisor-header .filter-btn').forEach(function(b) {
+    b.classList.remove('active');
+    var label = b.textContent.trim().toLowerCase();
+    if ((status === null && label === 'all') || label === (status || '')) b.classList.add('active');
+  });
+  refreshAdvisorList();
+}
+
+function refreshAdvisorList() {
+  var url = BASE + '/suggestions' + (_advisorFilter ? '?status=' + _advisorFilter : '');
+  fetch(url).then(function(r) { return r.json(); }).then(function(data) {
+    var list = document.getElementById('advisor-list');
+    var lastEl = document.getElementById('advisor-last-checked');
+    if (lastEl && data.lastCheckedAt) lastEl.textContent = 'Last checked: ' + new Date(data.lastCheckedAt).toLocaleString();
+    var items = data.suggestions || [];
+
+    // Update badge
+    var badge = document.getElementById('advisor-badge');
+    if (badge) {
+      fetch(BASE + '/suggestions?status=pending').then(function(r2) { return r2.json(); }).then(function(d2) {
+        var n = (d2.suggestions || []).length;
+        badge.style.display = n > 0 ? '' : 'none';
+        badge.textContent = n > 0 ? String(n) : '';
+      }).catch(function() {});
+    }
+
+    if (!items.length) {
+      list.innerHTML = '<div class="empty-state">No ' + (_advisorFilter || '') + ' suggestions</div>';
+      return;
+    }
+    list.innerHTML = items.map(renderSuggestion).join('');
+  }).catch(function() {
+    document.getElementById('advisor-list').innerHTML = '<div class="empty-state">Failed to load suggestions</div>';
+  });
+}
+
+function renderSuggestion(s) {
+  var icons = { openrouter_cheaper: '\u{1F4B8}', openrouter_best_value: '\u2696\uFE0F', openrouter_best: '\u2B50', local_model: '\u{1F5A5}\uFE0F', deberta_update: '\u{1F504}' };
+  var categoryColors = { openrouter_cheaper: '#6b7280', openrouter_best_value: '#8b5cf6', openrouter_best: '#f59e0b' };
+  var categoryLabels = { openrouter_cheaper: 'CHEAPEST', openrouter_best_value: 'BEST VALUE', openrouter_best: 'TOP PICK' };
+  var icon = icons[s.type] || '\u{1F4A1}';
+  var catLabel = categoryLabels[s.type]
+    ? '<span style="font-size:10px;font-weight:700;letter-spacing:.06em;color:' + (categoryColors[s.type] || 'var(--text-tertiary)') + ';margin-left:8px;vertical-align:middle">' + categoryLabels[s.type] + '</span>'
+    : '';
+  var saving = s.savingsPercent ? '<span class="saving-pill">-' + s.savingsPercent.toFixed(0) + '%</span>' : '';
+  var actions = '';
+  if (s.status === 'pending') {
+    actions = '<button class="btn btn-sm btn-primary" onclick="acceptSuggestion(\\'' + s.id + '\\',this)">Accept</button>' +
+              '<button class="btn btn-sm btn-outline" onclick="dismissSuggestion(\\'' + s.id + '\\')">Dismiss</button>';
+  } else {
+    actions = '<span style="font-size:11px;color:var(--text-tertiary);padding:8px 0">' + s.status + '</span>';
+  }
+
+  var meta = '';
+  if (s.currentValue) meta += '<div class="sc-meta-item">Current: <strong>' + esc(s.currentValue) + '</strong></div>';
+  if (s.suggestedValue) meta += '<div class="sc-meta-item">Suggested: <strong>' + esc(s.suggestedValue) + '</strong></div>';
+  var ctx = s.details && s.details.contextLength;
+  if (ctx) meta += '<div class="sc-meta-item">Context: <strong>' + (ctx / 1000).toFixed(0) + 'k</strong></div>';
+  if (s.diskRequiredGb) meta += '<div class="sc-meta-item">Disk needed: <strong>' + s.diskRequiredGb.toFixed(1) + ' GB</strong></div>';
+  if (s.pullCommand) meta += '<div class="sc-meta-item">Pull: <code>' + esc(s.pullCommand) + '</code></div>';
+
+  var bench = '';
+  if (s.benchmarkCurrent && s.benchmarkCandidate) {
+    bench = '<div class="sc-bench">' +
+      '<div class="sc-bench-col"><div class="sc-bench-label">Current</div>' +
+        '<div class="sc-bench-val">' + (s.benchmarkCurrent.jsonSuccessRate * 100).toFixed(0) + '% JSON</div>' +
+        '<div style="font-size:11px;color:var(--text-tertiary)">' + Math.round(s.benchmarkCurrent.avgLatencyMs) + 'ms avg</div>' +
+      '</div>' +
+      '<div class="sc-bench-col"><div class="sc-bench-label">Candidate</div>' +
+        '<div class="sc-bench-val">' + (s.benchmarkCandidate.jsonSuccessRate * 100).toFixed(0) + '% JSON</div>' +
+        '<div style="font-size:11px;color:var(--text-tertiary)">' + Math.round(s.benchmarkCandidate.avgLatencyMs) + 'ms avg</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  return '<div class="suggestion-card ' + s.status + '">' +
+    '<div class="sc-head">' +
+      '<div class="sc-icon">' + icon + '</div>' +
+      '<div style="min-width:0;flex:1">' +
+        '<div class="sc-title">' + esc(s.title) + catLabel + saving + '</div>' +
+        '<div class="sc-desc">' + esc(s.description) + '</div>' +
+      '</div>' +
+      '<div class="sc-actions">' + actions + '</div>' +
+    '</div>' +
+    (meta ? '<div class="sc-meta">' + meta + '</div>' : '') +
+    bench +
+  '</div>';
+}
+
+function acceptSuggestion(id, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Applying\u2026';
+  fetch(BASE + '/suggestions/' + id + '/accept', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(result) {
+      if (result.ok) {
+        showToast('Suggestion applied \u2014 config updated');
+        refreshAdvisorList();
+      } else {
+        showToast('Failed: ' + (result.message || 'unknown error'), true);
+        btn.disabled = false; btn.textContent = 'Accept';
+      }
+    }).catch(function(e) {
+      showToast('Error: ' + e.message, true);
+      btn.disabled = false; btn.textContent = 'Accept';
+    });
+}
+
+function dismissSuggestion(id) {
+  fetch(BASE + '/suggestions/' + id + '/dismiss', { method: 'POST' })
+    .then(function() { refreshAdvisorList(); })
+    .catch(function() {});
+}
+
+function runAdvisor() {
+  var btn = document.getElementById('advisor-run-btn');
+  btn.disabled = true; btn.textContent = 'Checking\u2026';
+  fetch(BASE + '/advisor/run', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function() {
+      showToast('Advisor check started \u2014 results will appear shortly');
+      setTimeout(function() {
+        btn.disabled = false; btn.textContent = 'Run Check Now';
+        refreshAdvisorList();
+      }, 8000);
+    }).catch(function() {
+      btn.disabled = false; btn.textContent = 'Run Check Now';
+    });
+}
+
+function refreshBudget() {
+  fetch(BASE + '/budget').then(function(r) { return r.json(); }).then(function(b) {
+    var section = document.getElementById('budget-section');
+    if (!b.enabled) { section.style.display = 'none'; return; }
+    section.style.display = '';
+
+    var fmtMoney = function(v) { return v == null ? '\u2014' : '$' + v.toFixed(2); };
+    var pct = function(cost, cap) { return cap ? Math.min(100, (cost / cap) * 100) : 0; };
+
+    document.getElementById('budget-daily-cost').textContent = fmtMoney(b.dailyCost);
+    document.getElementById('budget-daily-cap').textContent = b.dailyCap ? 'cap: $' + b.dailyCap.toFixed(2) : 'no cap';
+    var dailyPct = pct(b.dailyCost, b.dailyCap);
+    var dailyBar = document.getElementById('budget-daily-bar');
+    dailyBar.style.width = dailyPct + '%';
+    dailyBar.style.background = dailyPct >= 100 ? '#ef4444' : dailyPct >= (b.warnAt || 80) ? '#f59e0b' : 'var(--accent)';
+
+    document.getElementById('budget-monthly-cost').textContent = fmtMoney(b.monthlyCost);
+    document.getElementById('budget-monthly-cap').textContent = b.monthlyCap ? 'cap: $' + b.monthlyCap.toFixed(2) : 'no cap';
+    var monthlyPct = pct(b.monthlyCost, b.monthlyCap);
+    var monthlyBar = document.getElementById('budget-monthly-bar');
+    monthlyBar.style.width = monthlyPct + '%';
+    monthlyBar.style.background = monthlyPct >= 100 ? '#ef4444' : monthlyPct >= (b.warnAt || 80) ? '#f59e0b' : 'var(--accent)';
+
+    document.getElementById('budget-action-label').textContent = 'Action on exceed: ' + b.action;
+    // Populate budget inputs
+    var budgetDaily = document.getElementById('cfg-budget-daily');
+    if (budgetDaily && b.dailyCap != null) budgetDaily.value = b.dailyCap;
+    var budgetMonthly = document.getElementById('cfg-budget-monthly');
+    if (budgetMonthly && b.monthlyCap != null) budgetMonthly.value = b.monthlyCap;
+    var budgetWarn = document.getElementById('cfg-budget-warn');
+    if (budgetWarn) budgetWarn.value = b.warnAt || 80;
+    var budgetAction = document.getElementById('cfg-budget-action');
+    if (budgetAction) budgetAction.value = b.action || 'warn';
+  }).catch(function() {});
+}
+
+async function saveBudgetSettings() {
+  var daily = parseFloat(document.getElementById('cfg-budget-daily').value);
+  var monthly = parseFloat(document.getElementById('cfg-budget-monthly').value);
+  var payload = {
+    privacy: {
+      budget: {
+        enabled: true,
+        dailyCap: isNaN(daily) ? null : daily,
+        monthlyCap: isNaN(monthly) ? null : monthly,
+        warnAt: parseInt(document.getElementById('cfg-budget-warn').value) || 80,
+        action: document.getElementById('cfg-budget-action').value,
+      }
+    }
+  };
+  var r = await fetch(BASE + '/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  var d = await r.json();
+  if (d.ok) { showToast('Budget saved'); refreshBudget(); }
+  else showToast('Save failed: ' + d.error, true);
+}
+
+async function saveAdvisorSettings() {
+  var payload = {
+    privacy: {
+      modelAdvisor: {
+        enabled: document.getElementById('cfg-adv-enabled').checked,
+        checkIntervalWeeks: parseInt(document.getElementById('cfg-adv-interval').value) || 2,
+        minSavingsPercent: parseInt(document.getElementById('cfg-adv-savings').value) || 20,
+        minDiskSpaceGb: parseInt(document.getElementById('cfg-adv-disk').value) || 10,
+        openrouterApiKey: document.getElementById('cfg-adv-orkey').value || undefined,
+        openrouter: { enabled: document.getElementById('cfg-adv-or').checked },
+        llmfit: { enabled: document.getElementById('cfg-adv-llmfit').checked },
+        deberta: {
+          enabled: document.getElementById('cfg-adv-deberta').checked,
+          autoUpdate: document.getElementById('cfg-adv-autoupdate').checked,
+        },
+      }
+    }
+  };
+  var r = await fetch(BASE + '/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  var d = await r.json();
+  if (d.ok) showToast('Advisor settings saved');
+  else showToast('Save failed: ' + d.error, true);
+}
+
+function refreshAdvisor() {
+  refreshBudget();
+  // Check if advisor is enabled by fetching config
+  fetch(BASE + '/config').then(function(r) { return r.json(); }).then(function(cfg) {
+    var ma = (cfg.privacy && cfg.privacy.modelAdvisor) || {};
+    var enabled = !!ma.enabled;
+    document.getElementById('advisor-disabled-notice').style.display = enabled ? 'none' : '';
+    document.getElementById('advisor-header').style.display = enabled ? 'flex' : 'none';
+    if (enabled) refreshAdvisorList();
+    else document.getElementById('advisor-list').innerHTML = '';
+    // Populate advisor settings form
+    var advEnabled = document.getElementById('cfg-adv-enabled');
+    if (advEnabled) advEnabled.checked = !!ma.enabled;
+    var advInterval = document.getElementById('cfg-adv-interval');
+    if (advInterval) advInterval.value = ma.checkIntervalWeeks || 2;
+    var advSavings = document.getElementById('cfg-adv-savings');
+    if (advSavings) advSavings.value = ma.minSavingsPercent || 20;
+    var advDisk = document.getElementById('cfg-adv-disk');
+    if (advDisk) advDisk.value = ma.minDiskSpaceGb || 10;
+    var advOrkey = document.getElementById('cfg-adv-orkey');
+    if (advOrkey) advOrkey.value = ma.openrouterApiKey || '';
+    var advOr = document.getElementById('cfg-adv-or');
+    if (advOr) advOr.checked = !ma.openrouter || ma.openrouter.enabled !== false;
+    var advLlmfit = document.getElementById('cfg-adv-llmfit');
+    if (advLlmfit) advLlmfit.checked = !ma.llmfit || ma.llmfit.enabled !== false;
+    var advDeberta = document.getElementById('cfg-adv-deberta');
+    if (advDeberta) advDeberta.checked = !ma.deberta || ma.deberta.enabled !== false;
+    var advAutoupdate = document.getElementById('cfg-adv-autoupdate');
+    if (advAutoupdate) advAutoupdate.checked = !ma.deberta || ma.deberta.autoUpdate !== false;
+    // Also populate budget fields if available
+    var budget = (cfg.privacy && cfg.privacy.budget) || {};
+    var budgetDaily = document.getElementById('cfg-budget-daily');
+    if (budgetDaily && budget.dailyCap != null) budgetDaily.value = budget.dailyCap;
+    var budgetMonthly = document.getElementById('cfg-budget-monthly');
+    if (budgetMonthly && budget.monthlyCap != null) budgetMonthly.value = budget.monthlyCap;
+    var budgetWarn = document.getElementById('cfg-budget-warn');
+    if (budgetWarn) budgetWarn.value = budget.warnAt || 80;
+    var budgetAction = document.getElementById('cfg-budget-action');
+    if (budgetAction) budgetAction.value = budget.action || 'warn';
+  }).catch(function() {
+    document.getElementById('advisor-disabled-notice').style.display = '';
+    document.getElementById('advisor-header').style.display = 'none';
+  });
+}
+
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 </script>
 </body>
 </html>`;
 }
 
 // index.ts
-var OPENCLAW_DIR2 = join9(process.env.HOME ?? "/tmp", ".openclaw");
-var GUARDCLAW_CONFIG_PATH3 = join9(OPENCLAW_DIR2, "guardclaw.json");
-var LEGACY_DASHBOARD_PATH = join9(OPENCLAW_DIR2, "guardclaw-dashboard.json");
+var OPENCLAW_DIR2 = join12(process.env.HOME ?? "/tmp", ".openclaw");
+var GUARDCLAW_CONFIG_PATH3 = join12(OPENCLAW_DIR2, "guardclaw.json");
+var LEGACY_DASHBOARD_PATH = join12(OPENCLAW_DIR2, "guardclaw-dashboard.json");
 function loadGuardClawConfigFile() {
   try {
     return JSON.parse(readFileSync3(GUARDCLAW_CONFIG_PATH3, "utf-8"));
@@ -7746,7 +9716,7 @@ function getPrivacyConfig3(pluginConfig) {
 }
 function readApiKeyFromAuthProfiles(providerName) {
   const authPaths = [
-    join9(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
+    join12(OPENCLAW_DIR2, "agents", "main", "agent", "auth-profiles.json")
   ];
   for (const authPath of authPaths) {
     try {
@@ -8006,7 +9976,7 @@ var plugin = {
       });
     }
     api.logger.info(`[GuardClaw] S0 injection detection initialized (heuristics_only=${injectionConfig.heuristics_only ?? false})`);
-    const statsPath = join9(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
+    const statsPath = join12(process.env.HOME ?? "/tmp", ".openclaw", "guardclaw-stats.json");
     const collector = new TokenStatsCollector(statsPath);
     setGlobalCollector(collector);
     collector.load().then(() => {
@@ -8017,6 +9987,13 @@ var plugin = {
     });
     loadBudgetData().catch(() => {
     });
+    const advisorConfig = resolvedPluginConfig.privacy?.modelAdvisor;
+    if (advisorConfig?.enabled) {
+      const openrouterKey = advisorConfig.openrouterApiKey || readApiKeyFromAuthProfiles("openrouter");
+      initModelAdvisor(advisorConfig, openrouterKey, api.logger).catch((err) => {
+        api.logger.warn(`[GuardClaw] Model advisor init failed: ${String(err)}`);
+      });
+    }
     initDashboard({
       pluginId: "guardclaw",
       pluginConfig: resolvedPluginConfig,

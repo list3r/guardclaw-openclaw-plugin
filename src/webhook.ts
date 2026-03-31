@@ -24,7 +24,9 @@ export type WebhookEvent =
   | "ban_triggered"
   | "budget_warning"
   | "budget_exceeded"
-  | "response_scan_hit";
+  | "response_scan_hit"
+  | "secret_denied"
+  | "secret_allowed";
 
 export type WebhookConfig = {
   /** Webhook endpoint URL */
@@ -59,6 +61,8 @@ const EVENT_COLORS: Record<WebhookEvent, number> = {
   budget_warning:   0xffaa00,
   budget_exceeded:  0xff2200,
   response_scan_hit: 0xff6600,
+  secret_denied:    0xcc3300,
+  secret_allowed:   0x00aa44,
 };
 
 const EVENT_LABELS: Record<WebhookEvent, string> = {
@@ -69,6 +73,8 @@ const EVENT_LABELS: Record<WebhookEvent, string> = {
   budget_warning:    "⚠️ Budget Warning",
   budget_exceeded:   "🛑 Budget Cap Exceeded",
   response_scan_hit: "🔎 Sensitive Content in Response",
+  secret_denied:     "🔐 Secret Access Denied",
+  secret_allowed:    "🔑 Secret Access Allowed",
 };
 
 function buildDiscordBody(payload: WebhookPayload): Record<string, unknown> {

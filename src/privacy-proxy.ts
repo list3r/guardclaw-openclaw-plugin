@@ -441,7 +441,8 @@ function completionToSSE(responseJson: Record<string, unknown>): string {
  *   → "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
  */
 export function buildUpstreamUrl(targetBaseUrl: string, reqUrl: string | undefined, target?: OriginalProviderTarget): string {
-  let baseUrl = targetBaseUrl.replace(/\/+$/, "");
+  let baseUrl = targetBaseUrl;
+  while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
   const rawPath = reqUrl ?? "/v1/chat/completions";
 
   // For Anthropic: the SDK sends /v1/messages through the proxy.
@@ -591,7 +592,7 @@ export async function startPrivacyProxy(
       } catch (parseErr) {
         log.warn(`[GuardClaw Proxy] Invalid JSON body: ${String(parseErr)}`);
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: `Invalid JSON: ${String(parseErr)}`, type: "invalid_request" } }));
+        res.end(JSON.stringify({ error: { message: "Invalid JSON in request body", type: "invalid_request" } }));
         return;
       }
 
@@ -821,12 +822,11 @@ export async function startPrivacyProxy(
         });
       } catch (fetchErr) {
         clearTimeout(nonStreamTimeout);
-        const msg = fetchErr instanceof Error && fetchErr.name === "AbortError"
-          ? "Upstream request timed out (120s)"
-          : String(fetchErr);
-        log.error(`[GuardClaw Proxy] Upstream fetch failed: ${msg}`);
+        const isTimeout = fetchErr instanceof Error && fetchErr.name === "AbortError";
+        const clientMsg = isTimeout ? "Upstream request timed out (120s)" : "Upstream request failed";
+        log.error(`[GuardClaw Proxy] Upstream fetch failed: ${String(fetchErr)}`);
         res.writeHead(504, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: msg, type: "proxy_timeout" } }));
+        res.end(JSON.stringify({ error: { message: clientMsg, type: "proxy_timeout" } }));
         return;
       }
       clearTimeout(nonStreamTimeout);

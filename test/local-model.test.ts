@@ -2,11 +2,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { desensitizeWithLocalModel, detectByLocalModel } from "../src/local-model.js";
 import type { DetectionContext, PrivacyConfig } from "../src/types.js";
 
-function parseRequestJson(fetchSpy: ReturnType<typeof vi.spyOn>): Record<string, unknown> {
-  const init = fetchSpy.mock.calls[0]?.[1];
-  const rawBody = init?.body;
-  expect(typeof rawBody).toBe("string");
-  return JSON.parse(rawBody as string) as Record<string, unknown>;
+// Returns the first fetch call body whose JSON has a `messages` array
+// (the LLM inference call, not an embedding call).
+function findLlmCallBody(fetchSpy: ReturnType<typeof vi.spyOn>): Record<string, unknown> {
+  for (const [, init] of fetchSpy.mock.calls) {
+    try {
+      const body = JSON.parse(init?.body as string) as Record<string, unknown>;
+      if (Array.isArray(body.messages)) return body;
+    } catch { /* skip */ }
+  }
+  throw new Error("No LLM call found in fetch spy calls");
 }
 
 describe("GuardClaw local-model request body", () => {
@@ -15,7 +20,9 @@ describe("GuardClaw local-model request body", () => {
   });
 
   it("injects disable-thinking params for detection requests", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    // detectByLocalModel may call fetch twice: once for embedding (few-shot)
+    // and once for the actual LLM inference. Mock both with a valid response.
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({
           choices: [
@@ -49,14 +56,14 @@ describe("GuardClaw local-model request body", () => {
 
     const result = await detectByLocalModel(context, config);
     expect(result.level).toBe("S1");
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalled();
 
-    const requestBody = parseRequestJson(fetchSpy);
+    const requestBody = findLlmCallBody(fetchSpy);
     expect(requestBody.chat_template_kwargs).toEqual({ enable_thinking: false });
   });
 
   it("injects disable-thinking params for PII extraction requests", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ choices: [{ message: { content: "[]" } }] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -74,9 +81,9 @@ describe("GuardClaw local-model request body", () => {
 
     const output = await desensitizeWithLocalModel("name: Alice, phone: 123", config);
     expect(output.wasModelUsed).toBe(true);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalled();
 
-    const requestBody = parseRequestJson(fetchSpy);
+    const requestBody = findLlmCallBody(fetchSpy);
     expect(requestBody.chat_template_kwargs).toEqual({ enable_thinking: false });
   });
 });

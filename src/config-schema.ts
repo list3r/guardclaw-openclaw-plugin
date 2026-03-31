@@ -25,6 +25,22 @@ export const guardClawConfigSchema = Type.Object({
       s2Policy: Type.Optional(
         Type.Union([Type.Literal("proxy"), Type.Literal("local")]),
       ),
+      s3Policy: Type.Optional(
+        Type.Union([
+          Type.Literal("local-only"),
+          Type.Literal("redact-and-forward"),
+          Type.Literal("synthesize"),
+        ]),
+      ),
+      synthesis: Type.Optional(
+        Type.Object({
+          fallback: Type.Optional(Type.Union([Type.Literal("local-only"), Type.Literal("block")])),
+          verifyOutput: Type.Optional(Type.Boolean()),
+          maxRetries: Type.Optional(Type.Number()),
+          maxInputChars: Type.Optional(Type.Number()),
+          timeoutMs: Type.Optional(Type.Number()),
+        }),
+      ),
       proxyPort: Type.Optional(Type.Number()),
       checkpoints: Type.Optional(
         Type.Object({
@@ -196,6 +212,42 @@ export const guardClawConfigSchema = Type.Object({
           warnAt: Type.Optional(Type.Number()),
         }),
       ),
+      behavioralAttestation: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          logOnly: Type.Optional(Type.Boolean()),
+          windowSize: Type.Optional(Type.Number()),
+          blockThreshold: Type.Optional(Type.Number()),
+        }),
+      ),
+      modelAdvisor: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          checkIntervalWeeks: Type.Optional(Type.Number()),
+          minSavingsPercent: Type.Optional(Type.Number()),
+          minDiskSpaceGb: Type.Optional(Type.Number()),
+          openrouterApiKey: Type.Optional(Type.String()),
+          openrouter: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
+          llmfit: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
+          deberta: Type.Optional(Type.Object({
+            enabled: Type.Optional(Type.Boolean()),
+            autoUpdate: Type.Optional(Type.Boolean()),
+          })),
+          benchmark: Type.Optional(
+            Type.Object({
+              enabled: Type.Optional(Type.Boolean()),
+              runs: Type.Optional(Type.Number()),
+            }),
+          ),
+        }),
+      ),
+      taintTracking: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          minValueLength: Type.Optional(Type.Number()),
+          trackS2: Type.Optional(Type.Boolean()),
+        }),
+      ),
     }),
   ),
 });
@@ -280,6 +332,33 @@ export const defaultPrivacyConfig = {
     onUserMessage: ["privacy"],
     onToolCallProposed: ["privacy"],
     onToolCallExecuted: ["privacy"],
+  },
+  responseScanning: {
+    enabled: true,
+    action: "warn" as "warn" | "redact" | "block",
+    scanSecrets: true,
+    scanPii: false,
+  },
+  behavioralAttestation: {
+    enabled: false,   // flip to true to start collecting data
+    logOnly: true,    // true = log+score only, never blocks; false = active gating
+    windowSize: 10,
+    blockThreshold: 0.8,
+  },
+  modelAdvisor: {
+    enabled: false,
+    checkIntervalWeeks: 2,
+    minSavingsPercent: 20,
+    minDiskSpaceGb: 10,
+    openrouter: { enabled: true },
+    llmfit: { enabled: true },
+    deberta: { enabled: true, autoUpdate: true },
+    benchmark: { enabled: true, runs: 3 },
+  },
+  taintTracking: {
+    enabled: true,
+    minValueLength: 8,
+    trackS2: false,
   },
 };
 

@@ -33,6 +33,7 @@ import {
 } from "./guard-agent.js";
 import { desensitizeWithLocalModel } from "./local-model.js";
 import { syncDetectByLocalModel } from "./sync-detect.js";
+import { synthesizeContent, synthesizeToolResult } from "./synthesis.js";
 import { getDefaultMemoryManager, GUARD_SECTION_BEGIN, GUARD_SECTION_END } from "./memory-isolation.js";
 import { loadPrompt } from "./prompt-loader.js";
 import { DualSessionManager, getDefaultSessionManager, type SessionMessage } from "./session-manager.js";
@@ -54,7 +55,7 @@ import {
   clearLastSenderId,
 } from "./session-state.js";
 import { detectByRules } from "./rules.js";
-import { isProtectedMemoryPath, redactSensitiveInfo, extractPathsFromParams, resolveDefaultBaseUrl } from "./utils.js";
+import { isProtectedMemoryPath, redactSensitiveInfo, redactForCleanTranscript, extractPathsFromParams, resolveDefaultBaseUrl } from "./utils.js";
 import {
   GUARDCLAW_S2_OPEN,
   GUARDCLAW_S2_CLOSE,
@@ -79,6 +80,19 @@ import {
 import { fireWebhooks } from "./webhook.js";
 import { scanResponse } from "./response-scanner.js";
 import { checkBudget, recordCost, calculateCost } from "./budget-guard.js";
+import { logToolEvent, clearBehavioralSession } from "./behavioral-log.js";
+import { attest } from "./behavioral-attestation.js";
+import { handleUseSecret } from "./secret-ops.js";
+import {
+  registerTaint,
+  redactTainted,
+  hasTaints,
+  markPendingTaint,
+  consumePendingTaint,
+  clearTaintSession,
+  extractTaintValues,
+  isSecretsMountPath,
+} from "./taint-store.js";
 
 function getPipelineConfig(): Record<string, unknown> {
   return { privacy: getLiveConfig() };
@@ -156,6 +170,39 @@ function isToolAllowlisted(toolName: string): boolean {
 // Workspace dir cache — set from first hook that has PluginHookAgentContext
 let _cachedWorkspaceDir: string | undefined;
 
+// ── S3 synthesis pre-cache ───────────────────────────────────────────────────
+// after_tool_call (async) synthesizes S3 tool results and stashes them here.
+// tool_result_persist (sync) reads the stash and applies the synthetic content.
+// Queue per session handles back-to-back tool calls correctly.
+const _synthesisPendingQueue = new Map<string, Array<{ toolName: string; synthetic: string }>>();
+
+function _popSynthesisPending(sessionKey: string, toolName: string): string | undefined {
+  const queue = _synthesisPendingQueue.get(sessionKey);
+  if (!queue || queue.length === 0) return undefined;
+  const idx = queue.findIndex((e) => e.toolName === toolName);
+  if (idx === -1) return undefined;
+  const [entry] = queue.splice(idx, 1);
+  if (queue.length === 0) _synthesisPendingQueue.delete(sessionKey);
+  return entry.synthetic;
+}
+
+// ── Tool result injection pre-cache ─────────────────────────────────────────
+// after_tool_call (async) runs injection detection on tool results and stashes
+// the outcome here. tool_result_persist (sync) reads the stash and applies
+// block/sanitize before the privacy pipeline runs.
+type InjectionPending = { toolName: string; action: "block" | "sanitise"; sanitised?: string; reason?: string };
+const _injectionPendingQueue = new Map<string, Array<InjectionPending>>();
+
+function _popInjectionPending(sessionKey: string, toolName: string): InjectionPending | undefined {
+  const queue = _injectionPendingQueue.get(sessionKey);
+  if (!queue || queue.length === 0) return undefined;
+  const idx = queue.findIndex((e) => e.toolName === toolName);
+  if (idx === -1) return undefined;
+  const [entry] = queue.splice(idx, 1);
+  if (queue.length === 0) _injectionPendingQueue.delete(sessionKey);
+  return entry;
+}
+
 const _OPENCLAW_DIR = join(process.env.HOME ?? "/tmp", ".openclaw");
 const GUARDCLAW_STATS_PATH = join(_OPENCLAW_DIR, "guardclaw-stats.json");
 const GUARDCLAW_INJECTIONS_PATH = join(_OPENCLAW_DIR, "guardclaw-injections.json");
@@ -217,6 +264,44 @@ async function updateS0Stats(action: "block" | "sanitise"): Promise<void> {
     if (action === "block") s0.blocked = (s0.blocked ?? 0) + 1;
     else s0.sanitised = (s0.sanitised ?? 0) + 1;
     s0.total = (s0.total ?? 0) + 1;
+    await writeStatsAtomic(stats);
+  } catch { /* best-effort */ }
+}
+
+async function updateSynthesisStats(
+  source: "user_message" | "tool_result",
+  latencyMs: number,
+  ok: boolean,
+): Promise<void> {
+  try {
+    let stats: Record<string, unknown> = {};
+    try {
+      const raw = await fs.promises.readFile(GUARDCLAW_STATS_PATH, "utf8");
+      Object.assign(stats, JSON.parse(raw));
+    } catch { /* first run */ }
+
+    if (!stats.synthesis || typeof stats.synthesis !== "object") stats.synthesis = {};
+    const syn = stats.synthesis as Record<string, unknown>;
+
+    if (!syn[source] || typeof syn[source] !== "object") {
+      syn[source] = { count: 0, failCount: 0, totalMs: 0, minMs: null, maxMs: null, lastMs: null, recentSamples: [] };
+    }
+    const bucket = syn[source] as Record<string, unknown>;
+
+    if (!ok) {
+      bucket.failCount = ((bucket.failCount as number) ?? 0) + 1;
+    } else {
+      bucket.count = ((bucket.count as number) ?? 0) + 1;
+      bucket.totalMs = ((bucket.totalMs as number) ?? 0) + latencyMs;
+      bucket.minMs = bucket.minMs == null ? latencyMs : Math.min(bucket.minMs as number, latencyMs);
+      bucket.maxMs = bucket.maxMs == null ? latencyMs : Math.max(bucket.maxMs as number, latencyMs);
+      bucket.lastMs = latencyMs;
+      const samples = (bucket.recentSamples as number[]) ?? [];
+      samples.push(latencyMs);
+      if (samples.length > 50) samples.shift(); // keep last 50 for p95
+      bucket.recentSamples = samples;
+    }
+
     await writeStatsAtomic(stats);
   } catch { /* best-effort */ }
 }
@@ -526,6 +611,55 @@ export function registerHooks(api: OpenClawPluginApi): void {
           // Fall through to S2 handling — will desensitize and forward
           // The S3 patterns are a superset of S2, so redaction will be maximal
           return; // let before_prompt_build handle S2 desensitization
+        } else if (s3Policy === "synthesize") {
+          // ── s3Policy: "synthesize" (transparent mode) ────────────────────
+          // Processes S3 content locally and injects a natural-language synthesis
+          // back into the conversation. Neither the cloud model nor the user sees
+          // that interception happened — the exchange appears seamless.
+          //
+          // Enable in guardclaw.json:
+          //   "privacy": { "s3Policy": "synthesize" }
+          //
+          // Falls back to "local-only" if synthesis fails or local model is unreachable.
+          api.logger.info("[GuardClaw] S3 synthesize mode — processing locally before cloud");
+
+          // Build task context from recent conversation (helps synthesis be relevant)
+          const taskContext = (params.messages ?? [])
+            .slice(-4)
+            .map((m: { role: string; content: string }) => `${m.role}: ${String(m.content).slice(0, 200)}`)
+            .join("\n");
+
+          const _synthT0 = Date.now();
+          const synthResult = await synthesizeContent(
+            userMessage,
+            taskContext,
+            privacyConfig,
+            sessionKey,
+          );
+          const _synthLatency = Date.now() - _synthT0;
+          updateSynthesisStats("user_message", _synthLatency, synthResult.ok).catch(() => {});
+
+          if (synthResult.ok) {
+            api.logger.info(`[GuardClaw] S3 synthesis complete — forwarding to cloud (${_synthLatency}ms)`);
+            // Save full content to local track, synthetic to clean track
+            if (sessionMgr) {
+              sessionMgr.appendToFullHistory(sessionKey, { role: "user", content: userMessage });
+              sessionMgr.appendToCleanHistory(sessionKey, { role: "user", content: synthResult.synthetic });
+            }
+            // Replace the message going to the cloud model with the synthesis
+            params.messages = (params.messages ?? []).map(
+              (m: { role: string; content: string }, i: number, arr: unknown[]) =>
+                i === arr.length - 1 && m.role === "user"
+                  ? { ...m, content: synthResult.synthetic }
+                  : m,
+            );
+            // Continue to cloud — do NOT fall through to guard agent
+          } else {
+            api.logger.warn(`[GuardClaw] S3 synthesis failed (${synthResult.reason}) — falling back to local-only`);
+            // Fall through to guard agent routing below
+            stashDetection(sessionKey, { level: "S3", reason: `synthesis-fallback: ${synthResult.reason}` });
+            // redirect to guard agent (same as local-only path)
+          }
         }
 
         setActiveLocalRouting(sessionKey);
@@ -863,6 +997,46 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const privacyConfig = getLiveConfig();
       const baseDir = privacyConfig.session?.baseDir ?? "~/.openclaw";
 
+      // ── Behavioral attestation logging ────────────────────────────────────
+      // Log every tool call when enabled. Guard sessions are excluded —
+      // they run in a trusted local context with different threat model.
+      const baConfig = (privacyConfig as Record<string, unknown> & {
+        behavioralAttestation?: { enabled?: boolean; logOnly?: boolean; windowSize?: number; blockThreshold?: number }
+      }).behavioralAttestation;
+      if (baConfig?.enabled && !isVerifiedGuardSession(sessionKey)) {
+        const currentLevel = getPendingDetection(sessionKey)?.level ?? null;
+        logToolEvent(sessionKey, toolName, typedParams, currentLevel);
+      }
+
+      // ── use_secret intercept ──────────────────────────────────────────────
+      // Virtual tool: never reaches the actual executor. GuardClaw resolves the
+      // credential locally, runs behavioral attestation + LLM intent verification,
+      // executes the operation, and returns only the result — the raw secret value
+      // never enters the agent's context.
+      if (toolName === "use_secret") {
+        const secretResult = await handleUseSecret(
+          typedParams,
+          sessionKey,
+          privacyConfig,
+          privacyConfig.webhooks,
+          api.logger,
+        );
+        if (!secretResult.ok) {
+          // Block with a denial message the agent can act on
+          return {
+            block: true,
+            blockReason: `[GuardClaw:secrets] Access denied — ${secretResult.reason}`,
+          };
+        }
+        // The SDK doesn't support synthetic results from before_tool_call,
+        // so we surface the operation result via blockReason. The agent sees
+        // this as a guardrail message that contains the result it requested.
+        return {
+          block: true,
+          blockReason: `[GuardClaw:secrets] Operation succeeded\n---\n${secretResult.result}`,
+        };
+      }
+
       // ── Guard session controls ─────────────────────────────────────────────
       // Guard Agent sessions run entirely locally (S3 isolation).  They have
       // elevated trust for local tools but must be prevented from exfiltrating
@@ -926,6 +1100,22 @@ export function registerHooks(api: OpenClawPluginApi): void {
           if (isProtectedMemoryPath(p, baseDir)) {
             api.logger.warn(`[GuardClaw] BLOCKED: cloud model tried to access protected path: ${p}`);
             return { block: true, blockReason: `GuardClaw: access to full history/memory is restricted for cloud models (${p})` };
+          }
+        }
+
+        // ── Taint: detect secrets-mount reads ──────────────────────────────────
+        // When the agent reads from /run/secrets/ or /var/run/secrets/, flag the
+        // session so tool_result_persist can register the content as tainted.
+        const _taintBtcCfg = (privacyConfig as Record<string, unknown> & {
+          taintTracking?: { enabled?: boolean }
+        }).taintTracking;
+        if (_taintBtcCfg?.enabled !== false) {
+          for (const p of pathValues) {
+            if (isSecretsMountPath(p)) {
+              markPendingTaint(sessionKey, `secrets-file:${p}`, "S3");
+              api.logger.info(`[GuardClaw:taint] Secrets-mount read detected — result will be taint-tracked (path=${p}, session=${sessionKey})`);
+              break; // one pending taint per tool call is sufficient
+            }
           }
         }
       }
@@ -1035,6 +1225,118 @@ export function registerHooks(api: OpenClawPluginApi): void {
   });
 
   // =========================================================================
+  // Hook 3b: after_tool_call — async S3 synthesis pre-cache
+  //   Runs BEFORE tool_result_persist. If s3Policy is "synthesize", detects
+  //   S3 content in the tool result and synthesizes it via the local model.
+  //   The result is stashed in _synthesisPendingQueue for tool_result_persist
+  //   to apply synchronously, without needing to await there.
+  // =========================================================================
+  api.on("after_tool_call", async (event, ctx) => {
+    try {
+      const sessionKey = ctx.sessionKey ?? "";
+      if (!sessionKey) return;
+
+      const privacyConfig = getLiveConfig();
+      if ((privacyConfig.s3Policy ?? "local-only") !== "synthesize") return;
+      if (!privacyConfig.localModel?.enabled) return;
+      if (isActiveLocalRouting(sessionKey)) return;
+      if (isVerifiedGuardSession(sessionKey)) return;
+      if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
+
+      // Extract result text — OpenClaw may expose it in different shapes
+      const ev = event as Record<string, unknown>;
+      const raw = ev.output ?? ev.result ?? ev.text ?? ev.content ?? "";
+      const textContent = typeof raw === "string" ? raw : JSON.stringify(raw);
+      if (!textContent || textContent.length < 10) return;
+
+      // Only synthesize if rules detect S3 — skip cheaper S1/S2 results
+      const ruleCheck = detectByRules(
+        { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: textContent, sessionKey },
+        privacyConfig,
+      );
+      if (ruleCheck.level !== "S3") return;
+
+      api.logger.info(`[GuardClaw] S3 in tool result — synthesizing before tool_result_persist (tool=${ctx.toolName ?? "unknown"})`);
+
+      const taskContext = `Tool "${ctx.toolName ?? "unknown"}" returned a result that needs to stay private.`;
+      const _synthT0 = Date.now();
+      const synthResult = await synthesizeToolResult(
+        ctx.toolName ?? "unknown",
+        textContent,
+        taskContext,
+        privacyConfig,
+        sessionKey,
+      );
+      const _synthLatency = Date.now() - _synthT0;
+      updateSynthesisStats("tool_result", _synthLatency, synthResult.ok).catch(() => {});
+
+      if (synthResult.ok) {
+        const queue = _synthesisPendingQueue.get(sessionKey) ?? [];
+        queue.push({ toolName: ctx.toolName ?? "", synthetic: synthResult.synthetic });
+        _synthesisPendingQueue.set(sessionKey, queue);
+        api.logger.info(`[GuardClaw] Synthesis stashed for tool_result_persist — ${_synthLatency}ms (tool=${ctx.toolName ?? "unknown"})`);
+      } else {
+        api.logger.warn(`[GuardClaw] Tool result synthesis failed after ${_synthLatency}ms (${synthResult.reason}) — tool_result_persist will redact normally`);
+      }
+    } catch (err) {
+      api.logger.error(`[GuardClaw] Error in after_tool_call synthesis: ${String(err)}`);
+    }
+  });
+
+  // =========================================================================
+  // Hook 3c: after_tool_call — S0 injection detection on tool results
+  //   Runs BEFORE tool_result_persist. Detects prompt injection attempts
+  //   embedded in tool results (web pages, API responses, file content).
+  //   Stashes block/sanitise decisions for tool_result_persist to apply.
+  // =========================================================================
+  api.on("after_tool_call", async (event, ctx) => {
+    try {
+      const sessionKey = ctx.sessionKey ?? "";
+      if (!sessionKey) return;
+      if (isActiveLocalRouting(sessionKey)) return;
+      if (isVerifiedGuardSession(sessionKey)) return;
+      if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
+
+      const injectionCfg = getLiveInjectionConfig();
+      if (injectionCfg.enabled === false) return;
+
+      const ev = event as Record<string, unknown>;
+      const raw = ev.output ?? ev.result ?? ev.text ?? ev.content ?? "";
+      const textContent = typeof raw === "string" ? raw : JSON.stringify(raw);
+      if (!textContent || textContent.length < 20) return;
+
+      // Map tool name to an injection source type so users can exempt
+      // specific source classes via config.exempt_sources
+      const toolName = ctx.toolName ?? "";
+      let source: import("./injection/index.js").InjectionSource = "api_response";
+      if (/web.?fetch|http.?fetch/i.test(toolName)) source = "web_fetch";
+      else if (/read.?file|file.?read/i.test(toolName)) source = "file";
+
+      const injResult = await detectInjection(textContent, source, injectionCfg);
+
+      if (injResult.action === "block" || injResult.action === "sanitise") {
+        const queue = _injectionPendingQueue.get(sessionKey) ?? [];
+        queue.push({
+          toolName,
+          action: injResult.action,
+          sanitised: injResult.sanitised,
+          reason: injResult.blocked_reason ?? `Injection detected (score ${injResult.score})`,
+        });
+        _injectionPendingQueue.set(sessionKey, queue);
+        api.logger.warn(
+          `[GuardClaw S0] Tool result injection ${injResult.action}: tool=${toolName} score=${injResult.score} ` +
+          `patterns=${injResult.matches.join(",")} session=${sessionKey}`,
+        );
+        recordDetection(sessionKey, "S0", "onToolCallExecuted",
+          injResult.blocked_reason ?? `Tool result injection (score ${injResult.score})`);
+        void updateS0Stats(injResult.action);
+      }
+    } catch (err) {
+      api.logger.error(`[GuardClaw] Error in after_tool_call injection check: ${String(err)}`);
+    }
+  });
+
+  // =========================================================================
   // Hook 4: tool_result_persist
   //         + memory_search filtering + memory dual-write sync
   // =========================================================================
@@ -1079,7 +1381,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           sessionManager.writeToFull(sessionKey, {
             role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
           }).catch(() => {});
-          const redacted = redactSensitiveInfo(textContent, getLiveConfig().redaction);
+          const redacted = redactForCleanTranscript(textContent, getLiveConfig().redaction);
           if (redacted !== textContent) {
             api.logger.info(`[GuardClaw] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`);
             sessionManager.writeToClean(sessionKey, {
@@ -1133,6 +1435,22 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // auth headers/tokens that must NOT be redacted or the tool breaks.
       if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
 
+      // ── S0: Apply pre-cached injection decision ──────────────────────────
+      // after_tool_call ran detectInjection async and stashed block/sanitise here.
+      const injPending = _popInjectionPending(sessionKey, ctx.toolName ?? "");
+      if (injPending) {
+        if (injPending.action === "block") {
+          api.logger.warn(`[GuardClaw S0] Tool result blocked (injection): tool=${ctx.toolName ?? "unknown"}`);
+          const blocked = replaceMessageText(msg,
+            `[GuardClaw S0: Tool result blocked — prompt injection detected. Reason: ${injPending.reason ?? "injection detected"}]`);
+          if (blocked) return { message: blocked };
+        } else if (injPending.action === "sanitise" && injPending.sanitised !== undefined) {
+          api.logger.info(`[GuardClaw S0] Tool result sanitised (injection): tool=${ctx.toolName ?? "unknown"}`);
+          const sanitised = replaceMessageText(msg, injPending.sanitised);
+          if (sanitised) return { message: sanitised };
+        }
+      }
+
       const textContent = extractMessageText(msg);
       if (!textContent || textContent.length < 10) return;
 
@@ -1147,6 +1465,29 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // after any S2/S3 detection — causing the LLM dual-write fallback
       // (below) to incorrectly skip.
       const wasPrivateBefore = isSessionMarkedPrivate(sessionKey);
+
+      // ── Taint tracking: extract config + consume pending registration ─────────
+      const _taintCfg = (privacyConfig as Record<string, unknown> & {
+        taintTracking?: { enabled?: boolean; minValueLength?: number; trackS2?: boolean }
+      }).taintTracking;
+      const taintEnabled = _taintCfg?.enabled !== false;
+      const taintMinLen = _taintCfg?.minValueLength ?? 8;
+
+      if (taintEnabled) {
+        // Consume any pending taint from a secrets-mount read in before_tool_call.
+        const pendingTaint = consumePendingTaint(sessionKey);
+        if (pendingTaint) {
+          const taintVals = extractTaintValues(textContent, taintMinLen);
+          for (const v of taintVals) {
+            registerTaint(sessionKey, v, pendingTaint.source, pendingTaint.sensitivity, taintMinLen);
+          }
+          if (taintVals.length > 0) {
+            api.logger.info(
+              `[GuardClaw:taint] Registered ${taintVals.length} tainted value(s) from ${pendingTaint.source} (session=${sessionKey})`,
+            );
+          }
+        }
+      }
 
       const ruleCheck = detectByRules(
         {
@@ -1181,7 +1522,41 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
       }
 
-      const redacted = redactSensitiveInfo(textContent, getLiveConfig().redaction);
+      // ── Taint: register values from S3-detected (and optionally S2) content ──
+      // Forward-taints values extracted from sensitive tool results so they are
+      // redacted if they appear in any FUTURE tool result in this session.
+      if (taintEnabled && (ruleCheck.level === "S3" || (ruleCheck.level === "S2" && _taintCfg?.trackS2))) {
+        const taintValsFromResult = extractTaintValues(textContent, taintMinLen);
+        const taintSource = `${ruleCheck.level.toLowerCase()}-tool-result:${ctx.toolName ?? "unknown"}`;
+        const taintSens = ruleCheck.level === "S3" ? "S3" as const : "S2" as const;
+        for (const v of taintValsFromResult) {
+          registerTaint(sessionKey, v, taintSource, taintSens, taintMinLen);
+        }
+        if (taintValsFromResult.length > 0) {
+          api.logger.info(
+            `[GuardClaw:taint] Registered ${taintValsFromResult.length} tainted value(s) from ${ruleCheck.level} tool result (tool=${ctx.toolName ?? "unknown"}, session=${sessionKey})`,
+          );
+        }
+      }
+
+      // ── s3Policy: synthesize — apply pre-cached synthetic content ──
+      // after_tool_call (async) already synthesized this result and stashed it.
+      // Use the synthesis instead of blunt redaction: the cloud model gets a
+      // natural-language description rather than [REDACTED] placeholders.
+      if (ruleCheck.level === "S3" && (privacyConfig.s3Policy ?? "local-only") === "synthesize") {
+        const synthetic = _popSynthesisPending(sessionKey, ctx.toolName ?? "");
+        if (synthetic) {
+          const sessionManager = getDefaultSessionManager();
+          sessionManager.writeToFull(sessionKey, { role: "tool", content: textContent, timestamp: Date.now(), sessionKey }).catch(() => {});
+          sessionManager.writeToClean(sessionKey, { role: "tool", content: synthetic, timestamp: Date.now(), sessionKey }).catch(() => {});
+          api.logger.info(`[GuardClaw] S3 tool result replaced with synthesis (tool=${ctx.toolName ?? "unknown"})`);
+          const modified = replaceMessageText(msg, synthetic);
+          if (modified) return { message: modified };
+        }
+        // No stash (synthesis failed or wasn't run) — fall through to redaction
+      }
+
+      const redacted = redactForCleanTranscript(textContent, getLiveConfig().redaction);
       const wasRedacted = redacted !== textContent;
 
       if (detectedSensitive || wasRedacted || wasPrivateBefore) {
@@ -1245,7 +1620,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           // S3 at persist time: redact before the result enters the model
           // context and the persisted transcript.
           if (llmResult.level === "S3") {
-            const s3Redacted = wasRedacted ? redacted : redactSensitiveInfo(textContent, getLiveConfig().redaction);
+            const s3Redacted = wasRedacted ? redacted : redactForCleanTranscript(textContent, getLiveConfig().redaction);
             const modified = replaceMessageText(msg, s3Redacted);
             if (modified) return { message: modified };
           }
@@ -1305,7 +1680,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
             // Local model response may contain echoed PII — write original
             // to full track, PII-redacted version to clean track.
-            const redacted = redactSensitiveInfo(msgText, getLiveConfig().redaction);
+            const redacted = redactForCleanTranscript(msgText, getLiveConfig().redaction);
             sessionManager.writeToFull(sessionKey, {
               role: "assistant", content: msgText, timestamp: ts, sessionKey,
             }).catch((err) => {
@@ -1356,7 +1731,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
         const assistantText = extractMessageText(msg);
         if (assistantText && assistantText.length >= 10) {
-          const redacted = redactSensitiveInfo(assistantText, getLiveConfig().redaction);
+          const redacted = redactForCleanTranscript(assistantText, getLiveConfig().redaction);
           if (redacted !== assistantText) {
             api.logger.info("[GuardClaw] PII-redacted local model response before transcript write");
             return { message: { ...(msg as Record<string, unknown>), content: [{ type: "text", text: redacted }] } };
@@ -1423,6 +1798,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       clearSessionState(sessionKey);
       clearSessionSecrets(sessionKey); // Free any in-memory Keychain secret values
+      clearBehavioralSession(sessionKey); // Free behavioral log in-memory buffers
       deregisterGuardSession(sessionKey); // #12: clean up registry entry for guard subsessions
 
       const collector = getGlobalCollector();

@@ -309,7 +309,7 @@ describe("Dual Session Manager", () => {
 
     test("should redact API keys echoed by local model", () => {
       const response =
-        "I found sk-FAKE_KEY_FOR_TESTING_ONLY in your config file.";
+        "I found sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdefghij in your config file.";
       const redacted = redactSensitiveInfo(response);
 
       expect(redacted).toContain("[REDACTED:KEY]");

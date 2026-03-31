@@ -24,6 +24,7 @@ import { initLiveConfig, watchConfigFile, loadInjectionAttemptCounts } from "./s
 import { initDashboard, statsHttpHandler } from "./src/stats-dashboard.js";
 import { initInjectionConfig } from "./src/injection/index.js";
 import { loadBudgetData } from "./src/budget-guard.js";
+import { initModelAdvisor } from "./src/model-advisor.js";
 import { runDebertaClassifier } from "./src/injection/deberta.js";
 import { defaultInjectionConfig } from "./src/config-schema.js";
 import type { PrivacyConfig, PipelineConfig, RouterRegistration, InjectionConfig } from "./src/types.js";
@@ -420,6 +421,15 @@ const plugin = {
 
     // Load persisted budget counters (non-fatal)
     loadBudgetData().catch(() => {});
+
+    // ── Step 5c: Initialize model advisor ──
+    const advisorConfig = (resolvedPluginConfig.privacy as Record<string, unknown>)?.modelAdvisor as Record<string, unknown> | undefined;
+    if (advisorConfig?.enabled) {
+      const openrouterKey = (advisorConfig.openrouterApiKey as string | undefined) || readApiKeyFromAuthProfiles("openrouter");
+      initModelAdvisor(advisorConfig as Parameters<typeof initModelAdvisor>[0], openrouterKey, api.logger).catch((err) => {
+        api.logger.warn(`[GuardClaw] Model advisor init failed: ${String(err)}`);
+      });
+    }
 
     // ── Step 6: Register Dashboard HTTP route ──
     initDashboard({

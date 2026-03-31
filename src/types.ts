@@ -24,8 +24,19 @@ export type PrivacyConfig = {
   enabled?: boolean;
   /** S2 handling: "proxy" strips PII via local HTTP proxy (default), "local" routes to local model */
   s2Policy?: "proxy" | "local";
+  /**
+   * S3 handling policy:
+   *   "local-only"        — route entirely to guard agent, cloud never sees content (default, safest)
+   *   "redact-and-forward" — strip secrets locally then forward to cloud (16 GB deployments)
+   *   "synthesize"        — local model processes S3 content and produces a natural-language
+   *                         description; cloud model receives the description seamlessly.
+   *                         Neither the cloud model nor the user sees that interception occurred.
+   */
+  s3Policy?: "local-only" | "redact-and-forward" | "synthesize";
   /** Port for the privacy proxy server (default: 8403) */
   proxyPort?: number;
+  /** Fine-grained options for s3Policy: "synthesize". Ignored for other policies. */
+  synthesis?: SynthesisConfig;
   checkpoints?: {
     onUserMessage?: DetectorType[];
     onToolCallProposed?: DetectorType[];
@@ -127,6 +138,31 @@ export type PrivacyConfig = {
   budget?: BudgetConfig;
   /** User IDs exempt from outbound message redaction */
   operatorPassthrough?: string[];
+  /** Value-based taint tracking for secrets across tool results. */
+  taintTracking?: TaintTrackingConfig;
+};
+
+export type TaintTrackingConfig = {
+  /**
+   * Enable value-based taint tracking for secrets.
+   * When enabled, values read from secrets mounts (/run/secrets/) or detected
+   * in S2/S3 tool results are tracked and redacted from all subsequent tool
+   * results before they reach the cloud LLM. Default: true.
+   */
+  enabled?: boolean;
+  /**
+   * Minimum value length to register as a taint.
+   * Shorter values have high false-positive rates (e.g. "ok", "true").
+   * Default: 8.
+   */
+  minValueLength?: number;
+  /**
+   * Also register S2-level tool result content as tainted, not just S3.
+   * Disabled by default to avoid over-redaction; enable for high-sensitivity
+   * deployments where S2 content must also be kept out of future LLM context.
+   * Default: false.
+   */
+  trackS2?: boolean;
 };
 
 export type InjectionConfig = {
@@ -183,6 +219,94 @@ export type BudgetConfig = {
   monthlyCap?: number;
   action?: BudgetAction;
   warnAt?: number;
+};
+
+// ── Model Advisor Types ─────────────────────────────────────────────────
+
+export type SuggestionType =
+  | "openrouter_cheaper"
+  | "openrouter_best_value"
+  | "openrouter_best"
+  | "local_model"
+  | "deberta_update";
+
+export type SuggestionStatus = "pending" | "accepted" | "dismissed";
+
+export type BenchmarkResult = {
+  jsonSuccessRate: number; // 0–1
+  avgLatencyMs: number;
+  runs: number;
+};
+
+export type ModelSuggestion = {
+  id: string;
+  type: SuggestionType;
+  status: SuggestionStatus;
+  createdAt: string;
+  title: string;
+  description: string;
+  currentValue?: string;
+  suggestedValue?: string;
+  savingsPercent?: number;
+  benchmarkCurrent?: BenchmarkResult;
+  benchmarkCandidate?: BenchmarkResult;
+  diskRequiredGb?: number;
+  pullCommand?: string;
+  details?: Record<string, unknown>;
+};
+
+export type ModelAdvisorConfig = {
+  /** Enable the advisor. Default: false */
+  enabled?: boolean;
+  /** How often to run checks (weeks). Default: 2 */
+  checkIntervalWeeks?: number;
+  /** Minimum % cheaper a model must be to warrant a suggestion. Default: 20 */
+  minSavingsPercent?: number;
+  /** Minimum free disk space (GB) required before suggesting a local model pull. Default: 10 */
+  minDiskSpaceGb?: number;
+  /** Override the OpenRouter API key (defaults to provider config) */
+  openrouterApiKey?: string;
+  openrouter?: { enabled?: boolean };
+  llmfit?: { enabled?: boolean };
+  deberta?: {
+    enabled?: boolean;
+    /**
+     * Automatically apply DeBERTa updates without user confirmation.
+     * The config is patched immediately; the new model is downloaded on next
+     * injection-service restart. Default: true.
+     */
+    autoUpdate?: boolean;
+  };
+  benchmark?: {
+    enabled?: boolean;
+    runs?: number;
+  };
+};
+
+/**
+ * Configuration for the transparent S3 synthesis pipeline.
+ * Only relevant when s3Policy is "synthesize".
+ */
+export type SynthesisConfig = {
+  /**
+   * What to do when synthesis fails (local model unavailable, timeout, verification fails).
+   * "local-only" — fall back to guard agent routing (safe default)
+   * "block"      — block the message entirely and tell the user to retry
+   * Default: "local-only"
+   */
+  fallback?: "local-only" | "block";
+  /**
+   * Re-run the S3 detector on synthesis output before sending to cloud.
+   * If S3 is still detected, retry up to maxRetries times.
+   * Default: true (strongly recommended)
+   */
+  verifyOutput?: boolean;
+  /** Max retries if verification fails. Default: 2 */
+  maxRetries?: number;
+  /** Truncate S3 input to this many characters before synthesis to avoid token overruns. Default: 4000 */
+  maxInputChars?: number;
+  /** Timeout per synthesis call in milliseconds. Default: 20000 */
+  timeoutMs?: number;
 };
 
 export type RedactionOptions = {

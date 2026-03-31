@@ -12,7 +12,7 @@
   ╚██████╗███████╗██║  ██║╚███╔███╔╝
    ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
 
-  Privacy Plugin for OpenClaw · Built by Centrase AI
+  Privacy-first OpenClaw plugin · Built by Centrase AI
 ```
 
 [![npm](https://img.shields.io/npm/v/@centrase/guardclaw?color=%238DC63F&label=npm)](https://www.npmjs.com/package/@centrase/guardclaw)
@@ -43,15 +43,44 @@ Detection runs rule-first (keywords, regex, file paths) with an optional LLM cla
 
 ## Features
 
-- **Three-tier sensitivity detection** — keyword, regex, and path-based rules + optional LLM classifier
+- **Four-tier sensitivity detection** — S0–S3 classification via keyword, regex, and path-based rules + optional LLM classifier
+- **Prompt injection detection (S0)** — DeBERTa transformer classifier runs locally on port 8404, intercepts injections before they reach the LLM
 - **Privacy proxy** — local HTTP proxy strips PII before forwarding to cloud APIs
 - **Guard agent** — dedicated local model session for S3 content that never routes to cloud
 - **Dual-track session history** — full history stays local; sanitised history goes to cloud
 - **Memory isolation** — `MEMORY.md` (clean) / `MEMORY-FULL.md` (unredacted) kept in sync automatically
 - **Router pipeline** — composable chain: privacy → token-saver → custom routers
 - **Learning loop** — correction store with embedding-based few-shot injection
+- **Model Advisor** — periodic checks for cheaper OpenRouter alternatives, better local models, and DeBERTa updates; surfaces suggestions in the dashboard
+- **Budget guardrails** — daily/monthly spend caps with live progress tracking
+- **Auto DeBERTa updates** — when a better injection classifier is available, it applies and hot-reloads in-place without restart
 - **Dashboard** — web UI at `http://127.0.0.1:18789/plugins/guardclaw/stats`
 - **Hot-reload config** — edit `~/.openclaw/guardclaw.json`, changes apply without restart
+
+---
+
+## Prompt Injection Detection (S0)
+
+GuardClaw runs a local [DeBERTa v3](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2) classifier as a FastAPI service on port 8404. Every incoming message is scored before it reaches the LLM — injections are blocked at the gate, not after the fact.
+
+The install script sets up the service automatically and registers it as a system service (launchd on macOS, systemd on Linux) so it starts on login and stays running.
+
+**Check the service:**
+```bash
+curl http://127.0.0.1:8404/health
+```
+
+**Custom endpoint** (e.g. remote host):
+```bash
+export GUARDCLAW_DEBERTA_URL=http://192.168.1.10:8404
+```
+
+**Logs:**
+```bash
+tail -f ~/.openclaw/deberta.log
+```
+
+When a newer model is available, GuardClaw's Model Advisor detects it and hot-swaps the classifier in-place — no service restart needed.
 
 ---
 
@@ -208,12 +237,14 @@ http://127.0.0.1:18789/plugins/guardclaw/stats
 ```
 
 **Provides:**
-- Real-time detection event log — every S1/S2/S3 classification with timestamps
+- Real-time detection event log — every S0–S3 classification with timestamps
 - Token usage tracking — count and cost estimates per message, per provider
 - Router pipeline status — visualise which routers processed each message
 - Configuration editor — modify rules and policies without restarting
 - Correction store — view and manage learned corrections from the feedback loop
 - Performance metrics — detection latency, cache hit rates, model performance
+- **Advisor tab** — pending model suggestions with accept/dismiss, benchmark comparisons, and savings estimates
+- **Budget tab** — daily/monthly cost progress bars with configurable spend caps
 
 ---
 
@@ -246,6 +277,38 @@ GuardClaw includes a `token-saver` router that cost-optimises your LLM calls whe
 
 ---
 
+## Model Advisor
+
+The Model Advisor runs periodic checks (default: every 2 weeks) across three areas:
+
+| Check | What it does |
+|-------|-------------|
+| **OpenRouter pricing** | Finds cheaper models that match your current provider's capability tier |
+| **Local model quality** | Uses LLMFit to identify better local models available to pull |
+| **DeBERTa updates** | Detects newer injection classifier versions on HuggingFace |
+
+Suggestions appear in the dashboard Advisor tab with benchmark comparisons and estimated savings. DeBERTa updates apply automatically by default (`autoUpdate: true`) and hot-reload the classifier without a service restart.
+
+**Enable it:**
+```json
+"modelAdvisor": {
+  "enabled": true,
+  "checkIntervalWeeks": 2,
+  "minSavingsPercent": 20,
+  "openrouterApiKey": "sk-or-...",
+  "openrouter": { "enabled": true },
+  "llmfit": { "enabled": true },
+  "deberta": {
+    "enabled": true,
+    "autoUpdate": true
+  }
+}
+```
+
+Set `autoUpdate: false` if you prefer to review and accept DeBERTa updates manually from the dashboard.
+
+---
+
 ## Architecture
 
 ```
@@ -262,17 +325,95 @@ src/
   session-manager.ts      Dual-track session history (full + sanitised)
   memory-isolation.ts     MEMORY.md ↔ MEMORY-FULL.md sync
   token-stats.ts          Usage tracking and cost accounting
-  stats-dashboard.ts      HTTP dashboard
+  stats-dashboard.ts      HTTP dashboard (detection log, advisor, budget)
   live-config.ts          Hot-reload of guardclaw.json
+  model-advisor.ts        Periodic model suggestion checks + auto DeBERTa updates
+  budget-guard.ts         Daily/monthly spend tracking and cap enforcement
   routers/
-    privacy.ts            Built-in S1/S2/S3 privacy router
+    privacy.ts            Built-in S0–S3 privacy router
     token-saver.ts        Cost-aware model routing (optional)
     configurable.ts       User-defined custom routers
+  injection/
+    deberta.ts            DeBERTa classifier client (port 8404)
 prompts/
   detection-system.md     Editable system prompt for LLM classification
   guard-agent-system.md   System prompt for the guard agent
   token-saver-judge.md    Prompt for cost-aware routing decisions
+scripts/
+  injection_classifier.py FastAPI DeBERTa service with hot-reload support
+  install.sh              Guided installer (Node + Python + OS service setup)
 ```
+
+---
+
+## Docker Secrets Integration
+
+GuardClaw automatically detects and classifies values from Docker secret mounts as **S2 (Sensitive)**.
+
+**How it works:**
+
+When GuardClaw sees a file path matching `/run/secrets/*` or `/var/run/secrets/*` (the standard Docker and Kubernetes secrets mount points), it:
+1. Classifies the path as S2 — sensitive credential data
+2. Marks the value for taint tracking
+3. Redacts any occurrence of that value in subsequent tool results before sending to the LLM
+
+**Docker Compose example:**
+
+```yaml
+services:
+  app:
+    image: myapp:latest
+    secrets:
+      - db_password
+    environment:
+      DB_PASSWORD_FILE: /run/secrets/db_password
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+Your app reads from `/run/secrets/db_password` at runtime. If an OpenClaw agent later runs `cat /run/secrets/db_password`, GuardClaw:
+1. Detects the `/run/secrets/` path → S2
+2. Extracts the value from the tool result
+3. Registers it as tainted for the session
+4. Redacts the value from the LLM context as `[REDACTED:TAINT]`
+
+**Kubernetes example:**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app
+spec:
+  containers:
+  - name: app
+    image: myapp:latest
+    volumeMounts:
+    - name: secrets
+      mountPath: /var/run/secrets
+      readOnly: true
+  volumes:
+  - name: secrets
+    secret:
+      secretName: my-secrets
+```
+
+Kubernetes mounts secrets to `/var/run/secrets/` — GuardClaw detects these automatically with the same S2 treatment.
+
+**Best practice:**
+
+1. Store secrets in Docker/Kubernetes secret management — do NOT use env vars
+2. Mount via `/run/secrets/` or `/var/run/secrets/`
+3. Apps read from the mount point at runtime
+4. GuardClaw handles the rest — automatic detection and taint tracking
+
+This approach provides **defense in depth:**
+- Secrets stored securely (never in image layers or env var listings)
+- GuardClaw detects the path and marks values as sensitive
+- Taint tracking ensures the value is redacted everywhere in the session
+- Even if an agent accidentally runs `cat /run/secrets/X`, the value is suppressed before the LLM sees it
 
 ---
 
@@ -288,6 +429,19 @@ prompts/
 ```bash
 tail -f ~/.openclaw/logs/gateway.err.log | grep GuardClaw
 ```
+
+**DeBERTa service not responding** — Check the log and restart the service:
+```bash
+tail -f ~/.openclaw/deberta.log
+
+# macOS
+launchctl kickstart -k gui/$(id -u)/ai.guardclaw.deberta
+
+# Linux
+systemctl --user restart guardclaw-deberta
+```
+
+**Model Advisor not showing suggestions** — Confirm `modelAdvisor.enabled: true` in `~/.openclaw/guardclaw.json`. You can also trigger a manual check from the Advisor tab in the dashboard.
 
 ---
 

@@ -313,7 +313,18 @@ function checkToolParams(
     return { level: "S1" };
   }
 
-  // Check S3 paths first (higher priority)
+  // Check for Docker/Kubernetes secrets mounts first (high confidence S2)
+  // These are standardized paths that always indicate secret values
+  for (const path of paths) {
+    if (path.startsWith("/run/secrets/") || path.startsWith("/var/run/secrets/")) {
+      return {
+        level: "S2",
+        reason: `Docker/Kubernetes secrets mount detected: ${path}`,
+      };
+    }
+  }
+
+  // Check S3 paths (higher priority than S2)
   const s3Paths = config.rules?.tools?.S3?.paths ?? [];
   for (const path of paths) {
     if (matchesPathPattern(path, s3Paths)) {

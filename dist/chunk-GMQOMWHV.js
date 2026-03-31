@@ -19,6 +19,22 @@ var guardClawConfigSchema = Type.Object({
       s2Policy: Type.Optional(
         Type.Union([Type.Literal("proxy"), Type.Literal("local")])
       ),
+      s3Policy: Type.Optional(
+        Type.Union([
+          Type.Literal("local-only"),
+          Type.Literal("redact-and-forward"),
+          Type.Literal("synthesize")
+        ])
+      ),
+      synthesis: Type.Optional(
+        Type.Object({
+          fallback: Type.Optional(Type.Union([Type.Literal("local-only"), Type.Literal("block")])),
+          verifyOutput: Type.Optional(Type.Boolean()),
+          maxRetries: Type.Optional(Type.Number()),
+          maxInputChars: Type.Optional(Type.Number()),
+          timeoutMs: Type.Optional(Type.Number())
+        })
+      ),
       proxyPort: Type.Optional(Type.Number()),
       checkpoints: Type.Optional(
         Type.Object({
@@ -189,6 +205,42 @@ var guardClawConfigSchema = Type.Object({
           ),
           warnAt: Type.Optional(Type.Number())
         })
+      ),
+      behavioralAttestation: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          logOnly: Type.Optional(Type.Boolean()),
+          windowSize: Type.Optional(Type.Number()),
+          blockThreshold: Type.Optional(Type.Number())
+        })
+      ),
+      modelAdvisor: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          checkIntervalWeeks: Type.Optional(Type.Number()),
+          minSavingsPercent: Type.Optional(Type.Number()),
+          minDiskSpaceGb: Type.Optional(Type.Number()),
+          openrouterApiKey: Type.Optional(Type.String()),
+          openrouter: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
+          llmfit: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
+          deberta: Type.Optional(Type.Object({
+            enabled: Type.Optional(Type.Boolean()),
+            autoUpdate: Type.Optional(Type.Boolean())
+          })),
+          benchmark: Type.Optional(
+            Type.Object({
+              enabled: Type.Optional(Type.Boolean()),
+              runs: Type.Optional(Type.Number())
+            })
+          )
+        })
+      ),
+      taintTracking: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          minValueLength: Type.Optional(Type.Number()),
+          trackS2: Type.Optional(Type.Boolean())
+        })
       )
     })
   )
@@ -262,6 +314,35 @@ var defaultPrivacyConfig = {
     onUserMessage: ["privacy"],
     onToolCallProposed: ["privacy"],
     onToolCallExecuted: ["privacy"]
+  },
+  responseScanning: {
+    enabled: true,
+    action: "warn",
+    scanSecrets: true,
+    scanPii: false
+  },
+  behavioralAttestation: {
+    enabled: false,
+    // flip to true to start collecting data
+    logOnly: true,
+    // true = log+score only, never blocks; false = active gating
+    windowSize: 10,
+    blockThreshold: 0.8
+  },
+  modelAdvisor: {
+    enabled: false,
+    checkIntervalWeeks: 2,
+    minSavingsPercent: 20,
+    minDiskSpaceGb: 10,
+    openrouter: { enabled: true },
+    llmfit: { enabled: true },
+    deberta: { enabled: true, autoUpdate: true },
+    benchmark: { enabled: true, runs: 3 }
+  },
+  taintTracking: {
+    enabled: true,
+    minValueLength: 8,
+    trackS2: false
   }
 };
 var defaultInjectionConfig = {
@@ -276,8 +357,33 @@ var defaultInjectionConfig = {
 };
 
 // src/injection/deberta.ts
-var ENDPOINT = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
+var BASE_URL = (() => {
+  const url = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
+  return url.endsWith("/classify") ? url.slice(0, -"/classify".length) : url;
+})();
+var ENDPOINT = `${BASE_URL}/classify`;
+var RELOAD_ENDPOINT = `${BASE_URL}/reload`;
 var TIMEOUT_MS = 5e3;
+var RELOAD_TIMEOUT_MS = 3e5;
+async function triggerDebertaReload(modelId) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RELOAD_TIMEOUT_MS);
+  try {
+    const res = await fetch(RELOAD_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelId }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) return { ok: false, message: `HTTP ${res.status}` };
+    const data = await res.json();
+    return { ok: true, message: data.note ?? `Loaded ${data.model ?? modelId}` };
+  } catch (err) {
+    clearTimeout(timer);
+    return { ok: false, message: err.name === "AbortError" ? "Timeout" : err.message ?? "Service unreachable" };
+  }
+}
 async function runDebertaClassifier(content) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -1827,7 +1933,7 @@ async function callLocalModel(systemPrompt, userContent, config) {
       maxTokens: 300,
       stop: ["\n\n", "\nExplanation", "\nNote"],
       apiKey: config.localModel?.apiKey,
-      disableThinking: false,
+      disableThinking: true,
       providerType,
       customModule: config.localModel?.module
     }
@@ -2001,7 +2107,7 @@ async function extractPiiWithModel(endpoint, model, content, opts) {
       maxTokens: 2500,
       stop: ["Input:", "Task:"],
       apiKey: opts?.apiKey,
-      disableThinking: false,
+      disableThinking: true,
       providerType: opts?.providerType,
       customModule: opts?.customModule
     }
@@ -2099,6 +2205,7 @@ export {
   defaultPrivacyConfig,
   defaultInjectionConfig,
   loadPrompt,
+  loadPromptWithVars,
   writePrompt,
   readPromptFromDisk,
   getCorrections,
@@ -2124,6 +2231,7 @@ export {
   setLastSenderId,
   getLastSenderId,
   clearLastSenderId,
+  triggerDebertaReload,
   runDebertaClassifier,
   SECURITY_CHANNEL,
   formatBlockAlert,
