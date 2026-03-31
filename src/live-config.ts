@@ -143,6 +143,24 @@ export function updateLiveConfig(patch: Partial<PrivacyConfig>): void {
   liveConfig = mergeConfig({ ...liveConfig, ...patch });
 }
 
+// ── GCF-024: guardclaw.json RMW mutex ───────────────────────────────────────
+// All read-modify-write operations on guardclaw.json must go through this lock
+// so concurrent auto-ban writes from hooks.ts and privacy-proxy.ts don't race.
+
+let _configWriteLock: Promise<void> = Promise.resolve();
+
+/**
+ * Serialize all read-modify-write operations on guardclaw.json.
+ * Uses Promise-chaining as an in-process async mutex.
+ */
+export function withConfigWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+  let resolve!: () => void;
+  const gate = new Promise<void>((r) => { resolve = r; });
+  const result = _configWriteLock.then(() => fn()).finally(resolve);
+  _configWriteLock = gate;
+  return result;
+}
+
 /** Hot-update the live injection config. Called after auto-ban. */
 export function updateLiveInjectionConfig(patch: Partial<InjectionConfig>): void {
   liveInjectionConfig = { ...liveInjectionConfig, ...patch };

@@ -147,6 +147,7 @@ export function clearSessionState(sessionKey: string): void {
   sessionStates.delete(sessionKey);
   activeLocalRouting.delete(sessionKey);
   pendingDetections.delete(sessionKey);
+  rollingBuffers.delete(sessionKey);
 }
 
 /**
@@ -252,6 +253,37 @@ export function getLastSenderId(channelId: string): string | undefined {
 
 export function clearLastSenderId(channelId: string): void {
   pendingSenderIds.delete(channelId);
+}
+
+// ── Cross-turn rolling buffer (GCF-002) ─────────────────────────────────
+// Per-session sliding window of the last N chars of tool result text.
+// Detects secrets that are chunked across turn boundaries (e.g. a private
+// key split across two consecutive tool results). Checked in tool_result_persist
+// after appending the current content.
+
+const ROLLING_BUFFER_MAX = 500;
+const rollingBuffers = new Map<string, string>();
+
+/**
+ * Append `content` to the session's rolling buffer and return the updated
+ * buffer string (trimmed to ROLLING_BUFFER_MAX from the tail).
+ */
+export function appendToRollingBuffer(sessionKey: string, content: string): string {
+  const existing = rollingBuffers.get(sessionKey) ?? "";
+  const combined = existing + content;
+  const trimmed = combined.length > ROLLING_BUFFER_MAX
+    ? combined.slice(combined.length - ROLLING_BUFFER_MAX)
+    : combined;
+  rollingBuffers.set(sessionKey, trimmed);
+  return trimmed;
+}
+
+export function getRollingBuffer(sessionKey: string): string {
+  return rollingBuffers.get(sessionKey) ?? "";
+}
+
+export function clearRollingBuffer(sessionKey: string): void {
+  rollingBuffers.delete(sessionKey);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

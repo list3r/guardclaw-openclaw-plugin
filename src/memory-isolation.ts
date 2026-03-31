@@ -289,11 +289,43 @@ export class MemoryIsolationManager {
   }
 
   /**
-   * Sync everything: long-term memory + all daily files
+   * Sync everything: long-term memory + all daily files.
+   *
+   * GCF-025: Uses an O_EXCL advisory lock file (~/.openclaw/memory-sync.lock)
+   * to prevent concurrent syncAllMemoryToClean() calls (e.g. from two sessions
+   * both reaching session_end at the same time) from producing TOCTOU races on
+   * MEMORY.md / MEMORY-FULL.md. Non-blocking: if the lock is already held,
+   * this call is skipped and a warning is logged rather than waiting.
    */
   async syncAllMemoryToClean(privacyConfig?: PrivacyConfig): Promise<void> {
-    await this.syncMemoryToClean(privacyConfig);
-    await this.syncDailyMemoryToClean(privacyConfig);
+    const lockDir = path.join(
+      process.env.HOME || process.env.USERPROFILE || "/tmp",
+      ".openclaw",
+    );
+    const lockPath = path.join(lockDir, "memory-sync.lock");
+    let lockFd: fs.promises.FileHandle | null = null;
+    try {
+      await fs.promises.mkdir(lockDir, { recursive: true });
+      // O_EXCL ensures atomic creation — fails immediately if lock already exists
+      lockFd = await fs.promises.open(
+        lockPath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+        0o600,
+      );
+    } catch {
+      // Another process holds the lock — skip this sync cycle safely
+      console.warn("[GuardClaw] Memory sync skipped: lock held by another process");
+      return;
+    }
+    try {
+      await this.syncMemoryToClean(privacyConfig);
+      await this.syncDailyMemoryToClean(privacyConfig);
+    } finally {
+      if (lockFd) {
+        await lockFd.close();
+        await fs.promises.unlink(lockPath).catch(() => {});
+      }
+    }
   }
 
   /**

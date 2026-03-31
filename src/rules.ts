@@ -8,6 +8,29 @@ import type { DetectionContext, DetectionResult, PrivacyConfig, SensitivityLevel
 import { levelToNumeric, maxLevel } from "./types.js";
 import { extractPathsFromParams, matchesPathPattern } from "./utils.js";
 
+/**
+ * GCF-001: Normalize text before keyword/pattern matching to defeat Unicode
+ * homoglyph and leet-speak bypasses.
+ *
+ * Steps:
+ *   1. NFKD normalization — folds fullwidth, Cyrillic lookalikes, and
+ *      combining diacriticals to their ASCII equivalents (e.g. ｐ→p, а→a).
+ *   2. Strip combining characters left by NFKD (category Mn).
+ *   3. Leet-speak substitutions: @→a, 0→o, 3→e, 1→i, $→s, 5→s.
+ */
+function normalizeForDetection(text: string): string {
+  // Step 1 + 2: NFKD + strip combining marks
+  const nfkd = text.normalize("NFKD").replace(/\p{Mn}/gu, "");
+  // Step 3: common leet-speak substitutions
+  return nfkd
+    .replace(/@/g, "a")
+    .replace(/0/g, "o")
+    .replace(/3/g, "e")
+    .replace(/1/g, "i")
+    .replace(/\$/g, "s")
+    .replace(/5/g, "s");
+}
+
 /** Cache compiled regex patterns to avoid re-compilation on every call */
 const PATTERN_CACHE_MAX = 500;
 const PATTERN_MAX_LENGTH = 500;
@@ -15,15 +38,24 @@ const patternCache = new Map<string, RegExp>();
 
 /**
  * Detect patterns likely to cause catastrophic backtracking (ReDoS).
- * Rejects patterns with nested quantifiers like (a+)+, (a*)*, (a+)*, etc.
+ * GCF-005: Expanded beyond the original heuristic to catch additional
+ * catastrophic-backtracking patterns missed by the original checks.
  *
- * Note: This is a heuristic, not a complete ReDoS prover.  It catches the
- * most common classes.  For truly untrusted input a library like `recheck`
- * or `safe-regex` would be more thorough.
+ * Catches:
+ *   - Nested quantifiers on groups: (x+)+, (x*)*, (x+)*, (x?)+
+ *   - Quantified alternation: (a|b)+, (a|b*)+
+ *   - Unbounded dot with outer repeat: (.*)+
+ *   - Empty string alternation: (a|)+
+ *   - Non-capturing group variants: (?:a+)+, (?:a|b*)+
+ *   - Nested character-class quantifiers: ([a-z]+\s*)+
+ *
+ * Note: This is an improved heuristic, not a formal ReDoS prover.
+ * For truly untrusted input a library like `safe-regex` or `recheck`
+ * would be more thorough.
  */
 function isDangerousRegex(pattern: string): boolean {
-  // Nested quantifiers on groups: (x+)+, (x*)*, (x+)*, (x?)+ etc.
-  if (/\([^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
+  // Nested quantifiers on groups (including non-capturing): (x+)+, (?:x*)+
+  if (/\((?:\?:)?[^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
   // Alternation with overlap inside a repeated group: (a|a)+
   if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern)) return true;
   // Curly-brace quantifiers inside a repeated group: (a{2,})+
@@ -32,6 +64,13 @@ function isDangerousRegex(pattern: string): boolean {
   if (/\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   // Alternation of quantified terms in a repeated group: (a+|b+)*
   if (/\([^)]*[+*?][^)]*\|[^)]*[+*?][^)]*\)[+*?{]/.test(pattern)) return true;
+  // Unbounded dot-star inside a repeated group: (.*)+
+  if (/\(\.[*+]\)[+*?{]/.test(pattern)) return true;
+  // Empty string in alternation: (a|)+ or (|a)+
+  if (/\([^)]*\|\)[+*{]/.test(pattern)) return true;
+  if (/\(\|[^)]*\)[+*{]/.test(pattern)) return true;
+  // Nested quantifiers on non-capturing groups with alternation: (?:a|b*)+
+  if (/\(\?:[^)]*\|[^)]*[*+][^)]*\)[+*?{]/.test(pattern)) return true;
   return false;
 }
 
@@ -194,10 +233,12 @@ function checkKeywords(
   text: string,
   config: PrivacyConfig
 ): { level: SensitivityLevel; reason?: string } {
+  // GCF-001: Normalize to defeat Unicode homoglyph and leet-speak bypasses.
+  const normalized = normalizeForDetection(text);
   // Check S3 keywords first (higher priority)
   const s3Keywords = config.rules?.keywords?.S3 ?? [];
   for (const keyword of s3Keywords) {
-    if (getKeywordRegex(keyword).test(text)) {
+    if (getKeywordRegex(keyword).test(normalized)) {
       return {
         level: "S3",
         reason: `S3 keyword detected: ${keyword}`,
@@ -208,7 +249,7 @@ function checkKeywords(
   // Check S2 keywords
   const s2Keywords = config.rules?.keywords?.S2 ?? [];
   for (const keyword of s2Keywords) {
-    if (getKeywordRegex(keyword).test(text)) {
+    if (getKeywordRegex(keyword).test(normalized)) {
       return {
         level: "S2",
         reason: `S2 keyword detected: ${keyword}`,
@@ -226,11 +267,13 @@ function checkPatterns(
   text: string,
   config: PrivacyConfig
 ): { level: SensitivityLevel; reason?: string } {
+  // GCF-001: Normalize to defeat Unicode homoglyph and leet-speak bypasses.
+  const normalized = normalizeForDetection(text);
   // Check S3 patterns first (higher priority)
   const s3Patterns = config.rules?.patterns?.S3 ?? [];
   for (const pattern of s3Patterns) {
     const regex = getOrCompileRegex(pattern);
-    if (regex && regex.test(text)) {
+    if (regex && regex.test(normalized)) {
       return {
         level: "S3",
         reason: `S3 pattern matched: ${pattern}`,
@@ -242,7 +285,7 @@ function checkPatterns(
   const s2Patterns = config.rules?.patterns?.S2 ?? [];
   for (const pattern of s2Patterns) {
     const regex = getOrCompileRegex(pattern);
-    if (regex && regex.test(text)) {
+    if (regex && regex.test(normalized)) {
       return {
         level: "S2",
         reason: `S2 pattern matched: ${pattern}`,

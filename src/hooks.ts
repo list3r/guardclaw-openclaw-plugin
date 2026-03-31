@@ -53,9 +53,10 @@ import {
   setLastSenderId,
   getLastSenderId,
   clearLastSenderId,
+  appendToRollingBuffer,
 } from "./session-state.js";
 import { detectByRules } from "./rules.js";
-import { isProtectedMemoryPath, redactSensitiveInfo, redactForCleanTranscript, extractPathsFromParams, resolveDefaultBaseUrl } from "./utils.js";
+import { isProtectedMemoryPath, redactSensitiveInfo, redactForCleanTranscript, extractPathsFromParams, resolveDefaultBaseUrl, matchesPathPattern } from "./utils.js";
 import {
   GUARDCLAW_S2_OPEN,
   GUARDCLAW_S2_CLOSE,
@@ -63,8 +64,10 @@ import {
 } from "./privacy-proxy.js";
 import { getGlobalPipeline } from "./router-pipeline.js";
 import { getGlobalCollector } from "./token-stats.js";
-import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans, withConfigWriteLock } from "./live-config.js";
 import { detectInjection, SECURITY_CHANNEL, formatBlockAlert } from "./injection/index.js";
+import { runHeuristics } from "./injection/heuristics.js";
+import { sanitiseContent } from "./injection/sanitiser.js";
 import { finalizeLoop } from "./loop-detection-level.js";
 import { recordFinalReply } from "./usage-intel.js";
 import {
@@ -186,22 +189,10 @@ function _popSynthesisPending(sessionKey: string, toolName: string): string | un
   return entry.synthetic;
 }
 
-// ── Tool result injection pre-cache ─────────────────────────────────────────
-// after_tool_call (async) runs injection detection on tool results and stashes
-// the outcome here. tool_result_persist (sync) reads the stash and applies
-// block/sanitize before the privacy pipeline runs.
-type InjectionPending = { toolName: string; action: "block" | "sanitise"; sanitised?: string; reason?: string };
-const _injectionPendingQueue = new Map<string, Array<InjectionPending>>();
-
-function _popInjectionPending(sessionKey: string, toolName: string): InjectionPending | undefined {
-  const queue = _injectionPendingQueue.get(sessionKey);
-  if (!queue || queue.length === 0) return undefined;
-  const idx = queue.findIndex((e) => e.toolName === toolName);
-  if (idx === -1) return undefined;
-  const [entry] = queue.splice(idx, 1);
-  if (queue.length === 0) _injectionPendingQueue.delete(sessionKey);
-  return entry;
-}
+// GCF-003: Tool result injection detection is now performed synchronously
+// inside tool_result_persist using runHeuristics() — no async pre-cache stash.
+// after_tool_call 3c still runs the full DeBERTa pipeline for audit/alerting
+// but no longer controls whether the tool result is blocked.
 
 const _OPENCLAW_DIR = join(process.env.HOME ?? "/tmp", ".openclaw");
 const GUARDCLAW_STATS_PATH = join(_OPENCLAW_DIR, "guardclaw-stats.json");
@@ -210,6 +201,27 @@ const GUARDCLAW_PENDING_CONFIG_PATH = join(_OPENCLAW_DIR, "workspace", "dashboar
 const GUARDCLAW_JSON_PATH = join(_OPENCLAW_DIR, "guardclaw.json");
 
 // injectionAttemptCounts is imported from live-config.ts (shared with privacy-proxy.ts)
+
+// GCF-026: Per-session Set of pending memory write promises.
+// tool_result_persist is synchronous and fires memory writes as fire-and-forget.
+// session_end and before_reset await all pending writes before proceeding.
+const _pendingMemoryWrites = new Map<string, Set<Promise<void>>>();
+
+function trackMemoryWrite(sessionKey: string, p: Promise<void>): void {
+  let set = _pendingMemoryWrites.get(sessionKey);
+  if (!set) { set = new Set(); _pendingMemoryWrites.set(sessionKey, set); }
+  set.add(p);
+  p.finally(() => { set?.delete(p); }).catch(() => {});
+}
+
+async function awaitPendingMemoryWrites(sessionKey: string, logger: { warn: (s: string) => void }): Promise<void> {
+  const set = _pendingMemoryWrites.get(sessionKey);
+  if (!set || set.size === 0) return;
+  logger.warn(`[GuardClaw] Awaiting ${set.size} pending memory write(s) before session lifecycle event (session=${sessionKey})`);
+  await Promise.allSettled([...set]);
+  _pendingMemoryWrites.delete(sessionKey);
+}
+
 
 interface InjectionEntry {
   ts: string;
@@ -495,7 +507,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
                 score: injResult.score,
                 patterns: injResult.matches,
                 source: 'user_message',
-                preview: msgStr.slice(0, 80),
+                // GCF-011: Redact before logging — false-positive blocks may contain real secrets.
+                preview: redactSensitiveInfo(msgStr.slice(0, 80), getLiveConfig().redaction),
               });
               void updateS0Stats('block');
               // Auto-ban logic: track injection attempts per senderId
@@ -507,18 +520,18 @@ export function registerHooks(api: OpenClawPluginApi): void {
                   api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
                   const newBanned = [...(injectionCfg.banned_senders ?? []), senderId];
                   updateLiveInjectionConfig({ banned_senders: newBanned });
-                  // Persist to guardclaw.json (path: privacy.injection.banned_senders)
-                  fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8')
-                    .then((raw) => {
-                      const cfg = JSON.parse(raw) as Record<string, unknown>;
-                      if (!cfg.privacy) cfg.privacy = {};
-                      const privacy = cfg.privacy as Record<string, unknown>;
-                      if (!privacy.injection) privacy.injection = {};
-                      (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
-                      return fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
-                    })
+                  // GCF-024: Persist under mutex to prevent concurrent auto-ban RMW races.
+                  withConfigWriteLock(async () => {
+                    const raw = await fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8');
+                    const cfg = JSON.parse(raw) as Record<string, unknown>;
+                    if (!cfg.privacy) cfg.privacy = {};
+                    const privacy = cfg.privacy as Record<string, unknown>;
+                    if (!privacy.injection) privacy.injection = {};
+                    (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
+                    await fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2), { encoding: 'utf-8', mode: 0o600 });
+                  })
                     .catch((err) => { api.logger.warn(`[GuardClaw S0] Failed to persist ban for ${senderId}: ${String(err)}`); })
-                    .finally(() => { pendingBans.delete(senderId); });
+                    .finally(() => { pendingBans.delete(senderId ?? ''); });
                 }
               }
               // Record in session state so dashboard /api/detections picks it up
@@ -543,7 +556,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
                 score: injResult.score,
                 patterns: injResult.matches,
                 source: 'user_message',
-                preview: msgStr.slice(0, 80),
+                // GCF-011: Redact before logging.
+                preview: redactSensitiveInfo(msgStr.slice(0, 80), getLiveConfig().redaction),
               });
               void updateS0Stats('sanitise');
               // Record in session state so dashboard /api/detections picks it up
@@ -1103,9 +1117,39 @@ export function registerHooks(api: OpenClawPluginApi): void {
           }
         }
 
+        // ── GCF-004: S3 path pre-blocking for cloud model sessions ────────────
+        // Block ALL tool calls (not just exec) when a cloud-model session
+        // attempts to access S3 paths or secrets mounts. This prevents the
+        // late-detection window (tool_result_persist is too late — cloud model
+        // already has the data in context). Blocking here prevents exposure.
+        const s3Paths = privacyConfig.rules?.tools?.S3?.paths ?? [];
+        for (const p of pathValues) {
+          if (isSecretsMountPath(p)) {
+            api.logger.warn(
+              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": secrets-mount path "${p}" — ` +
+              `would expose secrets to cloud model (session=${sessionKey})`,
+            );
+            return {
+              block: true,
+              blockReason: `GuardClaw: secrets-mount paths are not accessible from cloud-model sessions — use a guard session for sensitive file access (${p})`,
+            };
+          }
+          if (s3Paths.length > 0 && matchesPathPattern(p, s3Paths)) {
+            api.logger.warn(
+              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": S3 path "${p}" — ` +
+              `would expose sensitive data to cloud model (session=${sessionKey})`,
+            );
+            return {
+              block: true,
+              blockReason: `GuardClaw: S3 path access is blocked for cloud-model sessions — use a guard session for sensitive file operations (${p})`,
+            };
+          }
+        }
+
         // ── Taint: detect secrets-mount reads ──────────────────────────────────
         // When the agent reads from /run/secrets/ or /var/run/secrets/, flag the
         // session so tool_result_persist can register the content as tainted.
+        // Note: this is now a fallback — GCF-004 blocks secrets-mount reads above.
         const _taintBtcCfg = (privacyConfig as Record<string, unknown> & {
           taintTracking?: { enabled?: boolean }
         }).taintTracking;
@@ -1114,7 +1158,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             if (isSecretsMountPath(p)) {
               markPendingTaint(sessionKey, `secrets-file:${p}`, "S3");
               api.logger.info(`[GuardClaw:taint] Secrets-mount read detected — result will be taint-tracked (path=${p}, session=${sessionKey})`);
-              break; // one pending taint per tool call is sufficient
+              // GCF-014: No break — queue all paths, one entry per tool call.
             }
           }
         }
@@ -1312,24 +1356,15 @@ export function registerHooks(api: OpenClawPluginApi): void {
       if (/web.?fetch|http.?fetch/i.test(toolName)) source = "web_fetch";
       else if (/read.?file|file.?read/i.test(toolName)) source = "file";
 
+      // GCF-003: DeBERTa runs here for enhanced audit/alerting only.
+      // tool_result_persist now blocks/sanitises synchronously via heuristics,
+      // removing the async ordering dependency on this hook completing first.
       const injResult = await detectInjection(textContent, source, injectionCfg);
-
       if (injResult.action === "block" || injResult.action === "sanitise") {
-        const queue = _injectionPendingQueue.get(sessionKey) ?? [];
-        queue.push({
-          toolName,
-          action: injResult.action,
-          sanitised: injResult.sanitised,
-          reason: injResult.blocked_reason ?? `Injection detected (score ${injResult.score})`,
-        });
-        _injectionPendingQueue.set(sessionKey, queue);
         api.logger.warn(
-          `[GuardClaw S0] Tool result injection ${injResult.action}: tool=${toolName} score=${injResult.score} ` +
+          `[GuardClaw S0] DeBERTa audit: tool result injection confirmed: tool=${toolName} score=${injResult.score} ` +
           `patterns=${injResult.matches.join(",")} session=${sessionKey}`,
         );
-        recordDetection(sessionKey, "S0", "onToolCallExecuted",
-          injResult.blocked_reason ?? `Tool result injection (score ${injResult.score})`);
-        void updateS0Stats(injResult.action);
       }
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in after_tool_call injection check: ${String(err)}`);
@@ -1355,9 +1390,12 @@ export function registerHooks(api: OpenClawPluginApi): void {
         if (writePath && isMemoryWritePath(writePath)) {
           const workspaceDir = _cachedWorkspaceDir ?? process.cwd();
           const privacyConfig = getLiveConfig();
-          syncMemoryWrite(writePath, workspaceDir, privacyConfig, api.logger, isGuardSessionKey(sessionKey)).catch((err) => {
-            api.logger.warn(`[GuardClaw] Memory dual-write sync failed: ${String(err)}`);
-          });
+          // GCF-008: Use isVerifiedGuardSession (registry-checked) not isGuardSessionKey
+          // (pattern-only) to prevent session-key spoofing from gaining guard write access.
+          // GCF-026: Track the write promise so session_end/before_reset can await it.
+          const writePromise = syncMemoryWrite(writePath, workspaceDir, privacyConfig, api.logger, isVerifiedGuardSession(sessionKey))
+            .catch((err) => { api.logger.warn(`[GuardClaw] Memory dual-write sync failed: ${String(err)}`); });
+          trackMemoryWrite(sessionKey, writePromise);
         }
       }
 
@@ -1435,24 +1473,77 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // auth headers/tokens that must NOT be redacted or the tool breaks.
       if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
 
-      // ── S0: Apply pre-cached injection decision ──────────────────────────
-      // after_tool_call ran detectInjection async and stashed block/sanitise here.
-      const injPending = _popInjectionPending(sessionKey, ctx.toolName ?? "");
-      if (injPending) {
-        if (injPending.action === "block") {
-          api.logger.warn(`[GuardClaw S0] Tool result blocked (injection): tool=${ctx.toolName ?? "unknown"}`);
-          const blocked = replaceMessageText(msg,
-            `[GuardClaw S0: Tool result blocked — prompt injection detected. Reason: ${injPending.reason ?? "injection detected"}]`);
-          if (blocked) return { message: blocked };
-        } else if (injPending.action === "sanitise" && injPending.sanitised !== undefined) {
-          api.logger.info(`[GuardClaw S0] Tool result sanitised (injection): tool=${ctx.toolName ?? "unknown"}`);
-          const sanitised = replaceMessageText(msg, injPending.sanitised);
-          if (sanitised) return { message: sanitised };
+      const textContent = extractMessageText(msg);
+      if (!textContent || textContent.length < 10) return;
+
+      // ── GCF-002: Cross-turn rolling buffer detection ──────────────────────
+      // Append content to the per-session 500-char sliding window and run
+      // full pattern detection on it.  This catches secrets split across
+      // two consecutive tool results (e.g. a PEM key returned in chunks).
+      {
+        const rollingBuf = appendToRollingBuffer(sessionKey, textContent);
+        if (rollingBuf.length >= 10) {
+          const rollingPrivCfg = getLiveConfig();
+          const rollingCheck = detectByRules(
+            { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: rollingBuf, sessionKey },
+            rollingPrivCfg,
+          );
+          if (rollingCheck.level === "S2" || rollingCheck.level === "S3") {
+            api.logger.warn(
+              `[GuardClaw:rolling] Cross-turn sensitive content detected level=${rollingCheck.level} session=${sessionKey} reason=${rollingCheck.reason ?? ""}`,
+            );
+            markSessionAsPrivate(sessionKey, rollingCheck.level);
+            recordDetection(sessionKey, rollingCheck.level, "onToolCallExecuted", `[rolling-buffer] ${rollingCheck.reason ?? ""}`);
+          }
         }
       }
 
-      const textContent = extractMessageText(msg);
-      if (!textContent || textContent.length < 10) return;
+      // ── S0: Synchronous injection detection (GCF-003) ────────────────────
+      // Run heuristics synchronously so blocking is guaranteed regardless of
+      // async after_tool_call ordering. DeBERTa still runs there for enhanced
+      // audit logging, but tool_result_persist is the enforcement point.
+      const injectionCfgTrp = getLiveInjectionConfig();
+      if (injectionCfgTrp.enabled !== false) {
+        const toolNameTrp = ctx.toolName ?? "";
+        let sourceTrp: import("./injection/index.js").InjectionSource = "api_response";
+        if (/web.?fetch|http.?fetch/i.test(toolNameTrp)) sourceTrp = "web_fetch";
+        else if (/read.?file|file.?read/i.test(toolNameTrp)) sourceTrp = "file";
+        if (!injectionCfgTrp.exempt_sources?.includes(sourceTrp)) {
+          const blockThresholdTrp = injectionCfgTrp.block_threshold ?? 70;
+          const sanitiseThresholdTrp = injectionCfgTrp.sanitise_threshold ?? 30;
+          const heuristic = runHeuristics(textContent);
+          if (heuristic.score >= sanitiseThresholdTrp) {
+            const injAction = heuristic.score >= blockThresholdTrp ? "block" : "sanitise";
+            const injReason = `Injection detected (heuristics score ${heuristic.score}): ${heuristic.matches.join(", ")}`;
+            void appendInjectionLog({
+              ts: new Date().toISOString(),
+              session: sessionKey,
+              action: injAction,
+              score: heuristic.score,
+              patterns: heuristic.matches,
+              source: sourceTrp,
+              preview: redactSensitiveInfo(textContent.slice(0, 80), getLiveConfig().redaction),
+            });
+            void updateS0Stats(injAction);
+            recordDetection(sessionKey, "S0", "onToolCallExecuted", injReason);
+            if (injAction === "block") {
+              api.logger.warn(
+                `[GuardClaw S0] Tool result blocked (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey}`,
+              );
+              const blocked = replaceMessageText(msg,
+                `[GuardClaw S0: Tool result blocked — prompt injection detected. Score: ${heuristic.score}, patterns: ${heuristic.matches.join(", ")}]`);
+              if (blocked) return { message: blocked };
+            } else {
+              api.logger.info(
+                `[GuardClaw S0] Tool result sanitised (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey}`,
+              );
+              const sanitisedText = sanitiseContent(textContent, heuristic.matchedPatterns);
+              const sanitised = replaceMessageText(msg, sanitisedText);
+              if (sanitised) return { message: sanitised };
+            }
+          }
+        }
+      }
 
       // ── Detection + PII redaction + state tracking + dual-track writing ──
       // This sync hook is the single handler for tool result privacy:
@@ -1789,6 +1880,9 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const sessionKey = event.sessionKey ?? ctx.sessionKey;
       if (!sessionKey) return;
 
+      // GCF-026: Await any pending fire-and-forget memory writes before syncing.
+      await awaitPendingMemoryWrites(sessionKey, api.logger);
+
       const wasPrivate = isSessionMarkedPrivate(sessionKey);
       api.logger.info(`[GuardClaw] ${wasPrivate ? "private" : "cloud"} session ${sessionKey} ended. Syncing memory…`);
 
@@ -1895,6 +1989,9 @@ export function registerHooks(api: OpenClawPluginApi): void {
   api.on("before_reset", async (_event, ctx) => {
     try {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
+      // GCF-026: Await any pending fire-and-forget memory writes before syncing.
+      const sessionKey = ctx.sessionKey ?? "";
+      if (sessionKey) await awaitPendingMemoryWrites(sessionKey, api.logger);
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
       await memMgr.syncAllMemoryToClean(privacyConfig);
@@ -2147,23 +2244,44 @@ function isHighRiskExecCommand(command: string): string | null {
  * backtick sub-expressions — the literal tool name is still present regardless
  * of how it is quoted or nested.
  */
+// GCF-015: Expanded network exfiltration patterns for guard bash sessions.
+// GCF-016: eval/exec/source are blocked entirely — they enable arbitrary code
+//          execution that bypasses all static pattern checks.
 const GUARD_BASH_NETWORK_PATTERNS: Array<{ pattern: RegExp; tool: string }> = [
-  { pattern: /\bcurl\b/i,                                       tool: "curl" },
-  { pattern: /\bwget\b/i,                                       tool: "wget" },
-  { pattern: /(?:^|\s)ncat?\b/m,                                tool: "nc/ncat" },
-  { pattern: /\bnetcat\b/i,                                     tool: "netcat" },
-  { pattern: /\bsocat\b/i,                                      tool: "socat" },
-  { pattern: /\bssh\s/i,                                        tool: "ssh" },
-  { pattern: /\bscp\s/i,                                        tool: "scp" },
-  { pattern: /\bsftp\s/i,                                       tool: "sftp" },
-  { pattern: /\brsync\s+\S*@/i,                                 tool: "rsync (remote)" },
-  { pattern: /\bftp\s/i,                                        tool: "ftp" },
-  { pattern: /\btelnet\b/i,                                     tool: "telnet" },
-  { pattern: /\bopenssl\s+s_client\b/i,                         tool: "openssl s_client" },
-  { pattern: /\/dev\/tcp\//,                                     tool: "/dev/tcp" },
-  { pattern: /\bpython[23]?\b[\s\S]*?-c[\s\S]*?socket/i,       tool: "python socket" },
+  { pattern: /\bcurl\b/i,                                             tool: "curl" },
+  { pattern: /\bwget\b/i,                                             tool: "wget" },
+  { pattern: /(?:^|\s)ncat?\b/m,                                      tool: "nc/ncat" },
+  { pattern: /\bnetcat\b/i,                                           tool: "netcat" },
+  { pattern: /\bsocat\b/i,                                            tool: "socat" },
+  { pattern: /\bssh\s/i,                                              tool: "ssh" },
+  { pattern: /\bscp\s/i,                                              tool: "scp" },
+  { pattern: /\bsftp\s/i,                                             tool: "sftp" },
+  { pattern: /\brsync\s+\S*@/i,                                       tool: "rsync (remote)" },
+  { pattern: /\bftp\s/i,                                              tool: "ftp" },
+  { pattern: /\btelnet\b/i,                                           tool: "telnet" },
+  { pattern: /\bopenssl\s+s_client\b/i,                               tool: "openssl s_client" },
+  { pattern: /\/dev\/tcp\//,                                           tool: "/dev/tcp" },
+  { pattern: /\bpython[23]?\b[\s\S]*?-c[\s\S]*?socket/i,             tool: "python socket" },
   { pattern: /\bnode\b[\s\S]*?-e[\s\S]*?(?:http|https|net|tls)\b/i, tool: "node net" },
-  { pattern: /\bperl\b[\s\S]*?-e[\s\S]*?socket/i,              tool: "perl socket" },
+  { pattern: /\bperl\b[\s\S]*?-e[\s\S]*?socket/i,                    tool: "perl socket" },
+  // GCF-015: Cloud CLI tools — each can exfiltrate files to attacker-controlled storage
+  { pattern: /\baws\s/i,                                               tool: "aws-cli" },
+  { pattern: /\bgsutil\s/i,                                            tool: "gsutil" },
+  { pattern: /\baz\s/i,                                                tool: "azure-cli" },
+  { pattern: /\bdocker\s+push\b/i,                                     tool: "docker push" },
+  // git push with a remote URL (not just 'git push origin' — but catch URL forms)
+  { pattern: /\bgit\s+(?:push|remote\s+add)\s+(?:\S+\s+)?https?:\/\//i, tool: "git push (url)" },
+  // Scripting language one-liners that make network calls
+  { pattern: /\bruby\s+-e\b/i,                                         tool: "ruby -e" },
+  { pattern: /\bphp\s+-r\b/i,                                          tool: "php -r" },
+  // DNS exfiltration via nslookup/dig
+  { pattern: /\bnslookup\b/i,                                          tool: "nslookup" },
+  { pattern: /\bdig\s/i,                                               tool: "dig" },
+  // GCF-016: Obfuscation primitives — block entirely to prevent bypass of all above patterns
+  { pattern: /\beval\b/i,                                              tool: "eval (obfuscation)" },
+  { pattern: /\bexec\b/i,                                              tool: "exec (obfuscation)" },
+  { pattern: /\bsource\b/i,                                            tool: "source (obfuscation)" },
+  { pattern: /\b\.\s+[^\s]/,                                           tool: "source-dot (obfuscation)" },
 ];
 
 /**

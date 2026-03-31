@@ -4,6 +4,40 @@ All notable changes to GuardClaw are documented here.
 
 ---
 
+## [1.7.0] — 2026-03-31
+
+### Security — 19 audit findings resolved (all remaining open issues from v1.6.1 GCF audit)
+
+**Group 1 — Critical/High**
+
+- **GCF-003** *(High)*: Fixed async injection detection race. Injection enforcement moved into synchronous `tool_result_persist` via `runHeuristics()`. DeBERTa in `after_tool_call` retained for enhanced audit logging only.
+- **GCF-014** *(High)*: Fixed pending-taint single-slot race. `_pending` in `taint-store.ts` changed from `Map<string, PendingTaint>` to `Map<string, PendingTaint[]>` (queue per session); concurrent secrets-mount reads no longer overwrite each other.
+- **GCF-022** *(High)*: Pinned HuggingFace classifier model to verified commit SHA in `injection_classifier.py`. `PINNED_REVISIONS` dict prevents silent supply-chain substitution via mutable model updates.
+- **GCF-015** *(High)*: Extended `GUARD_BASH_NETWORK_PATTERNS` to cover `aws`, `gsutil`, `az`, `docker push`, `git push` with remote URL, `ruby -e`, `php -r`, `nslookup`, `dig`.
+- **GCF-016** *(Medium, Group 1 companion)*: `eval`, `exec`, `source` now blocked entirely in guard bash sessions — these builtins enable full bypass of all static network patterns.
+- **GCF-004** *(Critical)*: `before_tool_call` now blocks tool execution when a cloud-model session parameter matches a secrets-mount path (`/run/secrets/`, `/var/run/secrets/`) or any configured S3 path pattern. Prevents cloud model from reading S3 content before taint/redaction can fire.
+
+**Group 2 — Medium/High**
+
+- **GCF-001** *(High)*: Added NFKD Unicode normalization and leet-speak substitution (`normalizeForDetection()`) in `rules.ts`. Applied to all keyword and regex pattern checks. Defeats homoglyph, fullwidth, combining-diacritic, and `p@ssw0rd`-style bypasses.
+- **GCF-002** *(High)*: Added per-session 500-char rolling buffer (`appendToRollingBuffer`) in `session-state.ts`. `tool_result_persist` appends each result and re-runs `detectByRules` on the buffer, catching secrets chunked across consecutive tool results.
+- **GCF-012** *(High)*: Taint store now uses LRU eviction instead of silent drop. On cap hit, oldest non-secrets-mount taint is evicted with a WARN log. Secrets-mount taints (higher trust) are never evicted.
+- **GCF-006** *(Medium)*: Added modern credential patterns to `config.example.json` default S2/S3 rules: GitHub PAT (`ghp_`, `github_pat_`), Slack bot token (`xoxb-`), npm token (`npm_`), PyPI token (`pypi-`), Stripe live key (`sk_live_`, `rk_live_`), Azure SAS (`sv=20YY-`), AWS session token (`ASIA`).
+- **GCF-008** *(Medium)*: All memory dual-write routing decisions in `hooks.ts` now use `isVerifiedGuardSession()` (registry check) instead of `isGuardSessionKey()` (pattern-only, spoofable).
+- **GCF-024** *(Medium)*: `withConfigWriteLock()` Promise-chaining mutex moved to `live-config.ts` and exported. All `guardclaw.json` read-modify-write operations in both `hooks.ts` and `privacy-proxy.ts` are now serialized through it.
+- **GCF-019** *(Medium)*: DeBERTa service host validated to loopback-only in `injection_classifier.py`. `--host 127.0.0.1` / `GUARDCLAW_DEBERTA_HOST=127.0.0.1` added to generated launchd plist and systemd unit in `install.sh`.
+- **GCF-025** *(Medium)*: `syncAllMemoryToClean()` in `memory-isolation.ts` acquires an O_EXCL advisory lock (`~/.openclaw/memory-sync.lock`) before running. Concurrent callers skip the sync cycle and log a warning rather than racing.
+
+**Group 3 — Low**
+
+- **GCF-005** *(Low)*: Extended `isDangerousRegex()` in `rules.ts` to catch additional catastrophic-backtracking patterns: unbounded dot-repeat `(.*)+`, empty string alternation `(a|)+`, and non-capturing group alternation `(?:a|b*)+`.
+- **GCF-011** *(Low)*: Injection log preview strings now pass through `redactSensitiveInfo()` before being written to the log file in both `appendInjectionLog` (hooks.ts) and `appendProxyInjectionLog` (privacy-proxy.ts).
+- **GCF-013** *(Low)*: `MIN_TAINT_LENGTH` lowered from 8 to 4 in `taint-store.ts`, consistent with `secret-manager.ts`. Accepts marginally higher false-positive risk to prevent sub-8-char secrets (e.g. short API tokens, PINs) from bypassing taint tracking.
+- **GCF-023** *(Medium)*: `npm audit --audit-level=high` added after `npm ci` in `install.sh`. Install fails if any high or critical vulnerabilities are found.
+- **GCF-026** *(Low)*: Memory write Promises are now tracked per session in `_pendingMemoryWrites`. `session_end` and `before_reset` call `awaitPendingMemoryWrites()` before proceeding, ensuring no memory writes are lost on clean session teardown.
+
+---
+
 ## [1.6.0] — 2026-03-31
 
 ### Added

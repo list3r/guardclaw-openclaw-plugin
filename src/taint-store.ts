@@ -17,8 +17,13 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/** Values shorter than this are too common to track safely (false-positive risk). */
-const MIN_TAINT_LENGTH = 8;
+/**
+ * Values shorter than this are too common to track safely (false-positive risk).
+ * Set to 4 to match secret-manager.ts MIN_SECRET_LENGTH (GCF-013).
+ * Accepts slightly higher false-positive risk from common short values in
+ * exchange for consistent coverage with the Keychain tracking path.
+ */
+const MIN_TAINT_LENGTH = 4;
 
 /** Hard cap on tainted values per session to prevent memory exhaustion. */
 const MAX_TAINTS_PER_SESSION = 200;
@@ -37,25 +42,32 @@ type PendingTaint = {
 
 // ── Per-session state ─────────────────────────────────────────────────────────
 
-/** sessionKey → Set of tainted literal values. */
+/** sessionKey → Set of tainted literal values (insertion-ordered for LRU eviction). */
 const _taints = new Map<string, Set<string>>();
 
 /** sessionKey → value → "S2|S3:source" label (for stats / debug). */
 const _sources = new Map<string, Map<string, string>>();
 
 /**
- * Pending taint registrations set in before_tool_call and consumed in
+ * GCF-014: Pending taint registrations set in before_tool_call and consumed in
  * tool_result_persist so the tool result content can be registered.
+ * Changed from single-slot Map<string, PendingTaint> to per-session queue
+ * Map<string, PendingTaint[]> so concurrent tool calls each get tainted.
+ * markPendingTaint pushes; consumePendingTaint shifts (FIFO).
  */
-const _pending = new Map<string, PendingTaint>();
+const _pending = new Map<string, PendingTaint[]>();
 
 // ── Registration ──────────────────────────────────────────────────────────────
 
 /**
  * Register a literal value as tainted for this session.
  *
- * Silently ignores values that are too short, empty, or would exceed the per-session
- * cap. Deduplicates automatically — registering the same value twice is a no-op.
+ * GCF-012: When the per-session cap is hit, uses LRU eviction instead of
+ * silent drop. Secrets-mount taints (source starts with "secrets-file:", higher-trust)
+ * are never evicted; only S2/S3 tool-result taints are candidates for eviction.
+ * Logs a WARN when eviction occurs so operators are alerted.
+ *
+ * Deduplicates automatically — registering the same value twice is a no-op.
  */
 export function registerTaint(
   sessionKey: string,
@@ -72,8 +84,33 @@ export function registerTaint(
     set = new Set();
     _taints.set(sessionKey, set);
   }
-  if (set.size >= MAX_TAINTS_PER_SESSION) return;
+
   if (set.has(trimmed)) return; // dedup
+
+  if (set.size >= MAX_TAINTS_PER_SESSION) {
+    // GCF-012: LRU eviction — find oldest evictable (non-secrets-mount) entry
+    const srcMap = _sources.get(sessionKey);
+    let evicted = false;
+    if (srcMap) {
+      for (const [candidate, label] of srcMap) {
+        if (!label.includes(":secrets-file:")) {
+          set.delete(candidate);
+          srcMap.delete(candidate);
+          evicted = true;
+          console.warn(
+            `[GuardClaw:taint] Cap hit (session=${sessionKey}): LRU-evicted oldest evictable taint to make room (cap=${MAX_TAINTS_PER_SESSION})`,
+          );
+          break;
+        }
+      }
+    }
+    if (!evicted) {
+      console.warn(
+        `[GuardClaw:taint] Cap hit (session=${sessionKey}): all ${MAX_TAINTS_PER_SESSION} slots are secrets-mount protected — dropping new entry from source="${source}"`,
+      );
+      return;
+    }
+  }
 
   set.add(trimmed);
 
@@ -131,24 +168,33 @@ export function hasTaints(sessionKey: string): boolean {
  * Mark that the NEXT tool result for this session should have its content
  * registered as tainted values. Called from before_tool_call when a
  * secrets-mount path is detected in the tool parameters.
+ *
+ * GCF-014: Pushes onto a per-session queue (instead of overwriting a single slot)
+ * so concurrent secrets-mount reads each get their own pending-taint entry.
  */
 export function markPendingTaint(
   sessionKey: string,
   source: TaintSource,
   sensitivity: TaintSensitivity,
 ): void {
-  _pending.set(sessionKey, { source, sensitivity });
+  const queue = _pending.get(sessionKey) ?? [];
+  queue.push({ source, sensitivity });
+  _pending.set(sessionKey, queue);
 }
 
 /**
- * Check and clear the pending taint flag for a session.
- * Returns the pending taint descriptor if one was set; null otherwise.
- * Must be called in tool_result_persist to consume the flag before registering values.
+ * Check and clear the oldest pending taint entry for a session (FIFO).
+ * Returns the pending taint descriptor if one was queued; null otherwise.
+ * Must be called in tool_result_persist to consume the entry before registering values.
+ *
+ * GCF-014: Shifts from the queue so concurrent tool calls are served in order.
  */
 export function consumePendingTaint(sessionKey: string): PendingTaint | null {
-  const val = _pending.get(sessionKey) ?? null;
-  _pending.delete(sessionKey);
-  return val;
+  const queue = _pending.get(sessionKey);
+  if (!queue || queue.length === 0) return null;
+  const entry = queue.shift()!;
+  if (queue.length === 0) _pending.delete(sessionKey);
+  return entry;
 }
 
 // ── Session lifecycle ─────────────────────────────────────────────────────────

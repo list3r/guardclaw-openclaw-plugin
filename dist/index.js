@@ -4,6 +4,7 @@ import {
   SECURITY_CHANNEL,
   TokenStatsCollector,
   addCorrection,
+  appendToRollingBuffer,
   callChatCompletion,
   clearActiveLocalRouting,
   clearLastSenderId,
@@ -46,6 +47,8 @@ import {
   recordInjectionAttempt,
   resetTurnLevel,
   runDebertaClassifier,
+  runHeuristics,
+  sanitiseContent,
   setActiveLocalRouting,
   setGlobalCollector,
   setLastSenderId,
@@ -55,8 +58,9 @@ import {
   updateLiveConfig,
   updateLiveInjectionConfig,
   watchConfigFile,
+  withConfigWriteLock,
   writePrompt
-} from "./chunk-RLCI4KU5.js";
+} from "./chunk-IGI2BZUC.js";
 import {
   fireWebhooks
 } from "./chunk-DLV362LL.js";
@@ -699,11 +703,42 @@ ${newLines.join("\n")}
     return synced;
   }
   /**
-   * Sync everything: long-term memory + all daily files
+   * Sync everything: long-term memory + all daily files.
+   *
+   * GCF-025: Uses an O_EXCL advisory lock file (~/.openclaw/memory-sync.lock)
+   * to prevent concurrent syncAllMemoryToClean() calls (e.g. from two sessions
+   * both reaching session_end at the same time) from producing TOCTOU races on
+   * MEMORY.md / MEMORY-FULL.md. Non-blocking: if the lock is already held,
+   * this call is skipped and a warning is logged rather than waiting.
    */
   async syncAllMemoryToClean(privacyConfig) {
-    await this.syncMemoryToClean(privacyConfig);
-    await this.syncDailyMemoryToClean(privacyConfig);
+    const lockDir = path.join(
+      process.env.HOME || process.env.USERPROFILE || "/tmp",
+      ".openclaw"
+    );
+    const lockPath = path.join(lockDir, "memory-sync.lock");
+    let lockFd = null;
+    try {
+      await fs.promises.mkdir(lockDir, { recursive: true });
+      lockFd = await fs.promises.open(
+        lockPath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+        384
+      );
+    } catch {
+      console.warn("[GuardClaw] Memory sync skipped: lock held by another process");
+      return;
+    }
+    try {
+      await this.syncMemoryToClean(privacyConfig);
+      await this.syncDailyMemoryToClean(privacyConfig);
+    } finally {
+      if (lockFd) {
+        await lockFd.close();
+        await fs.promises.unlink(lockPath).catch(() => {
+        });
+      }
+    }
   }
   /**
    * PII redaction: prefer local model, fall back to regex.
@@ -1066,15 +1101,23 @@ function getDefaultSessionManager(baseDir) {
 }
 
 // src/rules.ts
+function normalizeForDetection(text) {
+  const nfkd = text.normalize("NFKD").replace(new RegExp("\\p{Mn}", "gu"), "");
+  return nfkd.replace(/@/g, "a").replace(/0/g, "o").replace(/3/g, "e").replace(/1/g, "i").replace(/\$/g, "s").replace(/5/g, "s");
+}
 var PATTERN_CACHE_MAX = 500;
 var PATTERN_MAX_LENGTH = 500;
 var patternCache = /* @__PURE__ */ new Map();
 function isDangerousRegex(pattern) {
-  if (/\([^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
+  if (/\((?:\?:)?[^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
   if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern)) return true;
   if (/\([^)]*\{\d+,\d*\}[^)]*\)[+*?{]/.test(pattern)) return true;
   if (/\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   if (/\([^)]*[+*?][^)]*\|[^)]*[+*?][^)]*\)[+*?{]/.test(pattern)) return true;
+  if (/\(\.[*+]\)[+*?{]/.test(pattern)) return true;
+  if (/\([^)]*\|\)[+*{]/.test(pattern)) return true;
+  if (/\(\|[^)]*\)[+*{]/.test(pattern)) return true;
+  if (/\(\?:[^)]*\|[^)]*[*+][^)]*\)[+*?{]/.test(pattern)) return true;
   return false;
 }
 function getOrCompileRegex(pattern) {
@@ -1191,9 +1234,10 @@ function getKeywordRegex(keyword) {
   return re;
 }
 function checkKeywords(text, config) {
+  const normalized = normalizeForDetection(text);
   const s3Keywords = config.rules?.keywords?.S3 ?? [];
   for (const keyword of s3Keywords) {
-    if (getKeywordRegex(keyword).test(text)) {
+    if (getKeywordRegex(keyword).test(normalized)) {
       return {
         level: "S3",
         reason: `S3 keyword detected: ${keyword}`
@@ -1202,7 +1246,7 @@ function checkKeywords(text, config) {
   }
   const s2Keywords = config.rules?.keywords?.S2 ?? [];
   for (const keyword of s2Keywords) {
-    if (getKeywordRegex(keyword).test(text)) {
+    if (getKeywordRegex(keyword).test(normalized)) {
       return {
         level: "S2",
         reason: `S2 keyword detected: ${keyword}`
@@ -1212,10 +1256,11 @@ function checkKeywords(text, config) {
   return { level: "S1" };
 }
 function checkPatterns(text, config) {
+  const normalized = normalizeForDetection(text);
   const s3Patterns = config.rules?.patterns?.S3 ?? [];
   for (const pattern of s3Patterns) {
     const regex = getOrCompileRegex(pattern);
-    if (regex && regex.test(text)) {
+    if (regex && regex.test(normalized)) {
       return {
         level: "S3",
         reason: `S3 pattern matched: ${pattern}`
@@ -1225,7 +1270,7 @@ function checkPatterns(text, config) {
   const s2Patterns = config.rules?.patterns?.S2 ?? [];
   for (const pattern of s2Patterns) {
     const regex = getOrCompileRegex(pattern);
-    if (regex && regex.test(text)) {
+    if (regex && regex.test(normalized)) {
       return {
         level: "S2",
         reason: `S2 pattern matched: ${pattern}`
@@ -1804,13 +1849,14 @@ async function startPrivacyProxy(port, logger) {
                 log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
                 const newBanned = [...injectionCfg.banned_senders ?? [], proxySenderId];
                 updateLiveInjectionConfig({ banned_senders: newBanned });
-                fs3.promises.readFile(GUARDCLAW_JSON_PATH, "utf8").then((raw) => {
+                withConfigWriteLock(async () => {
+                  const raw = await fs3.promises.readFile(GUARDCLAW_JSON_PATH, "utf8");
                   const cfg = JSON.parse(raw);
                   if (!cfg.privacy) cfg.privacy = {};
                   const privacy = cfg.privacy;
                   if (!privacy.injection) privacy.injection = {};
                   privacy.injection.banned_senders = newBanned;
-                  return fs3.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+                  await fs3.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
                 }).catch((err) => {
                   log.warn(`[GuardClaw S0] Failed to persist ban for ${proxySenderId}: ${String(err)}`);
                 }).finally(() => {
@@ -3005,7 +3051,7 @@ function _notify(event, details, webhooks) {
 }
 
 // src/taint-store.ts
-var MIN_TAINT_LENGTH = 8;
+var MIN_TAINT_LENGTH = 4;
 var MAX_TAINTS_PER_SESSION = 200;
 var _taints = /* @__PURE__ */ new Map();
 var _sources = /* @__PURE__ */ new Map();
@@ -3018,8 +3064,30 @@ function registerTaint(sessionKey, value, source, sensitivity, minLength = MIN_T
     set = /* @__PURE__ */ new Set();
     _taints.set(sessionKey, set);
   }
-  if (set.size >= MAX_TAINTS_PER_SESSION) return;
   if (set.has(trimmed)) return;
+  if (set.size >= MAX_TAINTS_PER_SESSION) {
+    const srcMap2 = _sources.get(sessionKey);
+    let evicted = false;
+    if (srcMap2) {
+      for (const [candidate, label] of srcMap2) {
+        if (!label.includes(":secrets-file:")) {
+          set.delete(candidate);
+          srcMap2.delete(candidate);
+          evicted = true;
+          console.warn(
+            `[GuardClaw:taint] Cap hit (session=${sessionKey}): LRU-evicted oldest evictable taint to make room (cap=${MAX_TAINTS_PER_SESSION})`
+          );
+          break;
+        }
+      }
+    }
+    if (!evicted) {
+      console.warn(
+        `[GuardClaw:taint] Cap hit (session=${sessionKey}): all ${MAX_TAINTS_PER_SESSION} slots are secrets-mount protected \u2014 dropping new entry from source="${source}"`
+      );
+      return;
+    }
+  }
   set.add(trimmed);
   let srcMap = _sources.get(sessionKey);
   if (!srcMap) {
@@ -3029,12 +3097,16 @@ function registerTaint(sessionKey, value, source, sensitivity, minLength = MIN_T
   srcMap.set(trimmed, `${sensitivity}:${source}`);
 }
 function markPendingTaint(sessionKey, source, sensitivity) {
-  _pending.set(sessionKey, { source, sensitivity });
+  const queue = _pending.get(sessionKey) ?? [];
+  queue.push({ source, sensitivity });
+  _pending.set(sessionKey, queue);
 }
 function consumePendingTaint(sessionKey) {
-  const val = _pending.get(sessionKey) ?? null;
-  _pending.delete(sessionKey);
-  return val;
+  const queue = _pending.get(sessionKey);
+  if (!queue || queue.length === 0) return null;
+  const entry = queue.shift();
+  if (queue.length === 0) _pending.delete(sessionKey);
+  return entry;
 }
 function extractTaintValues(content, minLength = MIN_TAINT_LENGTH) {
   const collected = /* @__PURE__ */ new Set();
@@ -3098,21 +3170,31 @@ function _popSynthesisPending(sessionKey, toolName) {
   if (queue.length === 0) _synthesisPendingQueue.delete(sessionKey);
   return entry.synthetic;
 }
-var _injectionPendingQueue = /* @__PURE__ */ new Map();
-function _popInjectionPending(sessionKey, toolName) {
-  const queue = _injectionPendingQueue.get(sessionKey);
-  if (!queue || queue.length === 0) return void 0;
-  const idx = queue.findIndex((e) => e.toolName === toolName);
-  if (idx === -1) return void 0;
-  const [entry] = queue.splice(idx, 1);
-  if (queue.length === 0) _injectionPendingQueue.delete(sessionKey);
-  return entry;
-}
 var _OPENCLAW_DIR2 = join8(process.env.HOME ?? "/tmp", ".openclaw");
 var GUARDCLAW_STATS_PATH = join8(_OPENCLAW_DIR2, "guardclaw-stats.json");
 var GUARDCLAW_INJECTIONS_PATH2 = join8(_OPENCLAW_DIR2, "guardclaw-injections.json");
 var GUARDCLAW_PENDING_CONFIG_PATH = join8(_OPENCLAW_DIR2, "workspace", "dashboard", "guardclaw-pending-config.json");
 var GUARDCLAW_JSON_PATH2 = join8(_OPENCLAW_DIR2, "guardclaw.json");
+var _pendingMemoryWrites = /* @__PURE__ */ new Map();
+function trackMemoryWrite(sessionKey, p) {
+  let set = _pendingMemoryWrites.get(sessionKey);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    _pendingMemoryWrites.set(sessionKey, set);
+  }
+  set.add(p);
+  p.finally(() => {
+    set?.delete(p);
+  }).catch(() => {
+  });
+}
+async function awaitPendingMemoryWrites(sessionKey, logger) {
+  const set = _pendingMemoryWrites.get(sessionKey);
+  if (!set || set.size === 0) return;
+  logger.warn(`[GuardClaw] Awaiting ${set.size} pending memory write(s) before session lifecycle event (session=${sessionKey})`);
+  await Promise.allSettled([...set]);
+  _pendingMemoryWrites.delete(sessionKey);
+}
 async function appendInjectionLog(entry) {
   let entries = [];
   try {
@@ -3341,7 +3423,8 @@ function registerHooks(api) {
                   score: injResult.score,
                   patterns: injResult.matches,
                   source: "user_message",
-                  preview: msgStr.slice(0, 80)
+                  // GCF-011: Redact before logging — false-positive blocks may contain real secrets.
+                  preview: redactSensitiveInfo(msgStr.slice(0, 80), getLiveConfig().redaction)
                 });
                 void updateS0Stats("block");
                 if (senderId) {
@@ -3352,17 +3435,18 @@ function registerHooks(api) {
                     api.logger.warn(`[GuardClaw S0] AUTO-BANNING senderId=${senderId} after ${attempts} injection attempts`);
                     const newBanned = [...injectionCfg.banned_senders ?? [], senderId];
                     updateLiveInjectionConfig({ banned_senders: newBanned });
-                    fs4.promises.readFile(GUARDCLAW_JSON_PATH2, "utf8").then((raw) => {
+                    withConfigWriteLock(async () => {
+                      const raw = await fs4.promises.readFile(GUARDCLAW_JSON_PATH2, "utf8");
                       const cfg = JSON.parse(raw);
                       if (!cfg.privacy) cfg.privacy = {};
                       const privacy = cfg.privacy;
                       if (!privacy.injection) privacy.injection = {};
                       privacy.injection.banned_senders = newBanned;
-                      return fs4.promises.writeFile(GUARDCLAW_JSON_PATH2, JSON.stringify(cfg, null, 2));
+                      await fs4.promises.writeFile(GUARDCLAW_JSON_PATH2, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 384 });
                     }).catch((err) => {
                       api.logger.warn(`[GuardClaw S0] Failed to persist ban for ${senderId}: ${String(err)}`);
                     }).finally(() => {
-                      pendingBans.delete(senderId);
+                      pendingBans.delete(senderId ?? "");
                     });
                   }
                 }
@@ -3385,7 +3469,8 @@ function registerHooks(api) {
                   score: injResult.score,
                   patterns: injResult.matches,
                   source: "user_message",
-                  preview: msgStr.slice(0, 80)
+                  // GCF-011: Redact before logging.
+                  preview: redactSensitiveInfo(msgStr.slice(0, 80), getLiveConfig().redaction)
                 });
                 void updateS0Stats("sanitise");
                 recordDetection(sessionKey, "S0", "onUserMessage", `Injection sanitised (score ${Math.round(injResult.score)})`);
@@ -3798,13 +3883,33 @@ ${secretResult.result}`
             return { block: true, blockReason: `GuardClaw: access to full history/memory is restricted for cloud models (${p})` };
           }
         }
+        const s3Paths = privacyConfig.rules?.tools?.S3?.paths ?? [];
+        for (const p of pathValues) {
+          if (isSecretsMountPath(p)) {
+            api.logger.warn(
+              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": secrets-mount path "${p}" \u2014 would expose secrets to cloud model (session=${sessionKey})`
+            );
+            return {
+              block: true,
+              blockReason: `GuardClaw: secrets-mount paths are not accessible from cloud-model sessions \u2014 use a guard session for sensitive file access (${p})`
+            };
+          }
+          if (s3Paths.length > 0 && matchesPathPattern(p, s3Paths)) {
+            api.logger.warn(
+              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": S3 path "${p}" \u2014 would expose sensitive data to cloud model (session=${sessionKey})`
+            );
+            return {
+              block: true,
+              blockReason: `GuardClaw: S3 path access is blocked for cloud-model sessions \u2014 use a guard session for sensitive file operations (${p})`
+            };
+          }
+        }
         const _taintBtcCfg = privacyConfig.taintTracking;
         if (_taintBtcCfg?.enabled !== false) {
           for (const p of pathValues) {
             if (isSecretsMountPath(p)) {
               markPendingTaint(sessionKey, `secrets-file:${p}`, "S3");
               api.logger.info(`[GuardClaw:taint] Secrets-mount read detected \u2014 result will be taint-tracked (path=${p}, session=${sessionKey})`);
-              break;
             }
           }
         }
@@ -3955,24 +4060,9 @@ ${secretResult.result}`
       else if (/read.?file|file.?read/i.test(toolName)) source = "file";
       const injResult = await detectInjection(textContent, source, injectionCfg);
       if (injResult.action === "block" || injResult.action === "sanitise") {
-        const queue = _injectionPendingQueue.get(sessionKey) ?? [];
-        queue.push({
-          toolName,
-          action: injResult.action,
-          sanitised: injResult.sanitised,
-          reason: injResult.blocked_reason ?? `Injection detected (score ${injResult.score})`
-        });
-        _injectionPendingQueue.set(sessionKey, queue);
         api.logger.warn(
-          `[GuardClaw S0] Tool result injection ${injResult.action}: tool=${toolName} score=${injResult.score} patterns=${injResult.matches.join(",")} session=${sessionKey}`
+          `[GuardClaw S0] DeBERTa audit: tool result injection confirmed: tool=${toolName} score=${injResult.score} patterns=${injResult.matches.join(",")} session=${sessionKey}`
         );
-        recordDetection(
-          sessionKey,
-          "S0",
-          "onToolCallExecuted",
-          injResult.blocked_reason ?? `Tool result injection (score ${injResult.score})`
-        );
-        void updateS0Stats(injResult.action);
       }
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in after_tool_call injection check: ${String(err)}`);
@@ -3989,9 +4079,10 @@ ${secretResult.result}`
         if (writePath && isMemoryWritePath(writePath)) {
           const workspaceDir = _cachedWorkspaceDir ?? process.cwd();
           const privacyConfig2 = getLiveConfig();
-          syncMemoryWrite(writePath, workspaceDir, privacyConfig2, api.logger, isGuardSessionKey(sessionKey)).catch((err) => {
+          const writePromise = syncMemoryWrite(writePath, workspaceDir, privacyConfig2, api.logger, isVerifiedGuardSession(sessionKey)).catch((err) => {
             api.logger.warn(`[GuardClaw] Memory dual-write sync failed: ${String(err)}`);
           });
+          trackMemoryWrite(sessionKey, writePromise);
         }
       }
       if (ctx.toolName === "memory_search") {
@@ -4057,23 +4148,69 @@ ${secretResult.result}`
         return;
       }
       if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
-      const injPending = _popInjectionPending(sessionKey, ctx.toolName ?? "");
-      if (injPending) {
-        if (injPending.action === "block") {
-          api.logger.warn(`[GuardClaw S0] Tool result blocked (injection): tool=${ctx.toolName ?? "unknown"}`);
-          const blocked = replaceMessageText(
-            msg,
-            `[GuardClaw S0: Tool result blocked \u2014 prompt injection detected. Reason: ${injPending.reason ?? "injection detected"}]`
-          );
-          if (blocked) return { message: blocked };
-        } else if (injPending.action === "sanitise" && injPending.sanitised !== void 0) {
-          api.logger.info(`[GuardClaw S0] Tool result sanitised (injection): tool=${ctx.toolName ?? "unknown"}`);
-          const sanitised = replaceMessageText(msg, injPending.sanitised);
-          if (sanitised) return { message: sanitised };
-        }
-      }
       const textContent = extractMessageText(msg);
       if (!textContent || textContent.length < 10) return;
+      {
+        const rollingBuf = appendToRollingBuffer(sessionKey, textContent);
+        if (rollingBuf.length >= 10) {
+          const rollingPrivCfg = getLiveConfig();
+          const rollingCheck = detectByRules(
+            { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: rollingBuf, sessionKey },
+            rollingPrivCfg
+          );
+          if (rollingCheck.level === "S2" || rollingCheck.level === "S3") {
+            api.logger.warn(
+              `[GuardClaw:rolling] Cross-turn sensitive content detected level=${rollingCheck.level} session=${sessionKey} reason=${rollingCheck.reason ?? ""}`
+            );
+            markSessionAsPrivate(sessionKey, rollingCheck.level);
+            recordDetection(sessionKey, rollingCheck.level, "onToolCallExecuted", `[rolling-buffer] ${rollingCheck.reason ?? ""}`);
+          }
+        }
+      }
+      const injectionCfgTrp = getLiveInjectionConfig();
+      if (injectionCfgTrp.enabled !== false) {
+        const toolNameTrp = ctx.toolName ?? "";
+        let sourceTrp = "api_response";
+        if (/web.?fetch|http.?fetch/i.test(toolNameTrp)) sourceTrp = "web_fetch";
+        else if (/read.?file|file.?read/i.test(toolNameTrp)) sourceTrp = "file";
+        if (!injectionCfgTrp.exempt_sources?.includes(sourceTrp)) {
+          const blockThresholdTrp = injectionCfgTrp.block_threshold ?? 70;
+          const sanitiseThresholdTrp = injectionCfgTrp.sanitise_threshold ?? 30;
+          const heuristic = runHeuristics(textContent);
+          if (heuristic.score >= sanitiseThresholdTrp) {
+            const injAction = heuristic.score >= blockThresholdTrp ? "block" : "sanitise";
+            const injReason = `Injection detected (heuristics score ${heuristic.score}): ${heuristic.matches.join(", ")}`;
+            void appendInjectionLog({
+              ts: (/* @__PURE__ */ new Date()).toISOString(),
+              session: sessionKey,
+              action: injAction,
+              score: heuristic.score,
+              patterns: heuristic.matches,
+              source: sourceTrp,
+              preview: redactSensitiveInfo(textContent.slice(0, 80), getLiveConfig().redaction)
+            });
+            void updateS0Stats(injAction);
+            recordDetection(sessionKey, "S0", "onToolCallExecuted", injReason);
+            if (injAction === "block") {
+              api.logger.warn(
+                `[GuardClaw S0] Tool result blocked (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey}`
+              );
+              const blocked = replaceMessageText(
+                msg,
+                `[GuardClaw S0: Tool result blocked \u2014 prompt injection detected. Score: ${heuristic.score}, patterns: ${heuristic.matches.join(", ")}]`
+              );
+              if (blocked) return { message: blocked };
+            } else {
+              api.logger.info(
+                `[GuardClaw S0] Tool result sanitised (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey}`
+              );
+              const sanitisedText = sanitiseContent(textContent, heuristic.matchedPatterns);
+              const sanitised = replaceMessageText(msg, sanitisedText);
+              if (sanitised) return { message: sanitised };
+            }
+          }
+        }
+      }
       const privacyConfig = getLiveConfig();
       const wasPrivateBefore = isSessionMarkedPrivate(sessionKey);
       const _taintCfg = privacyConfig.taintTracking;
@@ -4330,6 +4467,7 @@ ${secretResult.result}`
     try {
       const sessionKey = event.sessionKey ?? ctx.sessionKey;
       if (!sessionKey) return;
+      await awaitPendingMemoryWrites(sessionKey, api.logger);
       const wasPrivate = isSessionMarkedPrivate(sessionKey);
       api.logger.info(`[GuardClaw] ${wasPrivate ? "private" : "cloud"} session ${sessionKey} ended. Syncing memory\u2026`);
       const memMgr = getDefaultMemoryManager();
@@ -4401,6 +4539,8 @@ ${secretResult.result}`
   api.on("before_reset", async (_event, ctx) => {
     try {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
+      const sessionKey = ctx.sessionKey ?? "";
+      if (sessionKey) await awaitPendingMemoryWrites(sessionKey, api.logger);
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
       await memMgr.syncAllMemoryToClean(privacyConfig);
@@ -4587,7 +4727,25 @@ var GUARD_BASH_NETWORK_PATTERNS = [
   { pattern: /\/dev\/tcp\//, tool: "/dev/tcp" },
   { pattern: /\bpython[23]?\b[\s\S]*?-c[\s\S]*?socket/i, tool: "python socket" },
   { pattern: /\bnode\b[\s\S]*?-e[\s\S]*?(?:http|https|net|tls)\b/i, tool: "node net" },
-  { pattern: /\bperl\b[\s\S]*?-e[\s\S]*?socket/i, tool: "perl socket" }
+  { pattern: /\bperl\b[\s\S]*?-e[\s\S]*?socket/i, tool: "perl socket" },
+  // GCF-015: Cloud CLI tools — each can exfiltrate files to attacker-controlled storage
+  { pattern: /\baws\s/i, tool: "aws-cli" },
+  { pattern: /\bgsutil\s/i, tool: "gsutil" },
+  { pattern: /\baz\s/i, tool: "azure-cli" },
+  { pattern: /\bdocker\s+push\b/i, tool: "docker push" },
+  // git push with a remote URL (not just 'git push origin' — but catch URL forms)
+  { pattern: /\bgit\s+(?:push|remote\s+add)\s+(?:\S+\s+)?https?:\/\//i, tool: "git push (url)" },
+  // Scripting language one-liners that make network calls
+  { pattern: /\bruby\s+-e\b/i, tool: "ruby -e" },
+  { pattern: /\bphp\s+-r\b/i, tool: "php -r" },
+  // DNS exfiltration via nslookup/dig
+  { pattern: /\bnslookup\b/i, tool: "nslookup" },
+  { pattern: /\bdig\s/i, tool: "dig" },
+  // GCF-016: Obfuscation primitives — block entirely to prevent bypass of all above patterns
+  { pattern: /\beval\b/i, tool: "eval (obfuscation)" },
+  { pattern: /\bexec\b/i, tool: "exec (obfuscation)" },
+  { pattern: /\bsource\b/i, tool: "source (obfuscation)" },
+  { pattern: /\b\.\s+[^\s]/, tool: "source-dot (obfuscation)" }
 ];
 function isGuardNetworkCommand(command) {
   for (const { pattern, tool } of GUARD_BASH_NETWORK_PATTERNS) {

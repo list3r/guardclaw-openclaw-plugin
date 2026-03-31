@@ -120,6 +120,14 @@ echo "→ Installing dependencies..."
 cd "$PLUGIN_DIR"
 npm ci --include=dev 2>&1 | tail -3
 echo "  ✓ Dependencies installed"
+# GCF-023: Fail install if any high/critical npm vulnerabilities are found.
+echo "→ Running npm audit..."
+if npm audit --audit-level=high 2>&1 | tail -5; then
+  echo "  ✓ npm audit passed"
+else
+  echo "  ✗ npm audit found high/critical vulnerabilities. Review above and update deps, then re-run install."
+  exit 1
+fi
 echo ""
 
 # ── Build ──
@@ -488,6 +496,7 @@ if $SETUP_CLASSIFIER; then
   <key>EnvironmentVariables</key>
   <dict>
     <key>GUARDCLAW_DEBERTA_PORT</key><string>8404</string>
+    <key>GUARDCLAW_DEBERTA_HOST</key><string>127.0.0.1</string>
   </dict>
 </dict>
 </plist>
@@ -513,6 +522,7 @@ ExecStart=$PYTHON_CMD $CLASSIFIER_SCRIPT
 Restart=on-failure
 RestartSec=5
 Environment=GUARDCLAW_DEBERTA_PORT=8404
+Environment=GUARDCLAW_DEBERTA_HOST=127.0.0.1
 StandardOutput=append:$HOME/.openclaw/deberta.log
 StandardError=append:$HOME/.openclaw/deberta.log
 

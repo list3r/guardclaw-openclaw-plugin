@@ -1,6 +1,6 @@
 import {
   detectByLocalModel
-} from "./chunk-RLCI4KU5.js";
+} from "./chunk-IGI2BZUC.js";
 
 // src/llm-detect-worker.ts
 import { runAsWorker } from "synckit";

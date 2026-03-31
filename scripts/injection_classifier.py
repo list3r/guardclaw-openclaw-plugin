@@ -57,6 +57,12 @@ except ImportError as e:
 # ── Config ──────────────────────────────────────────────────────────────────
 
 PORT = int(os.environ.get("GUARDCLAW_DEBERTA_PORT", "8404"))
+# GCF-019: Explicitly bind to 127.0.0.1 (loopback only) to prevent the service
+# from being accessible on any other network interface. The env var allows
+# operators to override only to other loopback addresses (e.g. ::1 for IPv6).
+_HOST_ENV = os.environ.get("GUARDCLAW_DEBERTA_HOST", "127.0.0.1")
+# Reject non-loopback hosts for safety
+HOST = _HOST_ENV if _HOST_ENV in ("127.0.0.1", "::1", "localhost") else "127.0.0.1"
 DEFAULT_MODEL = os.environ.get(
     "GUARDCLAW_DEBERTA_MODEL",
     "protectai/deberta-v3-base-prompt-injection-v2",
@@ -75,11 +81,26 @@ _reload_lock = asyncio.Lock()   # prevents concurrent reloads
 _ready = False                  # True once first model is loaded
 
 
+# GCF-022: Pinned revision SHAs for known-good model versions.
+# These are verified commit hashes from HuggingFace Hub; pinning prevents a
+# mutable model update from silently introducing a backdoored classifier.
+# Update after verifying a new release at:
+#   https://huggingface.co/<model_id>/commit/<sha>
+PINNED_REVISIONS: dict = {
+    "protectai/deberta-v3-base-prompt-injection-v2": "e6535ca4ce3ba852083e75ec585d7c8aeb4be4c5",
+    "protectai/deberta-v3-base-prompt-injection":    "main",  # add SHA when pinning
+    "laiyer/deberta-v3-base-prompt-injection":       "main",  # add SHA when pinning
+}
+
+
 def _load_model(model_id: str):
     """Synchronous model load — call from thread pool to avoid blocking event loop."""
-    log.info(f"Loading model: {model_id}")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForSequenceClassification.from_pretrained(model_id)
+    # GCF-022: Use pinned revision so HuggingFace model updates can't silently
+    # swap in a backdoored classifier. Falls back to "main" for unknown models.
+    revision = PINNED_REVISIONS.get(model_id, "main")
+    log.info(f"Loading model: {model_id} (revision={revision})")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    model = AutoModelForSequenceClassification.from_pretrained(model_id, revision=revision)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     log.info(f"Using device: {device}")
     clf = pipeline(
@@ -236,5 +257,5 @@ async def health():
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info(f"Starting GuardClaw DeBERTa service on port {PORT}")
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
+    log.info(f"Starting GuardClaw DeBERTa service on {HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")

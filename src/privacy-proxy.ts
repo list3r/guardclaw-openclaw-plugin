@@ -19,7 +19,7 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import { join } from "node:path";
 import { redactSensitiveInfo } from "./utils.js";
-import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans, withConfigWriteLock } from "./live-config.js";
 import { getProviderForModel } from "./provider.js";
 import { detectInjection } from "./injection/index.js";
 
@@ -665,15 +665,15 @@ export async function startPrivacyProxy(
                 log.warn(`[GuardClaw S0] AUTO-BANNING senderId=${proxySenderId} after ${attempts} proxy injection attempts`);
                 const newBanned = [...(injectionCfg.banned_senders ?? []), proxySenderId];
                 updateLiveInjectionConfig({ banned_senders: newBanned });
-                fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8')
-                  .then((raw) => {
-                    const cfg = JSON.parse(raw) as Record<string, unknown>;
-                    if (!cfg.privacy) cfg.privacy = {};
-                    const privacy = cfg.privacy as Record<string, unknown>;
-                    if (!privacy.injection) privacy.injection = {};
-                    (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
-                    return fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
-                  })
+                withConfigWriteLock(async () => {
+                  const raw = await fs.promises.readFile(GUARDCLAW_JSON_PATH, 'utf8');
+                  const cfg = JSON.parse(raw) as Record<string, unknown>;
+                  if (!cfg.privacy) cfg.privacy = {};
+                  const privacy = cfg.privacy as Record<string, unknown>;
+                  if (!privacy.injection) privacy.injection = {};
+                  (privacy.injection as Record<string, unknown>).banned_senders = newBanned;
+                  await fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2));
+                })
                   .catch((err) => { log.warn(`[GuardClaw S0] Failed to persist ban for ${proxySenderId}: ${String(err)}`); })
                   .finally(() => { pendingBans.delete(proxySenderId); });
               }

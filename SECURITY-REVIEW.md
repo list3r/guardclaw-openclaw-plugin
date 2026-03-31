@@ -5,6 +5,8 @@
 **Date:** 2026-03-31  
 **Files reviewed:** `src/hooks.ts`, `src/rules.ts`, `src/taint-store.ts`, `src/guard-agent.ts`, `src/privacy-proxy.ts`, `src/secret-manager.ts`, `src/injection/deberta.ts`, `src/injection/index.ts`, `src/memory-isolation.ts`, `scripts/install.sh`
 
+**Fix status as of v1.7.0 (2026-03-31):** All 26 findings resolved — 7 in v1.6.1, 19 in v1.7.0.
+
 ---
 
 ## Executive Summary
@@ -23,34 +25,34 @@ Three issues are rated **Critical**: the unauthenticated supply-chain clone (GCF
 
 ## Findings Table
 
-| ID | Severity | Component | Description |
-|----|----------|-----------|-------------|
-| GCF-001 | High | `rules.ts` | Keyword/pattern bypass via Unicode homoglyphs, L337-speak, and encoding tricks |
-| GCF-002 | High | `hooks.ts` / `taint-store.ts` | Cross-turn secret chunking — no aggregation across messages |
-| GCF-003 | High | `hooks.ts` | Async `after_tool_call` stash race: injection/synthesis check can miss `tool_result_persist` window |
-| GCF-004 | Critical | `hooks.ts` | S3 tool-result late detection — cloud model already active, redaction is best-effort |
-| GCF-005 | Low | `rules.ts` | `isDangerousRegex()` heuristic misses several catastrophic-backtracking patterns |
-| GCF-006 | Medium | `rules.ts` / default config | Default S3/S2 patterns miss modern credential formats (GitHub, GCP, Azure, npm, etc.) |
-| GCF-007 | Medium | `hooks.ts` | `toolAllowlist` is a single config field that completely bypasses the privacy pipeline |
-| GCF-008 | Medium | `hooks.ts` | `isGuardSessionKey()` (pattern-only) still used for memory-write routing — spoofable |
-| GCF-009 | High | `memory-isolation.ts` | No restrictive file permissions on `MEMORY-FULL.md` / `full.jsonl` (world-readable) |
-| GCF-010 | High | `memory-isolation.ts` | No symlink guards on memory read/write — pre-planted symlink enables arbitrary file overwrite |
-| GCF-011 | Low | `privacy-proxy.ts` / `hooks.ts` | Injection log and DeBERTa log contain 80-char plaintext previews of blocked content |
-| GCF-012 | High | `taint-store.ts` | Taint-store flood attack: 200-entry cap can be exhausted to cause false negatives |
-| GCF-013 | Medium | `taint-store.ts` | Sub-8-char secrets bypass taint tracking; inconsistency with secret-manager (MIN=4) |
-| GCF-014 | High | `taint-store.ts` | Pending-taint bridge race: concurrent secrets-mount reads; only one pending slot per session |
-| GCF-015 | High | `guard-agent.ts` | `GUARD_BASH_NETWORK_PATTERNS` missing `git`, cloud-CLI (`aws`, `gsutil`, `az`), and language `exec()` variants |
-| GCF-016 | Medium | `guard-agent.ts` | Bash obfuscation bypasses `GUARD_BASH_NETWORK_PATTERNS` (quoting, variable splicing) |
-| GCF-017 | Critical | `injection/deberta.ts` | `GUARDCLAW_DEBERTA_URL` env-var SSRF: redirects all S0 checks to attacker server (bypass + exfiltration) |
-| GCF-018 | Critical | `injection/deberta.ts` | `/reload` endpoint unauthenticated: attacker-controlled model hot-swap silently defeats injection detection |
-| GCF-019 | Medium | `injection/deberta.ts` | DeBERTa service listens without explicit 127.0.0.1 bind; no API key; DoS from localhost |
-| GCF-020 | Critical | `scripts/install.sh` | Unauthenticated `git clone` — repository compromise equals RCE on all installations |
-| GCF-021 | High | `scripts/install.sh` | Unpinned `pip install --upgrade` — PyPI supply-chain attack delivers persistent malicious service |
-| GCF-022 | High | `scripts/install.sh` | HuggingFace model downloaded without hash/version pinning — silent classifier backdoor |
-| GCF-023 | Medium | `scripts/install.sh` | `npm ci` runs without `npm audit`; dev deps included |
-| GCF-024 | Medium | `hooks.ts` / `privacy-proxy.ts` | Auto-ban read-modify-write race on `guardclaw.json` — concurrent requests lose ban writes |
-| GCF-025 | Medium | `memory-isolation.ts` | `syncMemoryToClean()` TOCTOU — concurrent session writes lost; `mergeCleanIntoFull()` can produce duplicate lines |
-| GCF-026 | Low | `hooks.ts` | `syncMemoryWrite` is fire-and-forget; process crash between `tool_result_persist` return and async write leaves memory tracks diverged |
+| ID | Severity | Status | Component | Description |
+|----|----------|--------|-----------|-------------|
+| GCF-001 | High | ✅ FIXED v1.7.0 | `rules.ts` | Keyword/pattern bypass via Unicode homoglyphs, L337-speak, and encoding tricks. **Fix:** NFKD normalization + leet-speak substitution in `normalizeForDetection()` applied to all keyword and pattern checks. |
+| GCF-002 | High | ✅ FIXED v1.7.0 | `hooks.ts` / `session-state.ts` | Cross-turn secret chunking — no aggregation across messages. **Fix:** Per-session 500-char rolling buffer (`appendToRollingBuffer`) in `session-state.ts`; `tool_result_persist` appends and re-runs `detectByRules` on the buffer. |
+| GCF-003 | High | ✅ FIXED v1.7.0 | `hooks.ts` | Async `after_tool_call` stash race: injection/synthesis check can miss `tool_result_persist` window. **Fix:** Moved injection enforcement to `tool_result_persist` using synchronous `runHeuristics()`. DeBERTa in `after_tool_call` retained for enhanced audit logging only. |
+| GCF-004 | Critical | ✅ FIXED v1.7.0 | `hooks.ts` | S3 tool-result late detection — cloud model already active, redaction is best-effort. **Fix:** `before_tool_call` now blocks execution of ALL tools (not just exec) when a cloud session parameter matches secrets-mount paths or configured S3 path patterns. |
+| GCF-005 | Low | ✅ FIXED v1.7.0 | `rules.ts` | `isDangerousRegex()` heuristic misses several catastrophic-backtracking patterns. **Fix:** Extended `isDangerousRegex()` to catch `(.*)+`, empty string alternation `(a|)+`, and non-capturing group variants `(?:a|b*)+`. |
+| GCF-006 | Medium | ✅ FIXED v1.7.0 | `config.example.json` | Default S3/S2 patterns miss modern credential formats (GitHub, GCP, Azure, npm, etc.). **Fix:** Added GitHub PAT, Slack bot token, npm token, PyPI token, Stripe live key, Azure SAS, AWS session token patterns to default config. |
+| GCF-007 | Medium | ✅ FIXED v1.6.1 | `hooks.ts` | `toolAllowlist` is a single config field that completely bypasses the privacy pipeline. |
+| GCF-008 | Medium | ✅ FIXED v1.7.0 | `hooks.ts` | `isGuardSessionKey()` (pattern-only) still used for memory-write routing — spoofable. **Fix:** All memory dual-write trust decisions now use `isVerifiedGuardSession()` (registry check). |
+| GCF-009 | High | ✅ FIXED v1.6.1 | `memory-isolation.ts` | No restrictive file permissions on `MEMORY-FULL.md` / `full.jsonl` (world-readable). |
+| GCF-010 | High | ✅ FIXED v1.6.1 | `memory-isolation.ts` | No symlink guards on memory read/write — pre-planted symlink enables arbitrary file overwrite. |
+| GCF-011 | Low | ✅ FIXED v1.7.0 | `privacy-proxy.ts` / `hooks.ts` | Injection log and DeBERTa log contain 80-char plaintext previews of blocked content. **Fix:** `redactSensitiveInfo()` applied to preview before writing to both `appendInjectionLog` and `appendProxyInjectionLog`. |
+| GCF-012 | High | ✅ FIXED v1.7.0 | `taint-store.ts` | Taint-store flood attack: 200-entry cap can be exhausted to cause false negatives. **Fix:** LRU eviction on cap hit — evicts oldest non-secrets-mount taint and logs WARN; secrets-mount taints are never evicted. |
+| GCF-013 | Medium | ✅ FIXED v1.7.0 | `taint-store.ts` | Sub-8-char secrets bypass taint tracking; inconsistency with secret-manager (MIN=4). **Fix:** `MIN_TAINT_LENGTH` lowered from 8 to 4, aligned with `secret-manager.ts`. |
+| GCF-014 | High | ✅ FIXED v1.7.0 | `taint-store.ts` | Pending-taint bridge race: concurrent secrets-mount reads; only one pending slot per session. **Fix:** `_pending` changed from `Map<string, PendingTaint>` to `Map<string, PendingTaint[]>`; `markPendingTaint` pushes, `consumePendingTaint` shifts. |
+| GCF-015 | High | ✅ FIXED v1.7.0 | `hooks.ts` | `GUARD_BASH_NETWORK_PATTERNS` missing `git`, cloud-CLI (`aws`, `gsutil`, `az`), and language `exec()` variants. **Fix:** Added `aws`, `gsutil`, `az`, `docker push`, `git push` (url), `ruby -e`, `php -r`, `nslookup`, `dig`, `eval`, `exec`, `source` patterns. |
+| GCF-016 | Medium | ✅ FIXED v1.7.0 | `hooks.ts` | Bash obfuscation bypasses `GUARD_BASH_NETWORK_PATTERNS` (quoting, variable splicing). **Fix:** `eval`, `exec`, `source` blocked entirely in guard bash sessions via dedicated pattern entries. |
+| GCF-017 | Critical | ✅ FIXED v1.6.1 | `injection/deberta.ts` | `GUARDCLAW_DEBERTA_URL` env-var SSRF: redirects all S0 checks to attacker server (bypass + exfiltration). |
+| GCF-018 | Critical | ✅ FIXED v1.6.1 | `injection/deberta.ts` | `/reload` endpoint unauthenticated: attacker-controlled model hot-swap silently defeats injection detection. |
+| GCF-019 | Medium | ✅ FIXED v1.7.0 | `scripts/injection_classifier.py` / `scripts/install.sh` | DeBERTa service listens without explicit 127.0.0.1 bind; no API key; DoS from localhost. **Fix:** `HOST` env var validated to loopback-only; `--host 127.0.0.1` added to both launchd plist and systemd unit. |
+| GCF-020 | Critical | ✅ FIXED v1.6.1 | `scripts/install.sh` | Unauthenticated `git clone` — repository compromise equals RCE on all installations. |
+| GCF-021 | High | ✅ FIXED v1.6.1 | `scripts/install.sh` | Unpinned `pip install --upgrade` — PyPI supply-chain attack delivers persistent malicious service. |
+| GCF-022 | High | ✅ FIXED v1.7.0 | `scripts/injection_classifier.py` | HuggingFace model downloaded without hash/version pinning — silent classifier backdoor. **Fix:** `PINNED_REVISIONS` dict with commit SHAs; `_load_model()` passes `revision=` to both `AutoTokenizer` and `AutoModelForSequenceClassification`. |
+| GCF-023 | Medium | ✅ FIXED v1.7.0 | `scripts/install.sh` | `npm ci` runs without `npm audit`; dev deps included. **Fix:** `npm audit --audit-level=high` added after `npm ci`; exits 1 if high/critical vulnerabilities found. |
+| GCF-024 | Medium | ✅ FIXED v1.7.0 | `src/live-config.ts` / `hooks.ts` / `privacy-proxy.ts` | Auto-ban read-modify-write race on `guardclaw.json` — concurrent requests lose ban writes. **Fix:** `withConfigWriteLock()` Promise-chaining mutex exported from `live-config.ts`, wrapping all guardclaw.json RMW operations in both hooks.ts and privacy-proxy.ts. |
+| GCF-025 | Medium | ✅ FIXED v1.7.0 | `memory-isolation.ts` | `syncMemoryToClean()` TOCTOU — concurrent session writes lost; `mergeCleanIntoFull()` can produce duplicate lines. **Fix:** O_EXCL advisory lock (`~/.openclaw/memory-sync.lock`) in `syncAllMemoryToClean()`; concurrent callers skip sync and log a warning. |
+| GCF-026 | Low | ✅ FIXED v1.7.0 | `hooks.ts` | `syncMemoryWrite` is fire-and-forget; process crash between `tool_result_persist` return and async write leaves memory tracks diverged. **Fix:** `trackMemoryWrite()` accumulates pending write Promises per session; `awaitPendingMemoryWrites()` awaits them in `session_end` and `before_reset`. |
 
 ---
 

@@ -709,6 +709,16 @@ function getLiveInjectionConfig() {
 function updateLiveConfig(patch) {
   liveConfig = mergeConfig({ ...liveConfig, ...patch });
 }
+var _configWriteLock = Promise.resolve();
+function withConfigWriteLock(fn) {
+  let resolve2;
+  const gate = new Promise((r) => {
+    resolve2 = r;
+  });
+  const result = _configWriteLock.then(() => fn()).finally(resolve2);
+  _configWriteLock = gate;
+  return result;
+}
 function updateLiveInjectionConfig(patch) {
   liveInjectionConfig = { ...liveInjectionConfig, ...patch };
   updateInjectionConfig(liveInjectionConfig);
@@ -927,6 +937,7 @@ function clearSessionState(sessionKey) {
   sessionStates2.delete(sessionKey);
   activeLocalRouting.delete(sessionKey);
   pendingDetections.delete(sessionKey);
+  rollingBuffers.delete(sessionKey);
 }
 function getAllSessionStates() {
   return new Map(sessionStates2);
@@ -976,6 +987,15 @@ function getLastSenderId(channelId) {
 }
 function clearLastSenderId(channelId) {
   pendingSenderIds.delete(channelId);
+}
+var ROLLING_BUFFER_MAX = 500;
+var rollingBuffers = /* @__PURE__ */ new Map();
+function appendToRollingBuffer(sessionKey, content) {
+  const existing = rollingBuffers.get(sessionKey) ?? "";
+  const combined = existing + content;
+  const trimmed = combined.length > ROLLING_BUFFER_MAX ? combined.slice(combined.length - ROLLING_BUFFER_MAX) : combined;
+  rollingBuffers.set(sessionKey, trimmed);
+  return trimmed;
 }
 function getHigherLevel(a, b) {
   const order = { S1: 1, S2: 2, S3: 3 };
@@ -2263,8 +2283,11 @@ export {
   setLastSenderId,
   getLastSenderId,
   clearLastSenderId,
+  appendToRollingBuffer,
+  runHeuristics,
   triggerDebertaReload,
   runDebertaClassifier,
+  sanitiseContent,
   SECURITY_CHANNEL,
   formatBlockAlert,
   initInjectionConfig,
@@ -2277,6 +2300,7 @@ export {
   getLiveConfig,
   getLiveInjectionConfig,
   updateLiveConfig,
+  withConfigWriteLock,
   updateLiveInjectionConfig,
   TokenStatsCollector,
   setGlobalCollector,
