@@ -56,7 +56,7 @@ import {
   updateLiveInjectionConfig,
   watchConfigFile,
   writePrompt
-} from "./chunk-GMQOMWHV.js";
+} from "./chunk-RLCI4KU5.js";
 import {
   fireWebhooks
 } from "./chunk-DLV362LL.js";
@@ -548,9 +548,9 @@ var MemoryIsolationManager = class {
       const dir = path.dirname(filePath);
       await fs.promises.mkdir(dir, { recursive: true });
       if (options?.append) {
-        await fs.promises.appendFile(filePath, content, "utf-8");
+        await fs.promises.appendFile(filePath, content, { encoding: "utf-8", mode: 384 });
       } else {
-        await fs.promises.writeFile(filePath, content, "utf-8");
+        await fs.promises.writeFile(filePath, content, { encoding: "utf-8", mode: 384 });
       }
     } catch (err) {
       console.error(`[GuardClaw] Failed to write memory (cloud=${isCloudModel}):`, err);
@@ -677,11 +677,11 @@ ${newLines.join("\n")}
           }
           const guardStripped = this.filterGuardContent(fullContent);
           const cleanContent = await this.redactContent(guardStripped, privacyConfig);
-          await fs.promises.writeFile(cleanPath, cleanContent, "utf-8");
+          await fs.promises.writeFile(cleanPath, cleanContent, { encoding: "utf-8", mode: 384 });
           if (cleanContent.includes(GUARD_SECTION_BEGIN)) {
             console.warn(`[GuardClaw] INTEGRITY: GUARD_SECTION_BEGIN in daily clean file ${file} \u2014 re-filtering`);
             const reFiltered = this.filterGuardContent(cleanContent);
-            await fs.promises.writeFile(cleanPath, reFiltered, "utf-8");
+            await fs.promises.writeFile(cleanPath, reFiltered, { encoding: "utf-8", mode: 384 });
           }
           synced++;
         } catch (fileErr) {
@@ -764,7 +764,7 @@ ${newLines.join("\n")}
 ## Cloud Session Additions
 ${newLines.join("\n")}
 `;
-      await fs.promises.writeFile(fullPath, fullContent + appendBlock, "utf-8");
+      await fs.promises.writeFile(fullPath, fullContent + appendBlock, { encoding: "utf-8", mode: 384 });
       console.log(
         `[GuardClaw] Merged ${newLines.length} daily line(s) from clean \u2192 full (${path.basename(fullPath)})`
       );
@@ -932,7 +932,7 @@ var DualSessionManager = class {
           ...message,
           timestamp: message.timestamp ?? Date.now()
         });
-        await fs2.promises.appendFile(historyPath, line + "\n", "utf-8");
+        await fs2.promises.appendFile(historyPath, line + "\n", { encoding: "utf-8", mode: 384 });
       } catch (err) {
         console.error(
           `[GuardClaw] Failed to write to ${historyType} history for ${sessionKey}:`,
@@ -2523,7 +2523,7 @@ async function persistBudget() {
   _data.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
   const tmp = BUDGET_PATH + ".tmp";
   try {
-    await writeFile(tmp, JSON.stringify(_data, null, 2), "utf-8");
+    await writeFile(tmp, JSON.stringify(_data, null, 2), { encoding: "utf-8", mode: 384 });
     await rename(tmp, BUDGET_PATH);
   } catch {
   }
@@ -2648,7 +2648,7 @@ function logToolEvent(sessionKey, toolName, params2, sensitivity) {
     const pending = _pendingEvents.get(sessionKey) ?? [];
     pending.push(event);
     _pendingEvents.set(sessionKey, pending);
-    appendFile(LOG_PATH, JSON.stringify(event) + "\n", "utf-8").catch(() => {
+    appendFile(LOG_PATH, JSON.stringify(event) + "\n", { encoding: "utf-8", mode: 384 }).catch(() => {
     });
   } catch {
   }
@@ -3127,14 +3127,14 @@ async function appendInjectionLog(entry) {
   entries.push(entry);
   if (entries.length > 200) entries = entries.slice(entries.length - 200);
   try {
-    await fs4.promises.writeFile(GUARDCLAW_INJECTIONS_PATH2, JSON.stringify(entries, null, 2));
+    await fs4.promises.writeFile(GUARDCLAW_INJECTIONS_PATH2, JSON.stringify(entries, null, 2), { mode: 384 });
   } catch (err) {
     console.warn(`[GuardClaw S0] Failed to write injection log: ${String(err)}`);
   }
 }
 async function writeStatsAtomic(stats) {
   const tmp = GUARDCLAW_STATS_PATH + ".tmp";
-  await fs4.promises.writeFile(tmp, JSON.stringify(stats, null, 2));
+  await fs4.promises.writeFile(tmp, JSON.stringify(stats, null, 2), { mode: 384 });
   await fs4.promises.rename(tmp, GUARDCLAW_STATS_PATH);
 }
 async function updateS0Stats(action) {
@@ -4707,6 +4707,14 @@ async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, i
     return;
   }
   if (!content.trim()) return;
+  try {
+    const srcStat = await fs4.promises.lstat(absPath);
+    if (srcStat.isSymbolicLink()) {
+      logger.warn(`[GuardClaw] Memory dual-write blocked \u2014 source path is a symlink: ${absPath}`);
+      return;
+    }
+  } catch {
+  }
   let fullRelPath;
   if (rel === "MEMORY.md" || rel === "memory.md") {
     fullRelPath = "MEMORY-FULL.md";
@@ -4717,14 +4725,22 @@ async function syncMemoryWrite(writePath, workspaceDir, privacyConfig, logger, i
   }
   const fullAbsPath = path3.resolve(workspaceDir, fullRelPath);
   await fs4.promises.mkdir(path3.dirname(fullAbsPath), { recursive: true });
+  try {
+    const dstStat = await fs4.promises.lstat(fullAbsPath);
+    if (dstStat.isSymbolicLink()) {
+      logger.warn(`[GuardClaw] Memory dual-write blocked \u2014 destination path is a symlink: ${fullAbsPath}`);
+      return;
+    }
+  } catch {
+  }
   const fullContent = isGuardSession ? `${GUARD_SECTION_BEGIN}
 ${content}
 ${GUARD_SECTION_END}` : content;
-  await fs4.promises.writeFile(fullAbsPath, fullContent, "utf-8");
+  await fs4.promises.writeFile(fullAbsPath, fullContent, { encoding: "utf-8", mode: 384 });
   const memMgr = getDefaultMemoryManager();
   const redacted = await memMgr.redactContentPublic(content, privacyConfig);
   if (redacted !== content) {
-    await fs4.promises.writeFile(absPath, redacted, "utf-8");
+    await fs4.promises.writeFile(absPath, redacted, { encoding: "utf-8", mode: 384 });
     logger.info(`[GuardClaw] Memory dual-write: ${rel} \u2192 ${fullRelPath} (redacted clean copy)`);
   } else {
     logger.info(`[GuardClaw] Memory dual-write: ${rel} \u2192 ${fullRelPath} (no PII found)`);
@@ -5213,7 +5229,7 @@ function readConfig() {
 function writeConfig(config) {
   try {
     mkdirSync(OPENCLAW_DIR, { recursive: true });
-    writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+    writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 384 });
   } catch {
   }
 }
@@ -5265,7 +5281,7 @@ function writeDefaultModel(modelRef) {
     defaults.model = modelRef;
   }
   try {
-    writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+    writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 384 });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: `Failed to write openclaw.json: ${String(err)}` };
@@ -5554,7 +5570,7 @@ async function loadAdvisorData() {
 async function saveAdvisorData() {
   const tmp = SUGGESTIONS_PATH + ".tmp";
   try {
-    await writeFile3(tmp, JSON.stringify(_data2, null, 2), "utf-8");
+    await writeFile3(tmp, JSON.stringify(_data2, null, 2), { encoding: "utf-8", mode: 384 });
     await rename3(tmp, SUGGESTIONS_PATH);
   } catch {
   }
@@ -6049,7 +6065,7 @@ async function acceptSuggestion(id) {
       const fileTiers = fileRouters["token-saver"].options.tiers ?? {};
       fileTiers[tier] = { provider: "openrouter", model: newModel };
       fileRouters["token-saver"].options.tiers = fileTiers;
-      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), { encoding: "utf-8", mode: 384 });
       suggestion.status = "accepted";
       await saveAdvisorData();
       return { ok: true, message: `Token-saver ${tier} tier updated to ${newModel}. Config saved.` };
@@ -6068,7 +6084,7 @@ async function acceptSuggestion(id) {
       const priv = fileCfg.privacy;
       if (!priv.localModel) priv.localModel = {};
       priv.localModel.model = newModel;
-      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), { encoding: "utf-8", mode: 384 });
       suggestion.status = "accepted";
       await saveAdvisorData();
       return {
@@ -6087,7 +6103,7 @@ async function acceptSuggestion(id) {
       }
       if (!fileCfg.injection) fileCfg.injection = {};
       fileCfg.injection.deberta_model = newModel;
-      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      await writeFile3(configPath, JSON.stringify(fileCfg, null, 2), { encoding: "utf-8", mode: 384 });
       suggestion.status = "accepted";
       await saveAdvisorData();
       triggerDebertaReload(newModel).then((r) => {
@@ -6160,7 +6176,7 @@ function saveGuardClawConfig(privacy) {
     } catch {
     }
     const updated = { ...existing, privacy };
-    writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(updated, null, 2), "utf-8");
+    writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(updated, null, 2), { encoding: "utf-8", mode: 384 });
   } catch {
   }
 }
@@ -6600,7 +6616,7 @@ async function statsHttpHandler(req, res) {
       const priv = cfg.privacy;
       if (!priv.injection) priv.injection = {};
       priv.injection.banned_senders = newBanned;
-      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), "utf-8");
+      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 384 });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);
@@ -6636,7 +6652,7 @@ async function statsHttpHandler(req, res) {
       const priv = cfg.privacy;
       if (!priv.injection) priv.injection = {};
       priv.injection.exempt_senders = newExempt;
-      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), "utf-8");
+      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 384 });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);
@@ -6661,7 +6677,7 @@ async function statsHttpHandler(req, res) {
       const priv = cfg.privacy;
       if (!priv.injection) priv.injection = {};
       priv.injection.exempt_senders = newExempt;
-      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), "utf-8");
+      writeFileSync2(GUARDCLAW_CONFIG_PATH2, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 384 });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);

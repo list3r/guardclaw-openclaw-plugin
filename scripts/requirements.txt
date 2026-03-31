@@ -1,0 +1,16 @@
+# GuardClaw DeBERTa classifier service dependencies
+# GCF-021: Pinned versions to prevent supply-chain attacks via unpinned --upgrade installs.
+# Update these versions intentionally when upgrading — do not use --upgrade in CI/install.
+#
+# To regenerate hashes after a version bump:
+#   pip download -r requirements.txt -d /tmp/whl --no-deps
+#   pip hash /tmp/whl/*.whl >> requirements.txt  (then curate)
+#
+# For now, versions are pinned without hashes (hash pinning requires pre-downloaded wheels).
+# To enable hash pinning: use `pip install --require-hashes -r requirements.txt`
+# and add --hash=sha256:<hash> for each package after downloading.
+
+fastapi==0.115.6
+uvicorn==0.34.0
+torch==2.5.1
+transformers==4.48.3

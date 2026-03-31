@@ -102,7 +102,7 @@ export function writePrompt(name: string, content: string): void {
   if (!safe) throw new Error(`Invalid prompt name: ${name}`);
   mkdirSync(PROMPTS_DIR, { recursive: true });
   const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
-  writeFileSync(filePath, content, "utf-8");
+  writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o600 });
   invalidatePrompt(safe);
 }
 

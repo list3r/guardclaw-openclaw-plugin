@@ -130,7 +130,7 @@ export function logToolEvent(
     _pendingEvents.set(sessionKey, pending);
 
     // Append to disk immediately (best-effort)
-    appendFile(LOG_PATH, JSON.stringify(event) + "\n", "utf-8").catch(() => {});
+    appendFile(LOG_PATH, JSON.stringify(event) + "\n", { encoding: "utf-8", mode: 0o600 }).catch(() => {});
   } catch {
     // Never disrupt the pipeline
   }
@@ -215,7 +215,7 @@ async function _rewriteSecretOpMs(updated: BehavioralEvent[]): Promise<void> {
     }
 
     const tmp = LOG_PATH + ".tmp";
-    await writeFile(tmp, out.join("\n") + "\n", "utf-8");
+    await writeFile(tmp, out.join("\n") + "\n", { encoding: "utf-8", mode: 0o600 });
     await rename(tmp, LOG_PATH);
   } catch {
     // Best-effort

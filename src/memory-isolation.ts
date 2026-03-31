@@ -75,9 +75,9 @@ export class MemoryIsolationManager {
 
       // Write or append
       if (options?.append) {
-        await fs.promises.appendFile(filePath, content, "utf-8");
+        await fs.promises.appendFile(filePath, content, { encoding: 'utf-8', mode: 0o600 });
       } else {
-        await fs.promises.writeFile(filePath, content, "utf-8");
+        await fs.promises.writeFile(filePath, content, { encoding: 'utf-8', mode: 0o600 });
       }
     } catch (err) {
       console.error(`[GuardClaw] Failed to write memory (cloud=${isCloudModel}):`, err);
@@ -261,14 +261,14 @@ export class MemoryIsolationManager {
           // Phase 2: PII redaction
           const cleanContent = await this.redactContent(guardStripped, privacyConfig);
 
-          await fs.promises.writeFile(cleanPath, cleanContent, "utf-8");
+          await fs.promises.writeFile(cleanPath, cleanContent, { encoding: 'utf-8', mode: 0o600 });
 
           // ── Integrity check (#15) ────────────────────────────────────────────
           // Verify the written daily clean file contains no guard section markers.
           if (cleanContent.includes(GUARD_SECTION_BEGIN)) {
             console.warn(`[GuardClaw] INTEGRITY: GUARD_SECTION_BEGIN in daily clean file ${file} — re-filtering`);
             const reFiltered = this.filterGuardContent(cleanContent);
-            await fs.promises.writeFile(cleanPath, reFiltered, "utf-8");
+            await fs.promises.writeFile(cleanPath, reFiltered, { encoding: 'utf-8', mode: 0o600 });
           }
 
           synced++;
@@ -370,7 +370,7 @@ export class MemoryIsolationManager {
       await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
 
       const appendBlock = `\n\n## Cloud Session Additions\n${newLines.join("\n")}\n`;
-      await fs.promises.writeFile(fullPath, fullContent + appendBlock, "utf-8");
+      await fs.promises.writeFile(fullPath, fullContent + appendBlock, { encoding: 'utf-8', mode: 0o600 });
       console.log(
         `[GuardClaw] Merged ${newLines.length} daily line(s) from clean → full (${path.basename(fullPath)})`,
       );

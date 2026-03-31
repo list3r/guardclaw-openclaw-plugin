@@ -86,7 +86,29 @@ else
     PLUGIN_DIR="$INSTALL_DIR"
   else
     echo "→ Cloning guardclaw-openclaw-plugin..."
+    # GCF-020: Pin to a specific commit SHA to prevent supply-chain attacks.
+    # Update EXPECTED_COMMIT when releasing a new version.
+    EXPECTED_COMMIT="728f95361391c5bd6e18df87cf75e2b54a41e20a"
     git clone --depth 1 https://github.com/list3r/guardclaw-openclaw-plugin "$INSTALL_DIR"
+    ACTUAL_COMMIT=$(git -C "$INSTALL_DIR" rev-parse HEAD)
+    if [ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]; then
+      echo ""
+      echo "  ⚠️  SECURITY WARNING: Cloned commit does not match expected SHA."
+      echo "     Expected: $EXPECTED_COMMIT"
+      echo "     Got:      $ACTUAL_COMMIT"
+      echo "     This may indicate the repository has been updated since this installer was built."
+      echo "     Verify the new commit at: https://github.com/list3r/guardclaw-openclaw-plugin/commit/$ACTUAL_COMMIT"
+      echo ""
+      read -p "  Continue anyway? [y/N] " -n 1 -r
+      echo ""
+      if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "  Install aborted."
+        rm -rf "$INSTALL_DIR"
+        exit 1
+      fi
+    else
+      echo "  ✓ Commit SHA verified: $ACTUAL_COMMIT"
+    fi
     PLUGIN_DIR="$INSTALL_DIR"
     echo "  ✓ Cloned to $INSTALL_DIR"
   fi
@@ -426,11 +448,12 @@ fi
 
 if $SETUP_CLASSIFIER; then
   echo ""
-  echo "→ Installing Python dependencies (fastapi uvicorn torch transformers)..."
+  echo "→ Installing Python dependencies (pinned versions — see scripts/requirements.txt)..."
   echo "  This may take a few minutes on first install (PyTorch is ~200 MB)."
   echo ""
 
-  if "$PYTHON_CMD" -m pip install --quiet --upgrade fastapi uvicorn torch transformers; then
+  # GCF-021: Use pinned requirements file instead of --upgrade to prevent supply-chain attacks.
+  if "$PYTHON_CMD" -m pip install --quiet -r "$PLUGIN_DIR/scripts/requirements.txt"; then
     echo "  ✓ Dependencies installed"
   else
     echo "  ✗ pip install failed. Try manually:"

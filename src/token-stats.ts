@@ -321,7 +321,7 @@ export class TokenStatsCollector {
   async flush(): Promise<void> {
     try {
       await mkdir(dirname(this.filePath), { recursive: true });
-      await writeFile(this.filePath, JSON.stringify(this.data, null, 2), "utf-8");
+      await writeFile(this.filePath, JSON.stringify(this.data, null, 2), { encoding: "utf-8", mode: 0o600 });
       this.dirty = false;
     } catch {
       // Non-critical — stats will be retried on next flush

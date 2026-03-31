@@ -181,7 +181,7 @@ export class DualSessionManager {
           timestamp: message.timestamp ?? Date.now(),
         });
 
-        await fs.promises.appendFile(historyPath, line + "\n", "utf-8");
+        await fs.promises.appendFile(historyPath, line + "\n", { encoding: "utf-8", mode: 0o600 });
       } catch (err) {
         console.error(
           `[GuardClaw] Failed to write to ${historyType} history for ${sessionKey}:`,

@@ -358,20 +358,52 @@ var defaultInjectionConfig = {
 
 // src/injection/deberta.ts
 var BASE_URL = (() => {
-  const url = process.env.GUARDCLAW_DEBERTA_URL ?? "http://127.0.0.1:8404/classify";
-  return url.endsWith("/classify") ? url.slice(0, -"/classify".length) : url;
+  const envUrl = process.env.GUARDCLAW_DEBERTA_URL;
+  const DEFAULT = "http://127.0.0.1:8404";
+  if (!envUrl) return DEFAULT;
+  const base = envUrl.endsWith("/classify") ? envUrl.slice(0, -"/classify".length) : envUrl;
+  try {
+    const parsed = new URL(base);
+    if (parsed.protocol !== "http:") {
+      console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL rejected \u2014 only http: scheme allowed (got ${parsed.protocol}). Using default.`);
+      return DEFAULT;
+    }
+    const host = parsed.hostname;
+    if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
+      console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL rejected \u2014 non-loopback host '${host}' not allowed (SSRF prevention). Using default.`);
+      return DEFAULT;
+    }
+    return base;
+  } catch {
+    console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL is not a valid URL \u2014 using default.`);
+    return DEFAULT;
+  }
 })();
 var ENDPOINT = `${BASE_URL}/classify`;
 var RELOAD_ENDPOINT = `${BASE_URL}/reload`;
 var TIMEOUT_MS = 5e3;
 var RELOAD_TIMEOUT_MS = 3e5;
+var ALLOWED_DEBERTA_MODELS = /* @__PURE__ */ new Set([
+  "protectai/deberta-v3-base-prompt-injection-v2",
+  "protectai/deberta-v3-base-prompt-injection",
+  "laiyer/deberta-v3-base-prompt-injection"
+]);
+var RELOAD_API_TOKEN = process.env.GUARDCLAW_DEBERTA_RELOAD_TOKEN ?? "";
 async function triggerDebertaReload(modelId) {
+  if (!ALLOWED_DEBERTA_MODELS.has(modelId)) {
+    console.warn(`[GuardClaw] DeBERTa reload rejected \u2014 model '${modelId}' is not in the allowlist.`);
+    return { ok: false, message: `Model '${modelId}' not in allowed list` };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RELOAD_TIMEOUT_MS);
   try {
+    const headers = { "Content-Type": "application/json" };
+    if (RELOAD_API_TOKEN) {
+      headers["X-GuardClaw-Token"] = RELOAD_API_TOKEN;
+    }
     const res = await fetch(RELOAD_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ model: modelId }),
       signal: controller.signal
     });
@@ -1153,7 +1185,7 @@ var TokenStatsCollector = class {
   async flush() {
     try {
       await mkdir(dirname(this.filePath), { recursive: true });
-      await writeFile2(this.filePath, JSON.stringify(this.data, null, 2), "utf-8");
+      await writeFile2(this.filePath, JSON.stringify(this.data, null, 2), { encoding: "utf-8", mode: 384 });
       this.dirty = false;
     } catch {
     }
@@ -1224,7 +1256,7 @@ function writePrompt(name, content) {
   if (!safe) throw new Error(`Invalid prompt name: ${name}`);
   mkdirSync(PROMPTS_DIR, { recursive: true });
   const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
-  writeFileSync(filePath, content, "utf-8");
+  writeFileSync(filePath, content, { encoding: "utf-8", mode: 384 });
   invalidatePrompt(safe);
 }
 function readPromptFromDisk(name) {

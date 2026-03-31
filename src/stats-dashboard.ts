@@ -79,7 +79,7 @@ function saveGuardClawConfig(privacy: Record<string, unknown>): void {
       /* file may not exist yet or is malformed — start from defaults */
     }
     const updated = { ...existing, privacy };
-    writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(updated, null, 2), "utf-8");
+    writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(updated, null, 2), { encoding: "utf-8", mode: 0o600 });
   } catch {
     // best-effort persistence
   }
@@ -621,7 +621,7 @@ export async function statsHttpHandler(
       const priv = cfg.privacy as Record<string, unknown>;
       if (!priv.injection) priv.injection = {};
       (priv.injection as Record<string, unknown>).banned_senders = newBanned;
-      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
+      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);
@@ -660,7 +660,7 @@ export async function statsHttpHandler(
       const priv = cfg.privacy as Record<string, unknown>;
       if (!priv.injection) priv.injection = {};
       (priv.injection as Record<string, unknown>).exempt_senders = newExempt;
-      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
+      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);
@@ -685,7 +685,7 @@ export async function statsHttpHandler(
       const priv = cfg.privacy as Record<string, unknown>;
       if (!priv.injection) priv.injection = {};
       (priv.injection as Record<string, unknown>).exempt_senders = newExempt;
-      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), "utf-8");
+      writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(cfg, null, 2), { encoding: "utf-8", mode: 0o600 });
       json(res, { ok: true });
     } catch (err) {
       json(res, { error: String(err) }, 400);

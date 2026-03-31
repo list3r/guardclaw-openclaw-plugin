@@ -90,7 +90,7 @@ function readConfig(): Record<string, unknown> {
 function writeConfig(config: Record<string, unknown>): void {
   try {
     mkdirSync(OPENCLAW_DIR, { recursive: true });
-    writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+    writeFileSync(GUARDCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 0o600 });
   } catch {
     /* best-effort */
   }
@@ -157,7 +157,7 @@ function writeDefaultModel(modelRef: string): { ok: boolean; error?: string } {
   }
 
   try {
-    writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+    writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 0o600 });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: `Failed to write openclaw.json: ${String(err)}` };

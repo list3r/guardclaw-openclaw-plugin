@@ -92,7 +92,7 @@ async function persistBudget(): Promise<void> {
   _data.lastUpdated = new Date().toISOString();
   const tmp = BUDGET_PATH + ".tmp";
   try {
-    await writeFile(tmp, JSON.stringify(_data, null, 2), "utf-8");
+    await writeFile(tmp, JSON.stringify(_data, null, 2), { encoding: "utf-8", mode: 0o600 });
     await rename(tmp, BUDGET_PATH);
   } catch { /* best-effort */ }
 }

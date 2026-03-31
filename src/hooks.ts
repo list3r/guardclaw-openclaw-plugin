@@ -239,7 +239,7 @@ async function appendInjectionLog(entry: InjectionEntry): Promise<void> {
   entries.push(entry);
   if (entries.length > 200) entries = entries.slice(entries.length - 200);
   try {
-    await fs.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2));
+    await fs.promises.writeFile(GUARDCLAW_INJECTIONS_PATH, JSON.stringify(entries, null, 2), { mode: 0o600 });
   } catch (err) {
     // Log write failures so operators know the audit trail has a gap.
     console.warn(`[GuardClaw S0] Failed to write injection log: ${String(err)}`);
@@ -248,7 +248,7 @@ async function appendInjectionLog(entry: InjectionEntry): Promise<void> {
 
 async function writeStatsAtomic(stats: Record<string, unknown>): Promise<void> {
   const tmp = GUARDCLAW_STATS_PATH + ".tmp";
-  await fs.promises.writeFile(tmp, JSON.stringify(stats, null, 2));
+  await fs.promises.writeFile(tmp, JSON.stringify(stats, null, 2), { mode: 0o600 });
   await fs.promises.rename(tmp, GUARDCLAW_STATS_PATH); // atomic on POSIX
 }
 
@@ -2380,6 +2380,16 @@ async function syncMemoryWrite(
 
   if (!content.trim()) return;
 
+  // Symlink guard (GCF-010): reject symlinks on both source and target paths
+  // to prevent pre-planted symlinks from exfiltrating or overwriting arbitrary files.
+  try {
+    const srcStat = await fs.promises.lstat(absPath);
+    if (srcStat.isSymbolicLink()) {
+      logger.warn(`[GuardClaw] Memory dual-write blocked — source path is a symlink: ${absPath}`);
+      return;
+    }
+  } catch { /* file doesn't exist yet — that's fine */ }
+
   // Determine the counterpart path
   let fullRelPath: string;
   if (rel === "MEMORY.md" || rel === "memory.md") {
@@ -2395,18 +2405,27 @@ async function syncMemoryWrite(
   // Ensure directory exists for daily memory files
   await fs.promises.mkdir(path.dirname(fullAbsPath), { recursive: true });
 
+  // Symlink guard on destination (GCF-010)
+  try {
+    const dstStat = await fs.promises.lstat(fullAbsPath);
+    if (dstStat.isSymbolicLink()) {
+      logger.warn(`[GuardClaw] Memory dual-write blocked — destination path is a symlink: ${fullAbsPath}`);
+      return;
+    }
+  } catch { /* destination doesn't exist yet — that's fine */ }
+
   // Wrap guard agent content with explicit markers so filterGuardContent
   // can reliably strip it when syncing FULL → CLEAN.
   const fullContent = isGuardSession
     ? `${GUARD_SECTION_BEGIN}\n${content}\n${GUARD_SECTION_END}`
     : content;
-  await fs.promises.writeFile(fullAbsPath, fullContent, "utf-8");
+  await fs.promises.writeFile(fullAbsPath, fullContent, { encoding: "utf-8", mode: 0o600 });
 
   // Redact PII and overwrite the clean version
   const memMgr = getDefaultMemoryManager();
   const redacted = await memMgr.redactContentPublic(content, privacyConfig);
   if (redacted !== content) {
-    await fs.promises.writeFile(absPath, redacted, "utf-8");
+    await fs.promises.writeFile(absPath, redacted, { encoding: "utf-8", mode: 0o600 });
     logger.info(`[GuardClaw] Memory dual-write: ${rel} → ${fullRelPath} (redacted clean copy)`);
   } else {
     logger.info(`[GuardClaw] Memory dual-write: ${rel} → ${fullRelPath} (no PII found)`);

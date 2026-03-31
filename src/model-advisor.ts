@@ -103,7 +103,7 @@ async function loadAdvisorData(): Promise<void> {
 async function saveAdvisorData(): Promise<void> {
   const tmp = SUGGESTIONS_PATH + ".tmp";
   try {
-    await writeFile(tmp, JSON.stringify(_data, null, 2), "utf-8");
+    await writeFile(tmp, JSON.stringify(_data, null, 2), { encoding: "utf-8", mode: 0o600 });
     await rename(tmp, SUGGESTIONS_PATH);
   } catch { /* best-effort */ }
 }
@@ -788,7 +788,7 @@ export async function acceptSuggestion(id: string): Promise<{ ok: boolean; messa
       const fileTiers = (fileRouters["token-saver"].options.tiers ?? {}) as Record<string, { provider: string; model: string }>;
       fileTiers[tier] = { provider: "openrouter", model: newModel };
       fileRouters["token-saver"].options.tiers = fileTiers;
-      await writeFile(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      await writeFile(configPath, JSON.stringify(fileCfg, null, 2), { encoding: "utf-8", mode: 0o600 });
 
       suggestion.status = "accepted";
       await saveAdvisorData();
@@ -809,7 +809,7 @@ export async function acceptSuggestion(id: string): Promise<{ ok: boolean; messa
       const priv = fileCfg.privacy as Record<string, unknown>;
       if (!priv.localModel) priv.localModel = {};
       (priv.localModel as Record<string, unknown>).model = newModel;
-      await writeFile(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      await writeFile(configPath, JSON.stringify(fileCfg, null, 2), { encoding: "utf-8", mode: 0o600 });
 
       suggestion.status = "accepted";
       await saveAdvisorData();
@@ -830,7 +830,7 @@ export async function acceptSuggestion(id: string): Promise<{ ok: boolean; messa
       try { fileCfg = JSON.parse(await readFile(configPath, "utf-8")) as Record<string, unknown>; } catch { /* first time */ }
       if (!fileCfg.injection) fileCfg.injection = {};
       (fileCfg.injection as Record<string, unknown>).deberta_model = newModel;
-      await writeFile(configPath, JSON.stringify(fileCfg, null, 2), "utf-8");
+      await writeFile(configPath, JSON.stringify(fileCfg, null, 2), { encoding: "utf-8", mode: 0o600 });
 
       suggestion.status = "accepted";
       await saveAdvisorData();

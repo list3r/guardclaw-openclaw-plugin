@@ -53,4 +53,33 @@ Once a secret value is known (via path rule or `guardclaw secrets get`), track t
 
 ## Backlog
 
-_(None yet)_
+### Prompt Caching / Session Cost Control
+**Status:** Open | **Date:** 2026-03-31 | **Suggested by:** Kevin | **Reference:** messkan/prompt-cache
+
+Two related concerns — cache LLM prompts to reduce costs, AND enforce hard session limits so a misconfigured agent can't run up a $400 bill.
+
+**Prompt cache proxy (messkan/prompt-cache pattern):**
+- HTTP proxy that caches identical LLM prompts and serves them from local storage
+- Eliminates re-billing for repeated system prompts, static context, and repeating tool descriptions
+- Natural fit for GuardClaw: already sits in the request path via privacy-proxy.ts — the token-saver router could incorporate this
+- Cache key: hash of (model + system prompt + last N messages). Only cache deterministic responses (temp=0 or near-0)
+- Estimated savings: 30–60% on session costs for heavy build sessions with stable system prompts
+
+**Session cost limits (baked into client config):**
+- Hard daily/monthly caps already exist in GuardClaw (budget-guard.ts), but LibreChat and other OpenClaw UIs don't enforce limits at the connection level
+- Need: per-session token budget in the OpenClaw config (`agents.defaults.maxTokensPerSession`) so runaway cron agents or stuck loops can't burn through budget
+- The $400 bill scenario: cron agent stuck in retry loop, no per-session cap, no circuit breaker
+- Circuit breaker: if a session exceeds N tokens in M minutes (configurable), pause + alert rather than just block
+
+**Implementation notes:**
+- Cache store: SQLite or Redis (Redis preferred for multi-instance deployments)
+- Privacy concern: cached prompts may contain S2/S3 content → cache must be encrypted at rest
+  - Cache key: HMAC of content, cache value: AES-GCM encrypted with session-derived key
+  - Never cache S3 content at all (only S1/S2 with encryption)
+- GuardClaw integration: add cache check step in router-pipeline.ts before hitting the upstream provider
+- Invalidation: TTL-based (24h default) + explicit invalidation on memory reset
+
+**References:**
+- messkan/prompt-cache — lightweight prompt caching proxy
+- Notes 34 + 57 in Kevin's AI notes folder
+- budget-guard.ts (existing spend tracking — extend with per-session limits)
