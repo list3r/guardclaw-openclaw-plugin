@@ -858,7 +858,7 @@ function getDefaultMemoryManager(workspaceDir) {
 // src/session-manager.ts
 import * as fs2 from "fs";
 import * as path2 from "path";
-var DualSessionManager = class {
+var DualSessionManager = class _DualSessionManager {
   baseDir;
   writeLocks = /* @__PURE__ */ new Map();
   /**
@@ -952,10 +952,17 @@ var DualSessionManager = class {
     }
     return false;
   }
+  /** Max session file size in bytes before auto-trim (default: 5MB) */
+  static MAX_FILE_BYTES = 5 * 1024 * 1024;
+  /** Lines to keep when trimming */
+  static TRIM_KEEP_LINES = 1e3;
+  /** Track which files we've checked this process lifetime to avoid repeated stat calls */
+  trimChecked = /* @__PURE__ */ new Set();
   /**
    * Write message to history file.
    * Uses a per-file write lock to serialize concurrent appends
    * (e.g. from fire-and-forget calls in sync hooks).
+   * Auto-trims files that exceed MAX_FILE_BYTES.
    */
   async writeToHistory(sessionKey, message, agentId, historyType) {
     const historyPath = this.getHistoryPath(sessionKey, agentId, historyType);
@@ -968,6 +975,7 @@ var DualSessionManager = class {
           timestamp: message.timestamp ?? Date.now()
         });
         await fs2.promises.appendFile(historyPath, line + "\n", { encoding: "utf-8", mode: 384 });
+        await this.maybeAutoTrim(historyPath);
       } catch (err) {
         console.error(
           `[GuardClaw] Failed to write to ${historyType} history for ${sessionKey}:`,
@@ -975,6 +983,23 @@ var DualSessionManager = class {
         );
       }
     });
+  }
+  /** Trim file to last TRIM_KEEP_LINES if it exceeds MAX_FILE_BYTES */
+  async maybeAutoTrim(filePath) {
+    try {
+      const stat = await fs2.promises.stat(filePath);
+      if (stat.size <= _DualSessionManager.MAX_FILE_BYTES) {
+        return;
+      }
+      const content = await fs2.promises.readFile(filePath, "utf-8");
+      const lines = content.trim().split("\n");
+      if (lines.length <= _DualSessionManager.TRIM_KEEP_LINES) return;
+      const trimmed = lines.slice(-_DualSessionManager.TRIM_KEEP_LINES).join("\n") + "\n";
+      await fs2.promises.writeFile(filePath, trimmed, { encoding: "utf-8", mode: 384 });
+      const savedMB = ((stat.size - Buffer.byteLength(trimmed)) / (1024 * 1024)).toFixed(1);
+      console.log(`[GuardClaw] Auto-trimmed ${path2.basename(filePath)}: ${lines.length} \u2192 ${_DualSessionManager.TRIM_KEEP_LINES} lines (freed ${savedMB}MB)`);
+    } catch {
+    }
   }
   /**
    * Read messages from history file

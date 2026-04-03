@@ -158,10 +158,18 @@ export class DualSessionManager {
     return false;
   }
 
+  /** Max session file size in bytes before auto-trim (default: 5MB) */
+  private static readonly MAX_FILE_BYTES = 5 * 1024 * 1024;
+  /** Lines to keep when trimming */
+  private static readonly TRIM_KEEP_LINES = 1000;
+  /** Track which files we've checked this process lifetime to avoid repeated stat calls */
+  private trimChecked = new Set<string>();
+
   /**
    * Write message to history file.
    * Uses a per-file write lock to serialize concurrent appends
    * (e.g. from fire-and-forget calls in sync hooks).
+   * Auto-trims files that exceed MAX_FILE_BYTES.
    */
   private async writeToHistory(
     sessionKey: string,
@@ -182,6 +190,9 @@ export class DualSessionManager {
         });
 
         await fs.promises.appendFile(historyPath, line + "\n", { encoding: "utf-8", mode: 0o600 });
+
+        // Auto-trim: check file size periodically (every 50 writes per file)
+        await this.maybeAutoTrim(historyPath);
       } catch (err) {
         console.error(
           `[GuardClaw] Failed to write to ${historyType} history for ${sessionKey}:`,
@@ -189,6 +200,27 @@ export class DualSessionManager {
         );
       }
     });
+  }
+
+  /** Trim file to last TRIM_KEEP_LINES if it exceeds MAX_FILE_BYTES */
+  private async maybeAutoTrim(filePath: string): Promise<void> {
+    try {
+      const stat = await fs.promises.stat(filePath);
+      if (stat.size <= DualSessionManager.MAX_FILE_BYTES) {
+        return;
+      }
+
+      const content = await fs.promises.readFile(filePath, "utf-8");
+      const lines = content.trim().split("\n");
+      if (lines.length <= DualSessionManager.TRIM_KEEP_LINES) return;
+
+      const trimmed = lines.slice(-DualSessionManager.TRIM_KEEP_LINES).join("\n") + "\n";
+      await fs.promises.writeFile(filePath, trimmed, { encoding: "utf-8", mode: 0o600 });
+      const savedMB = ((stat.size - Buffer.byteLength(trimmed)) / (1024 * 1024)).toFixed(1);
+      console.log(`[GuardClaw] Auto-trimmed ${path.basename(filePath)}: ${lines.length} → ${DualSessionManager.TRIM_KEEP_LINES} lines (freed ${savedMB}MB)`);
+    } catch {
+      // Non-fatal — trim is best-effort
+    }
   }
 
   /**
