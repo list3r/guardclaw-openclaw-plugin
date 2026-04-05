@@ -61,7 +61,9 @@ function isDangerousRegex(pattern: string): boolean {
   // Curly-brace quantifiers inside a repeated group: (a{2,})+
   if (/\([^)]*\{\d+,\d*\}[^)]*\)[+*?{]/.test(pattern)) return true;
   // Character class followed by a quantifier inside a repeated group: ([a-z]+)*
-  if (/\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
+  // Must start with '(' to ensure the char class is actually INSIDE the group,
+  // not merely preceding it (e.g. [\s:]*(?:...) is safe — the char class is outside).
+  if (/\((?:\?:)?[^)]*\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   // Alternation of quantified terms in a repeated group: (a+|b+)*
   if (/\([^)]*[+*?][^)]*\|[^)]*[+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   // Unbounded dot-star inside a repeated group: (.*)+

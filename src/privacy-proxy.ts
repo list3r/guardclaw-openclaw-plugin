@@ -319,6 +319,20 @@ const ANTHROPIC_APIS = ["anthropic-messages"];
 const GOOGLE_NATIVE_APIS = ["google-generative-ai", "google-gemini-cli", "google-ai-studio"];
 const GOOGLE_URL_MARKERS = ["generativelanguage.googleapis.com", "aiplatform.googleapis.com"];
 
+const OLLAMA_APIS = ["ollama"];
+const OLLAMA_URL_MARKERS = [":11434"];
+
+export function isOllamaTarget(target: OriginalProviderTarget): boolean {
+  const api = (target.api ?? "").toLowerCase();
+  const provider = target.provider.toLowerCase();
+  const url = target.baseUrl.toLowerCase();
+
+  if (OLLAMA_APIS.includes(api)) return true;
+  if (provider.includes("ollama")) return true;
+  if (OLLAMA_URL_MARKERS.some((p) => url.includes(p))) return true;
+  return false;
+}
+
 export function isGoogleTarget(target: OriginalProviderTarget): boolean {
   const api = (target.api ?? "").toLowerCase();
   const provider = target.provider.toLowerCase();
@@ -334,6 +348,9 @@ export function isGoogleTarget(target: OriginalProviderTarget): boolean {
 export function resolveAuthHeaders(target: OriginalProviderTarget): Record<string, string> {
   const headers: Record<string, string> = {};
   if (!target.apiKey) return headers;
+
+  // Ollama doesn't use auth — skip header entirely
+  if (isOllamaTarget(target)) return headers;
 
   const p = target.provider.toLowerCase();
   const api = (target.api ?? "").toLowerCase();
@@ -457,6 +474,15 @@ export function buildUpstreamUrl(targetBaseUrl: string, reqUrl: string | undefin
     return `${baseUrl}${rawPath}`;
   }
 
+  // Ollama: uses /api/chat instead of /v1/chat/completions
+  if (target && isOllamaTarget(target)) {
+    if (rawPath.includes("/chat/completions") || rawPath.includes("/chat")) {
+      return `${baseUrl}/api/chat`;
+    }
+    // Other Ollama endpoints: /api/generate, /api/embeddings, etc.
+    return `${baseUrl}/api${rawPath.replace(/^\/v1/, "")}`;
+  }
+
   // Other providers: strip /v1 prefix (it's already in the base URL)
   const forwardPath = rawPath.replace(/^\/v1/, "");
 
@@ -569,16 +595,19 @@ export async function startPrivacyProxy(
     warn: (m: string) => console.warn(m),
     error: (m: string) => console.error(m),
   };
+  /** Per-request tracing — only emits when guardclaw.json → privacy.debugLogging is true. */
+  const logDebug = (m: string): void => { if (getLiveConfig().debugLogging) log.info(m); };
 
   const server = http.createServer(async (req, res) => {
     if (req.method !== "POST") {
-      res.writeHead(405, { "Content-Type": "application/json" });
+      res.writeHead(405, { "Content-Type": "application/json", "Connection": "close" });
       res.end(JSON.stringify({ error: "Method not allowed" }));
+      req.socket.destroy();
       return;
     }
 
     try {
-      log.info(`[GuardClaw Proxy] Incoming ${req.method} ${req.url}`);
+      logDebug(`[GuardClaw Proxy] Incoming ${req.method} ${req.url}`);
       const body = await readRequestBody(req);
       if (!body || !body.trim()) {
         log.warn("[GuardClaw Proxy] Empty request body");
@@ -600,9 +629,9 @@ export async function startPrivacyProxy(
       const injectionCfg = getLiveInjectionConfig();
       if (injectionCfg.enabled !== false) {
         const proxyMessages = parsed.messages as Array<Record<string, unknown>> | undefined;
-        log.info(`[GuardClaw S0] messages=${proxyMessages ? proxyMessages.length : 'undefined'} keys=${Object.keys(parsed).join(',')}`);
+        logDebug(`[GuardClaw S0] messages=${proxyMessages ? proxyMessages.length : 'undefined'} keys=${Object.keys(parsed).join(',')}`);
         const lastUserMsg = proxyMessages?.slice().reverse().find(m => String(m.role ?? "") === "user");
-        log.info(`[GuardClaw S0] lastUserMsg role=${lastUserMsg?.role} contentType=${typeof lastUserMsg?.content}`);
+        logDebug(`[GuardClaw S0] lastUserMsg role=${lastUserMsg?.role} contentType=${typeof lastUserMsg?.content}`);
         let userContent = "";
         if (lastUserMsg) {
           if (typeof lastUserMsg.content === "string") {
@@ -623,7 +652,7 @@ export async function startPrivacyProxy(
               .join("");
           }
         }
-        log.info(`[GuardClaw S0] userContent length=${userContent.length} first80=${userContent.slice(0, 80).replace(/\n/g, "\\n")}`);
+        logDebug(`[GuardClaw S0] userContent length=${userContent.length} first80=${userContent.slice(0, 80).replace(/\n/g, "\\n")}`);
 
         // Extract senderId: try header, then Discord envelope in content
         let proxySenderId = req.headers["x-guardclaw-sender-id"] as string | undefined;
@@ -644,7 +673,7 @@ export async function startPrivacyProxy(
         if (userContent && !isExemptSender) {
           const proxyInjResult = await detectInjection(userContent, 'user_message', injectionCfg);
           const proxySessionKey = req.headers["x-guardclaw-session"] as string | undefined ?? "proxy";
-          log.info(`[GuardClaw S0] detection result: action=${proxyInjResult.action} score=${proxyInjResult.score} matches=${proxyInjResult.matches.join(',')}`);
+          logDebug(`[GuardClaw S0] detection result: action=${proxyInjResult.action} score=${proxyInjResult.score} matches=${proxyInjResult.matches.join(',')}`);
           if (proxyInjResult.action === 'block') {
             log.warn(`[GuardClaw S0] BLOCKED in proxy session=${proxySessionKey} score=${proxyInjResult.score} patterns=${proxyInjResult.matches.join(',')}`);
             await appendProxyInjectionLog({
@@ -708,14 +737,14 @@ export async function startPrivacyProxy(
       const hadOpenAiMarkers = stripPiiMarkers(parsed.messages ?? []);
       const hadGoogleMarkers = stripPiiMarkersGoogleContents(parsed.contents);
       if (hadOpenAiMarkers || hadGoogleMarkers) {
-        log.info("[GuardClaw Proxy] Stripped S2 PII markers from request");
+        logDebug("[GuardClaw Proxy] Stripped S2 PII markers from request");
       }
 
       // Step 2: Clean tool schemas (supports both OpenAI and Google formats)
       const hadOpenAiSchemaFix = cleanToolSchemas(parsed.tools);
       const hadGoogleSchemaFix = cleanGoogleToolSchemas(parsed.tools);
       if (hadOpenAiSchemaFix || hadGoogleSchemaFix) {
-        log.info("[GuardClaw Proxy] Cleaned unsupported keywords from tool schemas");
+        logDebug("[GuardClaw Proxy] Cleaned unsupported keywords from tool schemas");
       }
 
       // Step 2b: Defense-in-depth — run rule-based PII redaction on non-system
@@ -736,7 +765,7 @@ export async function startPrivacyProxy(
           const redacted = redactSensitiveInfo(msg.content, redactionOpts);
           if (redacted !== msg.content) {
             msg.content = redacted;
-            log.info("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message");
+            logDebug("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message");
           }
         } else if (Array.isArray(msg.content)) {
           for (const part of msg.content as Array<Record<string, unknown>>) {
@@ -744,7 +773,7 @@ export async function startPrivacyProxy(
               const redacted = redactSensitiveInfo(part.text, redactionOpts);
               if (redacted !== part.text) {
                 part.text = redacted;
-                log.info("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message part");
+                logDebug("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message part");
               }
             }
           }
@@ -756,7 +785,7 @@ export async function startPrivacyProxy(
               const redacted = redactSensitiveInfo(part.text, redactionOpts);
               if (redacted !== part.text) {
                 part.text = redacted;
-                log.info("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to Google part");
+                logDebug("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to Google part");
               }
             }
           }
@@ -793,19 +822,19 @@ export async function startPrivacyProxy(
       const MAX_COMPLETION_TOKENS = 16384;
       for (const key of ["max_tokens", "max_completion_tokens"] as const) {
         if (parsed[key] != null && (parsed[key] as number) > MAX_COMPLETION_TOKENS) {
-          log.info(`[GuardClaw Proxy] Capped ${key} ${parsed[key]} → ${MAX_COMPLETION_TOKENS}`);
+          logDebug(`[GuardClaw Proxy] Capped ${key} ${parsed[key]} → ${MAX_COMPLETION_TOKENS}`);
           parsed[key] = MAX_COMPLETION_TOKENS;
         }
       }
 
       const clientWantsStream = !!parsed.stream;
       const streamUpstream = clientWantsStream;
-      log.info(`[GuardClaw Proxy] → ${upstreamUrl} (stream=${clientWantsStream}, upstreamStream=${streamUpstream}, model=${requestModel ?? "unknown"}, provider=${target.provider})`);
+      logDebug(`[GuardClaw Proxy] → ${upstreamUrl} (stream=${clientWantsStream}, upstreamStream=${streamUpstream}, model=${requestModel ?? "unknown"}, provider=${target.provider})`);
 
       if (streamUpstream) {
         const streamOk = await tryStreamUpstream(parsed, upstreamUrl, upstreamHeaders, res, log);
         if (streamOk) return;
-        log.info("[GuardClaw Proxy] Streaming unavailable, falling back to non-streaming + SSE conversion");
+        logDebug("[GuardClaw Proxy] Streaming unavailable, falling back to non-streaming + SSE conversion");
       }
 
       // Non-streaming upstream request (or fallback from failed stream).
@@ -825,15 +854,16 @@ export async function startPrivacyProxy(
         const isTimeout = fetchErr instanceof Error && fetchErr.name === "AbortError";
         const clientMsg = isTimeout ? "Upstream request timed out (120s)" : "Upstream request failed";
         log.error(`[GuardClaw Proxy] Upstream fetch failed: ${String(fetchErr)}`);
-        res.writeHead(504, { "Content-Type": "application/json" });
+        res.writeHead(504, { "Content-Type": "application/json", "Connection": "close" });
         res.end(JSON.stringify({ error: { message: clientMsg, type: "proxy_timeout" } }));
+        req.socket.destroy();
         return;
       }
       clearTimeout(nonStreamTimeout);
 
       // Read the upstream response body safely
       const responseText = await upstream.text();
-      log.info(`[GuardClaw Proxy] Upstream responded: status=${upstream.status} ok=${upstream.ok} bodyLen=${responseText.length}`);
+      logDebug(`[GuardClaw Proxy] Upstream responded: status=${upstream.status} ok=${upstream.ok} bodyLen=${responseText.length}`);
 
       if (!responseText.trim()) {
         log.error(`[GuardClaw Proxy] Upstream returned empty body (status=${upstream.status})`);
@@ -873,7 +903,7 @@ export async function startPrivacyProxy(
     } catch (err) {
       log.error(`[GuardClaw Proxy] Request failed: ${String(err)}`);
       if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" });
+        res.writeHead(500, { "Content-Type": "application/json", "Connection": "close" });
       }
       if (!res.writableEnded) {
         res.end(JSON.stringify({
@@ -883,8 +913,44 @@ export async function startPrivacyProxy(
           },
         }));
       }
+      req.socket.destroy();
     }
   });
+
+  // Connection lifecycle limits — prevent FD exhaustion from leaked keep-alive sockets
+  server.keepAliveTimeout = 5_000;        // Close idle keep-alive connections after 5s
+  server.headersTimeout = 10_000;         // Kill connections that don't send headers within 10s
+  server.requestTimeout = 135_000;        // Kill connections that take longer than upstream timeout + buffer
+  server.maxRequestsPerSocket = 25;       // Force reconnection after 25 requests per socket
+
+  // Active socket reaper — safety net for any connections that slip through lifecycle limits.
+  // Tracks all connections and destroys any that have been alive longer than MAX_SOCKET_AGE_MS.
+  const MAX_SOCKET_AGE_MS = 180_000; // 3 minutes — no single proxy request should live longer
+  const REAP_INTERVAL_MS = 30_000;
+  const activeSockets = new Map<import("node:net").Socket, number>();
+
+  server.on("connection", (socket) => {
+    activeSockets.set(socket, Date.now());
+    socket.once("close", () => activeSockets.delete(socket));
+  });
+
+  const reaperInterval = setInterval(() => {
+    const now = Date.now();
+    let reaped = 0;
+    for (const [socket, createdAt] of activeSockets) {
+      if (now - createdAt > MAX_SOCKET_AGE_MS) {
+        socket.destroy();
+        activeSockets.delete(socket);
+        reaped++;
+      }
+    }
+    if (reaped > 0) {
+      log.warn(`[GuardClaw Proxy] Reaper destroyed ${reaped} stale connections (${activeSockets.size} remaining)`);
+    }
+  }, REAP_INTERVAL_MS);
+  if (typeof reaperInterval === "object" && "unref" in reaperInterval) {
+    (reaperInterval as NodeJS.Timeout).unref();
+  }
 
   // Handle server-level errors
   server.on("error", (err) => {

@@ -241,7 +241,8 @@ var guardClawConfigSchema = Type.Object({
           minValueLength: Type.Optional(Type.Number()),
           trackS2: Type.Optional(Type.Boolean())
         })
-      )
+      ),
+      debugLogging: Type.Optional(Type.Boolean())
     })
   )
 });
@@ -291,6 +292,7 @@ var defaultPrivacyConfig = {
     "gemini-2.0-flash": { inputPer1M: 0.1, outputPer1M: 0.4 },
     "deepseek-chat": { inputPer1M: 0.27, outputPer1M: 1.1 }
   },
+  debugLogging: false,
   redaction: {
     internalIp: false,
     email: false,

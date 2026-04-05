@@ -140,6 +140,12 @@ export type PrivacyConfig = {
   operatorPassthrough?: string[];
   /** Value-based taint tracking for secrets across tool results. */
   taintTracking?: TaintTrackingConfig;
+  /**
+   * Emit verbose per-request info logs (routing decisions, S0 details, proxy
+   * lifecycle). Disabled by default to prevent gateway.log flooding.
+   * Enable via guardclaw.json → privacy.debugLogging: true for troubleshooting.
+   */
+  debugLogging?: boolean;
 };
 
 export type TaintTrackingConfig = {

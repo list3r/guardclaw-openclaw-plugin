@@ -60,7 +60,7 @@ import {
   watchConfigFile,
   withConfigWriteLock,
   writePrompt
-} from "./chunk-IGI2BZUC.js";
+} from "./chunk-LAR7JTXF.js";
 import {
   fireWebhooks
 } from "./chunk-DLV362LL.js";
@@ -1137,7 +1137,7 @@ function isDangerousRegex(pattern) {
   if (/\((?:\?:)?[^)]*[+*?]\)[+*?{]/.test(pattern)) return true;
   if (/\([^)]*\|[^)]*\)[+*{]/.test(pattern)) return true;
   if (/\([^)]*\{\d+,\d*\}[^)]*\)[+*?{]/.test(pattern)) return true;
-  if (/\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
+  if (/\((?:\?:)?[^)]*\[[^\]]+\][+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   if (/\([^)]*[+*?][^)]*\|[^)]*[+*?][^)]*\)[+*?{]/.test(pattern)) return true;
   if (/\(\.[*+]\)[+*?{]/.test(pattern)) return true;
   if (/\([^)]*\|\)[+*{]/.test(pattern)) return true;
@@ -1622,6 +1622,17 @@ var ANTHROPIC_PATTERNS = ["anthropic"];
 var ANTHROPIC_APIS = ["anthropic-messages"];
 var GOOGLE_NATIVE_APIS = ["google-generative-ai", "google-gemini-cli", "google-ai-studio"];
 var GOOGLE_URL_MARKERS = ["generativelanguage.googleapis.com", "aiplatform.googleapis.com"];
+var OLLAMA_APIS = ["ollama"];
+var OLLAMA_URL_MARKERS = [":11434"];
+function isOllamaTarget(target) {
+  const api = (target.api ?? "").toLowerCase();
+  const provider = target.provider.toLowerCase();
+  const url = target.baseUrl.toLowerCase();
+  if (OLLAMA_APIS.includes(api)) return true;
+  if (provider.includes("ollama")) return true;
+  if (OLLAMA_URL_MARKERS.some((p) => url.includes(p))) return true;
+  return false;
+}
 function isGoogleTarget(target) {
   const api = (target.api ?? "").toLowerCase();
   const provider = target.provider.toLowerCase();
@@ -1635,6 +1646,7 @@ function isGoogleTarget(target) {
 function resolveAuthHeaders(target) {
   const headers = {};
   if (!target.apiKey) return headers;
+  if (isOllamaTarget(target)) return headers;
   const p = target.provider.toLowerCase();
   const api = (target.api ?? "").toLowerCase();
   if (ANTHROPIC_PATTERNS.some((pat) => p.includes(pat)) || ANTHROPIC_APIS.includes(api)) {
@@ -1706,6 +1718,12 @@ function buildUpstreamUrl(targetBaseUrl, reqUrl, target) {
   const isAnthropic = api === "anthropic-messages" || ANTHROPIC_PATTERNS.some((p) => (target?.provider ?? "").toLowerCase().includes(p));
   if (isAnthropic) {
     return `${baseUrl}${rawPath}`;
+  }
+  if (target && isOllamaTarget(target)) {
+    if (rawPath.includes("/chat/completions") || rawPath.includes("/chat")) {
+      return `${baseUrl}/api/chat`;
+    }
+    return `${baseUrl}/api${rawPath.replace(/^\/v1/, "")}`;
   }
   const forwardPath = rawPath.replace(/^\/v1/, "");
   if (target && isGoogleTarget(target) && !baseUrl.includes("/openai")) {
@@ -1791,14 +1809,18 @@ async function startPrivacyProxy(port, logger) {
     warn: (m) => console.warn(m),
     error: (m) => console.error(m)
   };
+  const logDebug = (m) => {
+    if (getLiveConfig().debugLogging) log.info(m);
+  };
   const server = http.createServer(async (req, res) => {
     if (req.method !== "POST") {
-      res.writeHead(405, { "Content-Type": "application/json" });
+      res.writeHead(405, { "Content-Type": "application/json", "Connection": "close" });
       res.end(JSON.stringify({ error: "Method not allowed" }));
+      req.socket.destroy();
       return;
     }
     try {
-      log.info(`[GuardClaw Proxy] Incoming ${req.method} ${req.url}`);
+      logDebug(`[GuardClaw Proxy] Incoming ${req.method} ${req.url}`);
       const body = await readRequestBody(req);
       if (!body || !body.trim()) {
         log.warn("[GuardClaw Proxy] Empty request body");
@@ -1818,9 +1840,9 @@ async function startPrivacyProxy(port, logger) {
       const injectionCfg = getLiveInjectionConfig();
       if (injectionCfg.enabled !== false) {
         const proxyMessages = parsed.messages;
-        log.info(`[GuardClaw S0] messages=${proxyMessages ? proxyMessages.length : "undefined"} keys=${Object.keys(parsed).join(",")}`);
+        logDebug(`[GuardClaw S0] messages=${proxyMessages ? proxyMessages.length : "undefined"} keys=${Object.keys(parsed).join(",")}`);
         const lastUserMsg = proxyMessages?.slice().reverse().find((m) => String(m.role ?? "") === "user");
-        log.info(`[GuardClaw S0] lastUserMsg role=${lastUserMsg?.role} contentType=${typeof lastUserMsg?.content}`);
+        logDebug(`[GuardClaw S0] lastUserMsg role=${lastUserMsg?.role} contentType=${typeof lastUserMsg?.content}`);
         let userContent = "";
         if (lastUserMsg) {
           if (typeof lastUserMsg.content === "string") {
@@ -1837,7 +1859,7 @@ async function startPrivacyProxy(port, logger) {
             }).join("");
           }
         }
-        log.info(`[GuardClaw S0] userContent length=${userContent.length} first80=${userContent.slice(0, 80).replace(/\n/g, "\\n")}`);
+        logDebug(`[GuardClaw S0] userContent length=${userContent.length} first80=${userContent.slice(0, 80).replace(/\n/g, "\\n")}`);
         let proxySenderId = req.headers["x-guardclaw-sender-id"];
         if (!proxySenderId && userContent) {
           const m = userContent.match(/"sender_id"\s*:\s*"(\d+)"/);
@@ -1853,7 +1875,7 @@ async function startPrivacyProxy(port, logger) {
         if (userContent && !isExemptSender) {
           const proxyInjResult = await detectInjection(userContent, "user_message", injectionCfg);
           const proxySessionKey = req.headers["x-guardclaw-session"] ?? "proxy";
-          log.info(`[GuardClaw S0] detection result: action=${proxyInjResult.action} score=${proxyInjResult.score} matches=${proxyInjResult.matches.join(",")}`);
+          logDebug(`[GuardClaw S0] detection result: action=${proxyInjResult.action} score=${proxyInjResult.score} matches=${proxyInjResult.matches.join(",")}`);
           if (proxyInjResult.action === "block") {
             log.warn(`[GuardClaw S0] BLOCKED in proxy session=${proxySessionKey} score=${proxyInjResult.score} patterns=${proxyInjResult.matches.join(",")}`);
             await appendProxyInjectionLog({
@@ -1920,12 +1942,12 @@ async function startPrivacyProxy(port, logger) {
       const hadOpenAiMarkers = stripPiiMarkers(parsed.messages ?? []);
       const hadGoogleMarkers = stripPiiMarkersGoogleContents(parsed.contents);
       if (hadOpenAiMarkers || hadGoogleMarkers) {
-        log.info("[GuardClaw Proxy] Stripped S2 PII markers from request");
+        logDebug("[GuardClaw Proxy] Stripped S2 PII markers from request");
       }
       const hadOpenAiSchemaFix = cleanToolSchemas(parsed.tools);
       const hadGoogleSchemaFix = cleanGoogleToolSchemas(parsed.tools);
       if (hadOpenAiSchemaFix || hadGoogleSchemaFix) {
-        log.info("[GuardClaw Proxy] Cleaned unsupported keywords from tool schemas");
+        logDebug("[GuardClaw Proxy] Cleaned unsupported keywords from tool schemas");
       }
       const redactionOpts = getLiveConfig().redaction;
       const allMessages = parsed.messages ?? parsed.contents ?? [];
@@ -1936,7 +1958,7 @@ async function startPrivacyProxy(port, logger) {
           const redacted = redactSensitiveInfo(msg.content, redactionOpts);
           if (redacted !== msg.content) {
             msg.content = redacted;
-            log.info("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message");
+            logDebug("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message");
           }
         } else if (Array.isArray(msg.content)) {
           for (const part of msg.content) {
@@ -1944,7 +1966,7 @@ async function startPrivacyProxy(port, logger) {
               const redacted = redactSensitiveInfo(part.text, redactionOpts);
               if (redacted !== part.text) {
                 part.text = redacted;
-                log.info("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message part");
+                logDebug("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to message part");
               }
             }
           }
@@ -1955,7 +1977,7 @@ async function startPrivacyProxy(port, logger) {
               const redacted = redactSensitiveInfo(part.text, redactionOpts);
               if (redacted !== part.text) {
                 part.text = redacted;
-                log.info("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to Google part");
+                logDebug("[GuardClaw Proxy] Defense-in-depth: rule-based PII redaction applied to Google part");
               }
             }
           }
@@ -1983,17 +2005,17 @@ async function startPrivacyProxy(port, logger) {
       const MAX_COMPLETION_TOKENS = 16384;
       for (const key of ["max_tokens", "max_completion_tokens"]) {
         if (parsed[key] != null && parsed[key] > MAX_COMPLETION_TOKENS) {
-          log.info(`[GuardClaw Proxy] Capped ${key} ${parsed[key]} \u2192 ${MAX_COMPLETION_TOKENS}`);
+          logDebug(`[GuardClaw Proxy] Capped ${key} ${parsed[key]} \u2192 ${MAX_COMPLETION_TOKENS}`);
           parsed[key] = MAX_COMPLETION_TOKENS;
         }
       }
       const clientWantsStream = !!parsed.stream;
       const streamUpstream = clientWantsStream;
-      log.info(`[GuardClaw Proxy] \u2192 ${upstreamUrl} (stream=${clientWantsStream}, upstreamStream=${streamUpstream}, model=${requestModel ?? "unknown"}, provider=${target.provider})`);
+      logDebug(`[GuardClaw Proxy] \u2192 ${upstreamUrl} (stream=${clientWantsStream}, upstreamStream=${streamUpstream}, model=${requestModel ?? "unknown"}, provider=${target.provider})`);
       if (streamUpstream) {
         const streamOk = await tryStreamUpstream(parsed, upstreamUrl, upstreamHeaders, res, log);
         if (streamOk) return;
-        log.info("[GuardClaw Proxy] Streaming unavailable, falling back to non-streaming + SSE conversion");
+        logDebug("[GuardClaw Proxy] Streaming unavailable, falling back to non-streaming + SSE conversion");
       }
       const upstreamBody = { ...parsed, stream: false };
       const nonStreamController = new AbortController();
@@ -2011,13 +2033,14 @@ async function startPrivacyProxy(port, logger) {
         const isTimeout = fetchErr instanceof Error && fetchErr.name === "AbortError";
         const clientMsg = isTimeout ? "Upstream request timed out (120s)" : "Upstream request failed";
         log.error(`[GuardClaw Proxy] Upstream fetch failed: ${String(fetchErr)}`);
-        res.writeHead(504, { "Content-Type": "application/json" });
+        res.writeHead(504, { "Content-Type": "application/json", "Connection": "close" });
         res.end(JSON.stringify({ error: { message: clientMsg, type: "proxy_timeout" } }));
+        req.socket.destroy();
         return;
       }
       clearTimeout(nonStreamTimeout);
       const responseText = await upstream.text();
-      log.info(`[GuardClaw Proxy] Upstream responded: status=${upstream.status} ok=${upstream.ok} bodyLen=${responseText.length}`);
+      logDebug(`[GuardClaw Proxy] Upstream responded: status=${upstream.status} ok=${upstream.ok} bodyLen=${responseText.length}`);
       if (!responseText.trim()) {
         log.error(`[GuardClaw Proxy] Upstream returned empty body (status=${upstream.status})`);
         res.writeHead(502, { "Content-Type": "application/json" });
@@ -2054,7 +2077,7 @@ async function startPrivacyProxy(port, logger) {
     } catch (err) {
       log.error(`[GuardClaw Proxy] Request failed: ${String(err)}`);
       if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" });
+        res.writeHead(500, { "Content-Type": "application/json", "Connection": "close" });
       }
       if (!res.writableEnded) {
         res.end(JSON.stringify({
@@ -2064,8 +2087,37 @@ async function startPrivacyProxy(port, logger) {
           }
         }));
       }
+      req.socket.destroy();
     }
   });
+  server.keepAliveTimeout = 5e3;
+  server.headersTimeout = 1e4;
+  server.requestTimeout = 135e3;
+  server.maxRequestsPerSocket = 25;
+  const MAX_SOCKET_AGE_MS = 18e4;
+  const REAP_INTERVAL_MS = 3e4;
+  const activeSockets = /* @__PURE__ */ new Map();
+  server.on("connection", (socket) => {
+    activeSockets.set(socket, Date.now());
+    socket.once("close", () => activeSockets.delete(socket));
+  });
+  const reaperInterval = setInterval(() => {
+    const now = Date.now();
+    let reaped = 0;
+    for (const [socket, createdAt] of activeSockets) {
+      if (now - createdAt > MAX_SOCKET_AGE_MS) {
+        socket.destroy();
+        activeSockets.delete(socket);
+        reaped++;
+      }
+    }
+    if (reaped > 0) {
+      log.warn(`[GuardClaw Proxy] Reaper destroyed ${reaped} stale connections (${activeSockets.size} remaining)`);
+    }
+  }, REAP_INTERVAL_MS);
+  if (typeof reaperInterval === "object" && "unref" in reaperInterval) {
+    reaperInterval.unref();
+  }
   server.on("error", (err) => {
     log.error(`[GuardClaw Proxy] Server error: ${String(err)}`);
   });
@@ -3078,6 +3130,7 @@ function _notify(event, details, webhooks) {
 // src/taint-store.ts
 var MIN_TAINT_LENGTH = 4;
 var MAX_TAINTS_PER_SESSION = 200;
+var EVICTION_BATCH_FRACTION = 0.25;
 var _taints = /* @__PURE__ */ new Map();
 var _sources = /* @__PURE__ */ new Map();
 var _pending = /* @__PURE__ */ new Map();
@@ -3092,21 +3145,27 @@ function registerTaint(sessionKey, value, source, sensitivity, minLength = MIN_T
   if (set.has(trimmed)) return;
   if (set.size >= MAX_TAINTS_PER_SESSION) {
     const srcMap2 = _sources.get(sessionKey);
-    let evicted = false;
+    const batchTarget = Math.max(1, Math.floor(MAX_TAINTS_PER_SESSION * EVICTION_BATCH_FRACTION));
+    let evictedCount = 0;
     if (srcMap2) {
+      const candidates = [];
       for (const [candidate, label] of srcMap2) {
         if (!label.includes(":secrets-file:")) {
-          set.delete(candidate);
-          srcMap2.delete(candidate);
-          evicted = true;
-          console.warn(
-            `[GuardClaw:taint] Cap hit (session=${sessionKey}): LRU-evicted oldest evictable taint to make room (cap=${MAX_TAINTS_PER_SESSION})`
-          );
-          break;
+          candidates.push(candidate);
+          if (candidates.length >= batchTarget) break;
         }
       }
+      for (const candidate of candidates) {
+        set.delete(candidate);
+        srcMap2.delete(candidate);
+        evictedCount++;
+      }
     }
-    if (!evicted) {
+    if (evictedCount > 0) {
+      console.warn(
+        `[GuardClaw:taint] Cap hit (session=${sessionKey}): batch-evicted ${evictedCount} oldest evictable taints (cap=${MAX_TAINTS_PER_SESSION}, remaining=${set.size})`
+      );
+    } else {
       console.warn(
         `[GuardClaw:taint] Cap hit (session=${sessionKey}): all ${MAX_TAINTS_PER_SESSION} slots are secrets-mount protected \u2014 dropping new entry from source="${source}"`
       );
@@ -3169,6 +3228,9 @@ function isSecretsMountPath(filePath) {
 // src/hooks.ts
 function getPipelineConfig() {
   return { privacy: getLiveConfig() };
+}
+function gcDebug(logger, msg) {
+  if (getLiveConfig().debugLogging) logger.info(msg);
 }
 function shouldUseFullMemoryTrack(sessionKey) {
   if (isActiveLocalRouting(sessionKey)) return true;
@@ -3426,7 +3488,7 @@ function registerHooks(api) {
         }
         const isExemptSender = senderId && new Set(injectionCfg.exempt_senders ?? []).has(senderId);
         if (isExemptSender) {
-          api.logger.info(`[GuardClaw S0] Exempt sender bypass \u2014 skipping injection check: senderId=${senderId} session=${sessionKey}`);
+          gcDebug(api.logger, `[GuardClaw S0] Exempt sender bypass \u2014 skipping injection check: senderId=${senderId} session=${sessionKey}`);
         }
         if (!isExemptSender) {
           const rawExtracted = extractUserContent(msgStr);
@@ -3542,7 +3604,7 @@ function registerHooks(api) {
           });
           return;
         } else if (s3Policy === "synthesize") {
-          api.logger.info("[GuardClaw] S3 synthesize mode \u2014 processing locally before cloud");
+          gcDebug(api.logger, "[GuardClaw] S3 synthesize mode \u2014 processing locally before cloud");
           const taskContext = (params.messages ?? []).slice(-4).map((m) => `${m.role}: ${String(m.content).slice(0, 200)}`).join("\n");
           const _synthT0 = Date.now();
           const synthResult = await synthesizeContent(
@@ -3555,7 +3617,7 @@ function registerHooks(api) {
           updateSynthesisStats("user_message", _synthLatency, synthResult.ok).catch(() => {
           });
           if (synthResult.ok) {
-            api.logger.info(`[GuardClaw] S3 synthesis complete \u2014 forwarding to cloud (${_synthLatency}ms)`);
+            gcDebug(api.logger, `[GuardClaw] S3 synthesis complete \u2014 forwarding to cloud (${_synthLatency}ms)`);
             if (sessionMgr) {
               sessionMgr.appendToFullHistory(sessionKey, { role: "user", content: userMessage });
               sessionMgr.appendToCleanHistory(sessionKey, { role: "user", content: synthResult.synthetic });
@@ -3580,7 +3642,7 @@ function registerHooks(api) {
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
         const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
-        api.logger.info(`[GuardClaw] S3 (rule fast-path) \u2014 routing to ${provider}/${model}`);
+        gcDebug(api.logger, `[GuardClaw] S3 (rule fast-path) \u2014 routing to ${provider}/${model}`);
         return { providerOverride: provider, modelOverride: model };
       }
       const pipeline = getGlobalPipeline();
@@ -3601,7 +3663,7 @@ function registerHooks(api) {
       recordDetection(sessionKey, decision.level, "onUserMessage", decision.reason);
       updateGuardclawStats(decision.level).catch(() => {
       });
-      api.logger.info(`[GuardClaw] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`);
+      gcDebug(api.logger, `[GuardClaw] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`);
       if (decision.level === "S3" || decision.level === "S2") {
         const webhooks = privacyConfig.webhooks ?? [];
         if (webhooks.length > 0) {
@@ -3623,7 +3685,7 @@ function registerHooks(api) {
           timestamp: Date.now()
         });
         if (decision.target) {
-          api.logger.info(`[GuardClaw] S3 \u2014 routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`);
+          gcDebug(api.logger, `[GuardClaw] S3 \u2014 routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`);
           return {
             providerOverride: decision.target.provider,
             ...decision.target.model ? { modelOverride: decision.target.model } : {}
@@ -3631,7 +3693,7 @@ function registerHooks(api) {
         }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
-        api.logger.info(`[GuardClaw] S3 \u2014 routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"} [${decision.routerId}]`);
+        gcDebug(api.logger, `[GuardClaw] S3 \u2014 routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"} [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
           modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
@@ -3670,7 +3732,7 @@ function registerHooks(api) {
       if (decision.level === "S2" && decision.action === "redirect" && decision.target?.provider !== "guardclaw-privacy") {
         markSessionAsPrivate(sessionKey, decision.level);
         if (decision.target) {
-          api.logger.info(`[GuardClaw] S2 \u2014 routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`);
+          gcDebug(api.logger, `[GuardClaw] S2 \u2014 routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`);
           return {
             providerOverride: decision.target.provider,
             ...decision.target.model ? { modelOverride: decision.target.model } : {}
@@ -3695,14 +3757,14 @@ function registerHooks(api) {
           stashOriginalProvider(sessionKey, stashTarget);
         }
         const modelInfo = decision.target.model ? ` (model=${decision.target.model})` : "";
-        api.logger.info(`[GuardClaw] S2 \u2014 routing through privacy proxy${modelInfo} [${decision.routerId}]`);
+        gcDebug(api.logger, `[GuardClaw] S2 \u2014 routing through privacy proxy${modelInfo} [${decision.routerId}]`);
         return {
           providerOverride: "guardclaw-privacy",
           ...decision.target.model ? { modelOverride: decision.target.model } : {}
         };
       }
       if (decision.action === "redirect" && decision.target) {
-        api.logger.info(`[GuardClaw] ${decision.level} \u2014 custom route to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`);
+        gcDebug(api.logger, `[GuardClaw] ${decision.level} \u2014 custom route to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`);
         return {
           providerOverride: decision.target.provider,
           ...decision.target.model ? { modelOverride: decision.target.model } : {}
@@ -3736,7 +3798,7 @@ function registerHooks(api) {
           });
           const guardCfg = getGuardAgentConfig(privacyConfig);
           const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
-          api.logger.info(`[GuardClaw] S3 TRANSFORM \u2014 routing to edge model [${decision.routerId}]`);
+          gcDebug(api.logger, `[GuardClaw] S3 TRANSFORM \u2014 routing to edge model [${decision.routerId}]`);
           return {
             providerOverride: guardCfg?.provider ?? defaultProvider,
             modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
@@ -3756,7 +3818,7 @@ function registerHooks(api) {
           if (s2Policy === "local") {
             const guardCfg = getGuardAgentConfig(privacyConfig);
             const defaultProvider2 = privacyConfig.localModel?.provider ?? "ollama";
-            api.logger.info(`[GuardClaw] S2 TRANSFORM \u2014 routing to local ${guardCfg?.provider ?? defaultProvider2} [${decision.routerId}]`);
+            gcDebug(api.logger, `[GuardClaw] S2 TRANSFORM \u2014 routing to local ${guardCfg?.provider ?? defaultProvider2} [${decision.routerId}]`);
             return {
               providerOverride: guardCfg?.provider ?? defaultProvider2,
               modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
@@ -3776,7 +3838,7 @@ function registerHooks(api) {
               api: providerApi
             });
           }
-          api.logger.info(`[GuardClaw] S2 TRANSFORM \u2014 routing through privacy proxy [${decision.routerId}]`);
+          gcDebug(api.logger, `[GuardClaw] S2 TRANSFORM \u2014 routing through privacy proxy [${decision.routerId}]`);
           return { providerOverride: "guardclaw-privacy" };
         }
         return;
@@ -3800,7 +3862,7 @@ function registerHooks(api) {
         if (shouldInject) {
           const context = await loadDualTrackContext(sessionKey, ctx.agentId, historyLimit);
           if (context) {
-            api.logger.info(`[GuardClaw] Injected dual-track history context for S3 turn`);
+            gcDebug(api.logger, `[GuardClaw] Injected dual-track history context for S3 turn`);
             return { prependContext: context };
           }
         }
@@ -3811,7 +3873,7 @@ function registerHooks(api) {
         if (shouldInject) {
           const context = await loadDualTrackContext(sessionKey, ctx.agentId, historyLimit);
           if (context) {
-            api.logger.info(`[GuardClaw] Injected dual-track history context for S2-local turn`);
+            gcDebug(api.logger, `[GuardClaw] Injected dual-track history context for S2-local turn`);
             return { prependContext: context };
           }
         }
@@ -3875,7 +3937,7 @@ ${secretResult.result}`
         const bashCmd = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
         if (bashCmd && parseKeychainCommand(bashCmd)) {
           markKeychainFetchPending(sessionKey);
-          api.logger.info(`[GuardClaw] Guard session keychain fetch detected \u2014 result will be tracked (session=${sessionKey})`);
+          gcDebug(api.logger, `[GuardClaw] Guard session keychain fetch detected \u2014 result will be tracked (session=${sessionKey})`);
         }
         if (isExecTool(toolName) && bashCmd) {
           const networkTool = isGuardNetworkCommand(bashCmd);
@@ -3934,7 +3996,7 @@ ${secretResult.result}`
           for (const p of pathValues) {
             if (isSecretsMountPath(p)) {
               markPendingTaint(sessionKey, `secrets-file:${p}`, "S3");
-              api.logger.info(`[GuardClaw:taint] Secrets-mount read detected \u2014 result will be taint-tracked (path=${p}, session=${sessionKey})`);
+              gcDebug(api.logger, `[GuardClaw:taint] Secrets-mount read detected \u2014 result will be taint-tracked (path=${p}, session=${sessionKey})`);
             }
           }
         }
@@ -4041,7 +4103,7 @@ ${secretResult.result}`
         privacyConfig
       );
       if (ruleCheck.level !== "S3") return;
-      api.logger.info(`[GuardClaw] S3 in tool result \u2014 synthesizing before tool_result_persist (tool=${ctx.toolName ?? "unknown"})`);
+      gcDebug(api.logger, `[GuardClaw] S3 in tool result \u2014 synthesizing before tool_result_persist (tool=${ctx.toolName ?? "unknown"})`);
       const taskContext = `Tool "${ctx.toolName ?? "unknown"}" returned a result that needs to stay private.`;
       const _synthT0 = Date.now();
       const synthResult = await synthesizeToolResult(
@@ -4058,7 +4120,7 @@ ${secretResult.result}`
         const queue = _synthesisPendingQueue.get(sessionKey) ?? [];
         queue.push({ toolName: ctx.toolName ?? "", synthetic: synthResult.synthetic });
         _synthesisPendingQueue.set(sessionKey, queue);
-        api.logger.info(`[GuardClaw] Synthesis stashed for tool_result_persist \u2014 ${_synthLatency}ms (tool=${ctx.toolName ?? "unknown"})`);
+        gcDebug(api.logger, `[GuardClaw] Synthesis stashed for tool_result_persist \u2014 ${_synthLatency}ms (tool=${ctx.toolName ?? "unknown"})`);
       } else {
         api.logger.warn(`[GuardClaw] Tool result synthesis failed after ${_synthLatency}ms (${synthResult.reason}) \u2014 tool_result_persist will redact normally`);
       }
@@ -4128,7 +4190,7 @@ ${secretResult.result}`
           });
           const redacted2 = redactForCleanTranscript(textContent2, getLiveConfig().redaction);
           if (redacted2 !== textContent2) {
-            api.logger.info(`[GuardClaw] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`);
+            gcDebug(api.logger, `[GuardClaw] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`);
             sessionManager.writeToClean(sessionKey, {
               role: "tool",
               content: redacted2,
@@ -4156,7 +4218,7 @@ ${secretResult.result}`
           if (consumeKeychainFetchPending(sessionKey)) {
             const secretValue = resultText.trim();
             trackSecret(sessionKey, secretValue);
-            api.logger.info(`[GuardClaw] Guard session Keychain secret tracked (session=${sessionKey})`);
+            gcDebug(api.logger, `[GuardClaw] Guard session Keychain secret tracked (session=${sessionKey})`);
             const redactedResult = redactTrackedSecrets(sessionKey, resultText);
             if (redactedResult !== resultText) {
               const modified = replaceMessageText(msg, redactedResult);
@@ -4226,7 +4288,8 @@ ${secretResult.result}`
               );
               if (blocked) return { message: blocked };
             } else {
-              api.logger.info(
+              gcDebug(
+                api.logger,
                 `[GuardClaw S0] Tool result sanitised (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey}`
               );
               const sanitisedText = sanitiseContent(textContent, heuristic.matchedPatterns);
@@ -4249,7 +4312,8 @@ ${secretResult.result}`
             registerTaint(sessionKey, v, pendingTaint.source, pendingTaint.sensitivity, taintMinLen);
           }
           if (taintVals.length > 0) {
-            api.logger.info(
+            gcDebug(
+              api.logger,
               `[GuardClaw:taint] Registered ${taintVals.length} tainted value(s) from ${pendingTaint.source} (session=${sessionKey})`
             );
           }
@@ -4286,7 +4350,8 @@ ${secretResult.result}`
           registerTaint(sessionKey, v, taintSource, taintSens, taintMinLen);
         }
         if (taintValsFromResult.length > 0) {
-          api.logger.info(
+          gcDebug(
+            api.logger,
             `[GuardClaw:taint] Registered ${taintValsFromResult.length} tainted value(s) from ${ruleCheck.level} tool result (tool=${ctx.toolName ?? "unknown"}, session=${sessionKey})`
           );
         }
@@ -4299,7 +4364,7 @@ ${secretResult.result}`
           });
           sessionManager.writeToClean(sessionKey, { role: "tool", content: synthetic, timestamp: Date.now(), sessionKey }).catch(() => {
           });
-          api.logger.info(`[GuardClaw] S3 tool result replaced with synthesis (tool=${ctx.toolName ?? "unknown"})`);
+          gcDebug(api.logger, `[GuardClaw] S3 tool result replaced with synthesis (tool=${ctx.toolName ?? "unknown"})`);
           const modified = replaceMessageText(msg, synthetic);
           if (modified) return { message: modified };
         }
@@ -4325,11 +4390,12 @@ ${secretResult.result}`
       }
       if (wasRedacted) {
         if (!detectedSensitive) markSessionAsPrivate(sessionKey, "S2");
-        api.logger.info(`[GuardClaw] PII-redacted tool result for transcript (tool=${ctx.toolName ?? "unknown"})`);
+        gcDebug(api.logger, `[GuardClaw] PII-redacted tool result for transcript (tool=${ctx.toolName ?? "unknown"})`);
         const modified = replaceMessageText(msg, redacted);
         if (modified) return { message: modified };
       }
-      if (privacyConfig.localModel?.enabled && ruleCheck.level !== "S3") {
+      const skipSyncLlm = wasPrivateBefore || detectedSensitive;
+      if (privacyConfig.localModel?.enabled && ruleCheck.level !== "S3" && !skipSyncLlm) {
         const llmResult = syncDetectByLocalModel(
           { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: textContent, sessionKey },
           privacyConfig
@@ -4348,7 +4414,7 @@ ${secretResult.result}`
               `[GuardClaw] LLM elevated tool result to S3 \u2014 PII redacted before reaching cloud model. tool=${ctx.toolName ?? "unknown"}, reason=${llmResult.reason ?? "semantic"}`
             );
           } else {
-            api.logger.info(`[GuardClaw] LLM elevated tool result to ${llmResult.level} (tool=${ctx.toolName ?? "unknown"}, reason=${llmResult.reason ?? "semantic"})`);
+            gcDebug(api.logger, `[GuardClaw] LLM elevated tool result to ${llmResult.level} (tool=${ctx.toolName ?? "unknown"}, reason=${llmResult.reason ?? "semantic"})`);
           }
           if (!detectedSensitive && !wasRedacted && !wasPrivateBefore) {
             const sessionManager = getDefaultSessionManager();
@@ -4438,7 +4504,7 @@ ${secretResult.result}`
           const secretRedacted = redactTrackedSecrets(sessionKey, assistantText);
           const fullyRedacted = redactSensitiveInfo(secretRedacted, getLiveConfig().redaction);
           if (fullyRedacted !== assistantText) {
-            api.logger.info("[GuardClaw] Redacted secrets/PII from guard session assistant response");
+            gcDebug(api.logger, "[GuardClaw] Redacted secrets/PII from guard session assistant response");
             return { message: { ...msg, content: [{ type: "text", text: fullyRedacted }] } };
           }
         }
@@ -4449,7 +4515,7 @@ ${secretResult.result}`
         if (assistantText && assistantText.length >= 10) {
           const redacted = redactForCleanTranscript(assistantText, getLiveConfig().redaction);
           if (redacted !== assistantText) {
-            api.logger.info("[GuardClaw] PII-redacted local model response before transcript write");
+            gcDebug(api.logger, "[GuardClaw] PII-redacted local model response before transcript write");
             return { message: { ...msg, content: [{ type: "text", text: redacted }] } };
           }
         }
@@ -4467,7 +4533,7 @@ ${secretResult.result}`
                 return { message: { ...msg, content: [{ type: "text", text: "[GuardClaw: Response blocked \u2014 contained sensitive content. Use a local model session to work with sensitive data.]" }] } };
               }
               if (result.action === "redact" && result.redacted !== void 0) {
-                api.logger.info(`[GuardClaw] Response scan: redacted ${result.matches.join(", ")} from cloud response`);
+                gcDebug(api.logger, `[GuardClaw] Response scan: redacted ${result.matches.join(", ")} from cloud response`);
                 return { message: { ...msg, content: [{ type: "text", text: result.redacted }] } };
               }
             }
@@ -4514,7 +4580,7 @@ ${secretResult.result}`
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
       await memMgr.syncAllMemoryToClean(privacyConfig);
-      api.logger.info("[GuardClaw] Memory synced after compaction");
+      gcDebug(api.logger, "[GuardClaw] Memory synced after compaction");
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in after_compaction hook: ${String(err)}`);
     }
@@ -4569,7 +4635,7 @@ ${secretResult.result}`
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
       await memMgr.syncAllMemoryToClean(privacyConfig);
-      api.logger.info("[GuardClaw] Memory synced before reset");
+      gcDebug(api.logger, "[GuardClaw] Memory synced before reset");
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in before_reset hook: ${String(err)}`);
     }

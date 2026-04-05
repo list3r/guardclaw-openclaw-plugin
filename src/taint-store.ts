@@ -28,6 +28,14 @@ const MIN_TAINT_LENGTH = 4;
 /** Hard cap on tainted values per session to prevent memory exhaustion. */
 const MAX_TAINTS_PER_SESSION = 200;
 
+/**
+ * Fraction of the store to evict when the cap is hit. Batch eviction avoids
+ * the pathological case where every new registration triggers an individual
+ * eviction + log + Map iteration. With 25% batch, hitting the cap once frees
+ * 50 slots — the next 50 registrations are free of eviction overhead.
+ */
+const EVICTION_BATCH_FRACTION = 0.25;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type TaintSensitivity = "S2" | "S3";
@@ -88,23 +96,30 @@ export function registerTaint(
   if (set.has(trimmed)) return; // dedup
 
   if (set.size >= MAX_TAINTS_PER_SESSION) {
-    // GCF-012: LRU eviction — find oldest evictable (non-secrets-mount) entry
+    // GCF-012: Batch LRU eviction — evict EVICTION_BATCH_FRACTION of evictable entries
+    // at once to avoid per-registration overhead when the store is persistently full.
     const srcMap = _sources.get(sessionKey);
-    let evicted = false;
+    const batchTarget = Math.max(1, Math.floor(MAX_TAINTS_PER_SESSION * EVICTION_BATCH_FRACTION));
+    let evictedCount = 0;
     if (srcMap) {
+      const candidates: string[] = [];
       for (const [candidate, label] of srcMap) {
         if (!label.includes(":secrets-file:")) {
-          set.delete(candidate);
-          srcMap.delete(candidate);
-          evicted = true;
-          console.warn(
-            `[GuardClaw:taint] Cap hit (session=${sessionKey}): LRU-evicted oldest evictable taint to make room (cap=${MAX_TAINTS_PER_SESSION})`,
-          );
-          break;
+          candidates.push(candidate);
+          if (candidates.length >= batchTarget) break;
         }
       }
+      for (const candidate of candidates) {
+        set.delete(candidate);
+        srcMap.delete(candidate);
+        evictedCount++;
+      }
     }
-    if (!evicted) {
+    if (evictedCount > 0) {
+      console.warn(
+        `[GuardClaw:taint] Cap hit (session=${sessionKey}): batch-evicted ${evictedCount} oldest evictable taints (cap=${MAX_TAINTS_PER_SESSION}, remaining=${set.size})`,
+      );
+    } else {
       console.warn(
         `[GuardClaw:taint] Cap hit (session=${sessionKey}): all ${MAX_TAINTS_PER_SESSION} slots are secrets-mount protected — dropping new entry from source="${source}"`,
       );
