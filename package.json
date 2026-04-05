@@ -1,6 +1,6 @@
 {
   "name": "@centrase/guardclaw",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Privacy-first OpenClaw plugin. Classifies and routes every message by sensitivity, blocks prompt injections locally, and keeps your AI spend in check. Built by Centrase AI.",
   "type": "module",
   "main": "dist/index.js",
