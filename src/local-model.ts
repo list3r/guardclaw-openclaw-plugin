@@ -30,6 +30,8 @@ export type ChatCompletionOptions = {
   apiKey?: string;
   /** Force-disable reasoning output for compatible backends. */
   disableThinking?: boolean;
+  /** JSON schema to enforce structured output via response_format. */
+  responseFormat?: { type: "json_object" } | { type: "json_schema"; json_schema: { name: string; strict?: boolean; schema: Record<string, unknown> } };
 };
 
 export type LlmUsageInfo = {
@@ -139,6 +141,7 @@ async function callOpenAICompatible(
       ...(options?.disableThinking
         ? { chat_template_kwargs: { enable_thinking: false } }
         : {}),
+      ...(options?.responseFormat ? { response_format: options.responseFormat } : {}),
     }),
     signal: AbortSignal.timeout(GUARDCLAW_FETCH_TIMEOUT_MS),
   });
@@ -468,7 +471,7 @@ async function callLocalModel(
   userContent: string,
   config: PrivacyConfig,
 ): Promise<ChatCompletionResult> {
-  const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
   const providerType = config.localModel?.type ?? "openai-compatible";
 
@@ -487,6 +490,23 @@ async function callLocalModel(
       disableThinking: true,
       providerType,
       customModule: config.localModel?.module,
+      // GCF-033: Enforce structured JSON output for classification
+      responseFormat: {
+        type: "json_schema",
+        json_schema: {
+          name: "sensitivity_classification",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              level: { type: "string", enum: ["S1", "S2", "S3"] },
+              reason: { type: "string" },
+            },
+            required: ["level", "reason"],
+            additionalProperties: false,
+          },
+        },
+      },
     },
   );
 }
@@ -639,7 +659,7 @@ export async function desensitizeWithLocalModel(
 
   try {
     const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-    const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+    const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
     const providerType = config.localModel?.type ?? "openai-compatible";
     const customModule = config.localModel?.module;
 
@@ -790,6 +810,33 @@ async function extractPiiWithModel(
       disableThinking: true,
       providerType: opts?.providerType,
       customModule: opts?.customModule,
+      // GCF-033: Enforce structured JSON output for PII extraction
+      responseFormat: {
+        type: "json_schema",
+        json_schema: {
+          name: "pii_extraction",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              items: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    type: { type: "string" },
+                    value: { type: "string" },
+                  },
+                  required: ["type", "value"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["items"],
+            additionalProperties: false,
+          },
+        },
+      },
     },
   );
 
@@ -818,6 +865,19 @@ function parsePiiJson(raw: string): Array<{ type: string; value: string }> {
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
+
+  // GCF-033: Handle response_format wrapper — model may return {"items":[...]}
+  try {
+    const wrapper = JSON.parse(cleaned) as Record<string, unknown>;
+    if (Array.isArray(wrapper.items)) {
+      return (wrapper.items as Array<unknown>).filter(
+        (item: unknown) =>
+          item && typeof item === "object" &&
+          typeof (item as Record<string, unknown>).type === "string" &&
+          typeof (item as Record<string, unknown>).value === "string",
+      ) as Array<{ type: string; value: string }>;
+    }
+  } catch { /* not a wrapper object — fall through to array parsing */ }
 
   // Find the JSON array in the output
   const arrayStart = cleaned.indexOf("[");

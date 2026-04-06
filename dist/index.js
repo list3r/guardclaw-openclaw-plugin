@@ -60,7 +60,7 @@ import {
   watchConfigFile,
   withConfigWriteLock,
   writePrompt
-} from "./chunk-LAR7JTXF.js";
+} from "./chunk-LOWUVBCG.js";
 import {
   fireWebhooks
 } from "./chunk-DLV362LL.js";
@@ -84,7 +84,7 @@ function getGuardAgentConfig(config) {
   if (!isGuardAgentConfigured(config)) {
     return null;
   }
-  const fullModel = config.guardAgent?.model ?? "ollama/openbmb/minicpm4.1";
+  const fullModel = config.guardAgent?.model ?? "ollama/qwen/qwen3-30b-a3b-2507";
   const firstSlash = fullModel.indexOf("/");
   const defaultProvider = config.localModel?.provider ?? "ollama";
   const [provider, modelName] = firstSlash >= 0 ? [fullModel.slice(0, firstSlash), fullModel.slice(firstSlash + 1)] : [defaultProvider, fullModel];
@@ -200,7 +200,7 @@ function resolveConfig(config) {
 }
 async function callSynthesis(content, taskContext, config, timeoutMs) {
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-  const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
   const providerType = config.localModel?.type ?? "openai-compatible";
   const prompt = loadPromptWithVars("s3-synthesis", DEFAULT_SYNTHESIS_PROMPT, {
     CONTENT: content,
@@ -229,7 +229,7 @@ async function callSynthesis(content, taskContext, config, timeoutMs) {
 }
 async function verifySynthesis(synthetic, config, timeoutMs) {
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-  const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
   const providerType = config.localModel?.type ?? "openai-compatible";
   const prompt = loadPromptWithVars("s3-verify", DEFAULT_VERIFY_PROMPT, {
     CONTENT: synthetic.slice(0, 2e3)
@@ -1803,6 +1803,80 @@ async function tryStreamUpstream(parsed, upstreamUrl, upstreamHeaders, res, log)
   }
   return true;
 }
+var CIRCUIT_FAILURE_THRESHOLD = 3;
+var CIRCUIT_COOLDOWN_MS = 3e4;
+var circuitBreakers = /* @__PURE__ */ new Map();
+function getCircuit(key) {
+  let entry = circuitBreakers.get(key);
+  if (!entry) {
+    entry = { state: "closed", failures: 0, lastFailure: 0, lastSuccess: 0 };
+    circuitBreakers.set(key, entry);
+  }
+  if (entry.state === "open" && Date.now() - entry.lastFailure > CIRCUIT_COOLDOWN_MS) {
+    entry.state = "half-open";
+  }
+  return entry;
+}
+function recordUpstreamSuccess(key) {
+  const entry = getCircuit(key);
+  entry.state = "closed";
+  entry.failures = 0;
+  entry.lastSuccess = Date.now();
+}
+function recordUpstreamFailure(key) {
+  const entry = getCircuit(key);
+  entry.failures++;
+  entry.lastFailure = Date.now();
+  if (entry.failures >= CIRCUIT_FAILURE_THRESHOLD) {
+    entry.state = "open";
+    return true;
+  }
+  return false;
+}
+function isCircuitOpen(key) {
+  return getCircuit(key).state === "open";
+}
+var Semaphore = class {
+  constructor(_max) {
+    this._max = _max;
+  }
+  _current = 0;
+  _queue = [];
+  async acquire(timeoutMs) {
+    if (this._current < this._max) {
+      this._current++;
+      return true;
+    }
+    return new Promise((resolve3) => {
+      const timer = setTimeout(() => {
+        const idx = this._queue.indexOf(cb);
+        if (idx !== -1) this._queue.splice(idx, 1);
+        resolve3(false);
+      }, timeoutMs);
+      const cb = () => {
+        clearTimeout(timer);
+        this._current++;
+        resolve3(true);
+      };
+      this._queue.push(cb);
+    });
+  }
+  release() {
+    this._current--;
+    if (this._queue.length > 0) {
+      const next = this._queue.shift();
+      next();
+    }
+  }
+  get active() {
+    return this._current;
+  }
+  get queued() {
+    return this._queue.length;
+  }
+};
+var DEFAULT_PROXY_CONCURRENCY = 5;
+var SEMAPHORE_TIMEOUT_MS = 1e4;
 async function startPrivacyProxy(port, logger) {
   const log = logger ?? {
     info: (m) => console.log(m),
@@ -1812,6 +1886,8 @@ async function startPrivacyProxy(port, logger) {
   const logDebug = (m) => {
     if (getLiveConfig().debugLogging) log.info(m);
   };
+  const proxyConcurrency = getLiveConfig().proxyConcurrency ?? DEFAULT_PROXY_CONCURRENCY;
+  const upstreamSemaphore = new Semaphore(proxyConcurrency);
   const server = http.createServer(async (req, res) => {
     if (req.method !== "POST") {
       res.writeHead(405, { "Content-Type": "application/json", "Connection": "close" });
@@ -1998,6 +2074,22 @@ async function startPrivacyProxy(port, logger) {
         return;
       }
       const upstreamUrl = buildUpstreamUrl(target.baseUrl, req.url, target);
+      const circuitKey = target.baseUrl;
+      if (isCircuitOpen(circuitKey)) {
+        log.warn(`[GuardClaw Proxy] Circuit OPEN for ${circuitKey} \u2014 rejecting without upstream call`);
+        res.writeHead(503, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({ error: { message: "Upstream circuit breaker open \u2014 retrying in 30s", type: "circuit_open" } }));
+        req.socket.destroy();
+        return;
+      }
+      const acquired = await upstreamSemaphore.acquire(SEMAPHORE_TIMEOUT_MS);
+      if (!acquired) {
+        log.warn(`[GuardClaw Proxy] Upstream concurrency limit reached (active=${upstreamSemaphore.active}, queued=${upstreamSemaphore.queued}) \u2014 rejecting`);
+        res.writeHead(503, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({ error: { message: "Upstream concurrency limit exceeded", type: "concurrency_limit" } }));
+        req.socket.destroy();
+        return;
+      }
       const upstreamHeaders = {
         "Content-Type": "application/json",
         ...resolveAuthHeaders(target)
@@ -2012,67 +2104,80 @@ async function startPrivacyProxy(port, logger) {
       const clientWantsStream = !!parsed.stream;
       const streamUpstream = clientWantsStream;
       logDebug(`[GuardClaw Proxy] \u2192 ${upstreamUrl} (stream=${clientWantsStream}, upstreamStream=${streamUpstream}, model=${requestModel ?? "unknown"}, provider=${target.provider})`);
-      if (streamUpstream) {
-        const streamOk = await tryStreamUpstream(parsed, upstreamUrl, upstreamHeaders, res, log);
-        if (streamOk) return;
-        logDebug("[GuardClaw Proxy] Streaming unavailable, falling back to non-streaming + SSE conversion");
-      }
-      const upstreamBody = { ...parsed, stream: false };
-      const nonStreamController = new AbortController();
-      const nonStreamTimeout = setTimeout(() => nonStreamController.abort(), 12e4);
-      let upstream;
+      let upstreamOk = false;
       try {
-        upstream = await fetch(upstreamUrl, {
-          method: "POST",
-          headers: upstreamHeaders,
-          body: JSON.stringify(upstreamBody),
-          signal: nonStreamController.signal
-        });
-      } catch (fetchErr) {
-        clearTimeout(nonStreamTimeout);
-        const isTimeout = fetchErr instanceof Error && fetchErr.name === "AbortError";
-        const clientMsg = isTimeout ? "Upstream request timed out (120s)" : "Upstream request failed";
-        log.error(`[GuardClaw Proxy] Upstream fetch failed: ${String(fetchErr)}`);
-        res.writeHead(504, { "Content-Type": "application/json", "Connection": "close" });
-        res.end(JSON.stringify({ error: { message: clientMsg, type: "proxy_timeout" } }));
-        req.socket.destroy();
-        return;
-      }
-      clearTimeout(nonStreamTimeout);
-      const responseText = await upstream.text();
-      logDebug(`[GuardClaw Proxy] Upstream responded: status=${upstream.status} ok=${upstream.ok} bodyLen=${responseText.length}`);
-      if (!responseText.trim()) {
-        log.error(`[GuardClaw Proxy] Upstream returned empty body (status=${upstream.status})`);
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "Upstream returned empty response", type: "proxy_error" } }));
-        return;
-      }
-      if (clientWantsStream) {
-        let responseJson;
+        if (streamUpstream) {
+          const streamOk = await tryStreamUpstream(parsed, upstreamUrl, upstreamHeaders, res, log);
+          if (streamOk) {
+            upstreamOk = true;
+            recordUpstreamSuccess(circuitKey);
+            return;
+          }
+          logDebug("[GuardClaw Proxy] Streaming unavailable, falling back to non-streaming + SSE conversion");
+        }
+        const upstreamBody = { ...parsed, stream: false };
+        const nonStreamController = new AbortController();
+        const nonStreamTimeout = setTimeout(() => nonStreamController.abort(), 12e4);
+        let upstream;
         try {
-          responseJson = JSON.parse(responseText);
-        } catch {
-          log.error(`[GuardClaw Proxy] Failed to parse upstream response: ${responseText.slice(0, 200)}`);
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "Invalid JSON from upstream", type: "proxy_error" } }));
+          upstream = await fetch(upstreamUrl, {
+            method: "POST",
+            headers: upstreamHeaders,
+            body: JSON.stringify(upstreamBody),
+            signal: nonStreamController.signal
+          });
+        } catch (fetchErr) {
+          clearTimeout(nonStreamTimeout);
+          const opened = recordUpstreamFailure(circuitKey);
+          if (opened) log.warn(`[GuardClaw Proxy] Circuit OPENED for ${circuitKey} after ${CIRCUIT_FAILURE_THRESHOLD} consecutive failures`);
+          const isTimeout = fetchErr instanceof Error && fetchErr.name === "AbortError";
+          const clientMsg = isTimeout ? "Upstream request timed out (120s)" : "Upstream request failed";
+          log.error(`[GuardClaw Proxy] Upstream fetch failed: ${String(fetchErr)}`);
+          res.writeHead(504, { "Content-Type": "application/json", "Connection": "close" });
+          res.end(JSON.stringify({ error: { message: clientMsg, type: "proxy_timeout" } }));
+          req.socket.destroy();
           return;
         }
-        if (upstream.ok) {
-          const ssePayload = completionToSSE(responseJson);
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-          });
-          res.end(ssePayload);
-        } else {
-          res.writeHead(upstream.status, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(responseJson));
+        clearTimeout(nonStreamTimeout);
+        upstreamOk = true;
+        recordUpstreamSuccess(circuitKey);
+        const responseText = await upstream.text();
+        logDebug(`[GuardClaw Proxy] Upstream responded: status=${upstream.status} ok=${upstream.ok} bodyLen=${responseText.length}`);
+        if (!responseText.trim()) {
+          log.error(`[GuardClaw Proxy] Upstream returned empty body (status=${upstream.status})`);
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Upstream returned empty response", type: "proxy_error" } }));
+          return;
         }
-      } else {
-        const contentType = upstream.headers.get("content-type") ?? "application/json";
-        res.writeHead(upstream.status, { "Content-Type": contentType });
-        res.end(responseText);
+        if (clientWantsStream) {
+          let responseJson;
+          try {
+            responseJson = JSON.parse(responseText);
+          } catch {
+            log.error(`[GuardClaw Proxy] Failed to parse upstream response: ${responseText.slice(0, 200)}`);
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "Invalid JSON from upstream", type: "proxy_error" } }));
+            return;
+          }
+          if (upstream.ok) {
+            const ssePayload = completionToSSE(responseJson);
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Connection": "keep-alive"
+            });
+            res.end(ssePayload);
+          } else {
+            res.writeHead(upstream.status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(responseJson));
+          }
+        } else {
+          const contentType = upstream.headers.get("content-type") ?? "application/json";
+          res.writeHead(upstream.status, { "Content-Type": contentType });
+          res.end(responseText);
+        }
+      } finally {
+        upstreamSemaphore.release();
       }
     } catch (err) {
       log.error(`[GuardClaw Proxy] Request failed: ${String(err)}`);
@@ -3428,7 +3533,7 @@ function registerHooks(api) {
             api.logger.info("[GuardClaw] Budget exceeded \u2014 routing to local model");
             const guardCfg = getGuardAgentConfig(privacyConfig);
             const localProvider = guardCfg?.provider ?? privacyConfig.localModel?.provider ?? "ollama";
-            const localModel = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
+            const localModel = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
             return { providerOverride: localProvider, modelOverride: localModel };
           }
         } else if (budgetStatus.warning) {
@@ -3641,7 +3746,7 @@ function registerHooks(api) {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
+        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
         gcDebug(api.logger, `[GuardClaw] S3 (rule fast-path) \u2014 routing to ${provider}/${model}`);
         return { providerOverride: provider, modelOverride: model };
       }
@@ -3693,10 +3798,10 @@ function registerHooks(api) {
         }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
-        gcDebug(api.logger, `[GuardClaw] S3 \u2014 routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"} [${decision.routerId}]`);
+        gcDebug(api.logger, `[GuardClaw] S3 \u2014 routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"} [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
+          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
         };
       }
       let desensitized;
@@ -3717,7 +3822,7 @@ function registerHooks(api) {
           const fallbackProvider = privacyConfig.localModel?.provider ?? "ollama";
           return {
             providerOverride: guardCfg?.provider ?? fallbackProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
+            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
           };
         }
         desensitized = result.desensitized;
@@ -3782,7 +3887,7 @@ function registerHooks(api) {
         api.logger.warn(`[GuardClaw] ${decision.level} BLOCK \u2014 redirecting to edge model [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
+          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
         };
       }
       if (decision.action === "transform") {
@@ -3801,7 +3906,7 @@ function registerHooks(api) {
           gcDebug(api.logger, `[GuardClaw] S3 TRANSFORM \u2014 routing to edge model [${decision.routerId}]`);
           return {
             providerOverride: guardCfg?.provider ?? defaultProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
+            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
           };
         }
         if (decision.level === "S2") {
@@ -3821,7 +3926,7 @@ function registerHooks(api) {
             gcDebug(api.logger, `[GuardClaw] S2 TRANSFORM \u2014 routing to local ${guardCfg?.provider ?? defaultProvider2} [${decision.routerId}]`);
             return {
               providerOverride: guardCfg?.provider ?? defaultProvider2,
-              modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
+              modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
             };
           }
           const defaults = api.config.agents?.defaults;
@@ -4237,6 +4342,26 @@ ${secretResult.result}`
       if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
       const textContent = extractMessageText(msg);
       if (!textContent || textContent.length < 10) return;
+      if (textContent.length < 200 && isToolNoise(textContent, ctx.toolName)) {
+        if (isSessionMarkedPrivate(sessionKey)) {
+          const sessionManager = getDefaultSessionManager();
+          sessionManager.writeToFull(sessionKey, {
+            role: "tool",
+            content: textContent,
+            timestamp: Date.now(),
+            sessionKey
+          }).catch(() => {
+          });
+          sessionManager.writeToClean(sessionKey, {
+            role: "tool",
+            content: textContent,
+            timestamp: Date.now(),
+            sessionKey
+          }).catch(() => {
+          });
+        }
+        return;
+      }
       {
         const rollingBuf = appendToRollingBuffer(sessionKey, textContent);
         if (rollingBuf.length >= 10) {
@@ -4704,7 +4829,7 @@ ${secretResult.result}`
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
+        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
         api.logger.info(`[GuardClaw] Subagent ${decision.level} \u2014 routing to ${provider}/${model}`);
         return {
           providerOverride: provider,
@@ -4718,7 +4843,7 @@ ${secretResult.result}`
           const guardCfg = getGuardAgentConfig(privacyCfg);
           const fallbackProvider = privacyCfg.localModel?.provider ?? "ollama";
           const provider = guardCfg?.provider ?? fallbackProvider;
-          const model = guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "openbmb/minicpm4.1";
+          const model = guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
           api.logger.warn(`[GuardClaw] Subagent S2 desensitization failed \u2014 routing to local ${provider}/${model}`);
           return { providerOverride: provider, modelOverride: model };
         }
@@ -4843,6 +4968,30 @@ function isGuardNetworkCommand(command) {
     if (pattern.test(command)) return tool;
   }
   return null;
+}
+var TOOL_NOISE_PATTERNS = /^\s*(?:[\u2713\u2714\u2715\u2716\u2022\u25cf\u25cb•·\-\*]\s*)?(?:ok|done|success|created|updated|deleted|wrote|saved|started|stopped|finished|completed|running|exited?\s*(?:code\s*)?\d*|true|false|null|undefined|\d+(?:\.\d+)?\s*(?:ms|s|sec|bytes?|[kmg]b)?|no\s+(?:results?|matches?|changes?|output)|\[\d+\/\d+\]|\d+\s+files?|empty|skipped|unchanged|passed|failed|error|warning|\{\}|\[\]|\s*)$/i;
+var TOOL_NOISE_TOOL_NAMES = /* @__PURE__ */ new Set([
+  "list_dir",
+  "list_directory",
+  "ls",
+  "search_files",
+  "find_files",
+  "task_status",
+  "task_progress",
+  "get_status",
+  "ping",
+  "health_check",
+  "list_sessions",
+  "list_agents"
+]);
+var SENSITIVE_WORDS_RE = /\b(?:password|passphrase|passwd|secret|token|credential|api.?key|private.?key|auth|ssn|salary|payroll|diagnosis|diagnos|patient|medical|prescription|bank|account|routing|bsb|acn|abn|tfn|medicare|ssn|license|passport|encrypt|decrypt)\b/i;
+function isToolNoise(text, toolName) {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (toolName && TOOL_NOISE_TOOL_NAMES.has(toolName)) return true;
+  if (TOOL_NOISE_PATTERNS.test(trimmed)) return true;
+  if (!trimmed.includes("\n") && trimmed.length < 80 && !/[@\d]{4,}|\b\d{3}[-.]\d{3}/.test(trimmed) && !SENSITIVE_WORDS_RE.test(trimmed)) return true;
+  return false;
 }
 function shouldSkipMessage(msg) {
   if (msg.includes("[REDACTED:") || msg.startsWith("[SYSTEM]")) return true;
@@ -5191,7 +5340,7 @@ function detectionToDecision(level, reason, privacyConfig) {
       action: "redirect",
       target: {
         provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
+        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
       },
       reason
     };
@@ -5205,7 +5354,7 @@ function detectionToDecision(level, reason, privacyConfig) {
       action: "redirect",
       target: {
         provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"
+        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
       },
       reason
     };
@@ -5255,7 +5404,7 @@ var OPENROUTER_DEFAULT_MODEL = "auto";
 var DEFAULT_CONFIG2 = {
   enabled: false,
   judgeEndpoint: "http://localhost:11434",
-  judgeModel: "openbmb/minicpm4.1",
+  judgeModel: "qwen/qwen3-30b-a3b-2507",
   judgeProviderType: "openai-compatible",
   tiers: {
     SIMPLE: { provider: "openai", model: "gpt-4o-mini" },
@@ -5712,7 +5861,7 @@ function resolveTargetForLevel(level, pluginConfig) {
     const defaultProvider = pCfg.localModel?.provider ?? "ollama";
     return {
       provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "openbmb/minicpm4.1"
+      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
     };
   }
   const s2Policy = pCfg.s2Policy ?? "proxy";
@@ -5721,7 +5870,7 @@ function resolveTargetForLevel(level, pluginConfig) {
     const defaultProvider = pCfg.localModel?.provider ?? "ollama";
     return {
       provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "openbmb/minicpm4.1"
+      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
     };
   }
   return { provider: "guardclaw-privacy", model: "" };
@@ -6065,7 +6214,7 @@ async function checkLLMFitModels(minDiskGb) {
   } catch {
     return [];
   }
-  const currentJudge = getLiveConfig().localModel?.model ?? "openbmb/minicpm4.1";
+  const currentJudge = getLiveConfig().localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
   const freeDiskGb = await getFreeDiskGb();
   const suggestions = [];
   for (const entry of entries.slice(0, 5)) {
@@ -6241,7 +6390,7 @@ async function runAdvisorChecks() {
     if (benchmarkEnabled) {
       const privacy = getLiveConfig();
       const localEndpoint = privacy.localModel?.endpoint ?? "http://localhost:11434";
-      const localModel = privacy.localModel?.model ?? "openbmb/minicpm4.1";
+      const localModel = privacy.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
       const providerType = privacy.localModel?.type ?? "openai-compatible";
       let currentBenchmark;
       try {
@@ -7963,7 +8112,7 @@ function dashboardHtml() {
     </div>
     <div class="field"><label data-i18n="cfg.provider">Provider</label><input id="cfg-lm-provider" placeholder="ollama"></div>
     <div class="field"><label>Endpoint</label><input id="cfg-lm-endpoint" placeholder="http://localhost:11434"><div class="hint" style="margin-top:4px">Full URL of your local model server \u2014 e.g. Ollama: http://localhost:11434 \xB7 LM Studio: http://localhost:1234 \xB7 vLLM: http://localhost:8000 \xB7 SGLang: http://localhost:30000 \xB7 Remote: http://192.168.1.10:11434</div></div>
-    <div class="field"><label>Model</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-lm-model" placeholder="openbmb/minicpm4.1" style="flex:1"><button type="button" onclick="fetchAndPickModel('lm')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div></div>
+    <div class="field"><label>Model</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-lm-model" placeholder="qwen/qwen3-30b-a3b-2507" style="flex:1"><button type="button" onclick="fetchAndPickModel('lm')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div></div>
     <div class="field"><label data-i18n="cfg.api_key">API Key</label><input id="cfg-lm-apikey" type="password" placeholder="sk-..."></div>
     <div class="field" id="cfg-lm-module-wrap" style="display:none"><label>Custom Module Path</label><input id="cfg-lm-module" placeholder="./my-provider.js"></div>
   </div>

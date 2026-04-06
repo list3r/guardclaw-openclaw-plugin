@@ -44,7 +44,7 @@ function detectionToDecision(
       action: "redirect",
       target: {
         provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
       },
       reason,
     };
@@ -60,7 +60,7 @@ function detectionToDecision(
       action: "redirect",
       target: {
         provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
       },
       reason,
     };

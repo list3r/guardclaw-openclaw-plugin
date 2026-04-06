@@ -228,13 +228,13 @@ except: pass
   echo ""
 
   # ── Detection classifier model ──
-  DEFAULT_DETECT_MODEL="qwen3.5:35b"
+  DEFAULT_DETECT_MODEL="qwen/qwen3-30b-a3b-2507"
   if [[ "$RAM_GB" -gt 0 && "$RAM_GB" -lt 16 ]]; then
     DEFAULT_DETECT_MODEL="qwen3:8b"
     echo "  ⚠ Under 16 GB RAM — suggesting smaller detection model."
   fi
   echo "  Detection classifier: small, fast model for real-time S1/S2/S3 classification."
-  echo "  Recommended: lfm2-8b-a1b (LM Studio) or a small Ollama model."
+  echo "  Recommended: qwen/qwen3-30b-a3b-2507 (LM Studio/Ollama) — MoE, only 3.3B active."
   echo "  Do NOT use a reasoning model here (e.g. QwQ, DeepSeek-R1) — they break JSON parsing."
   read -r -p "  Detection model [$DEFAULT_DETECT_MODEL]: " _dm
   DETECT_MODEL="${_dm:-$DEFAULT_DETECT_MODEL}"
@@ -279,7 +279,7 @@ except: pass
     "$PYTHON_CMD_CFG" -c "
 import json, os
 
-detect_model      = os.environ.get('DETECT_MODEL',      'qwen3.5:35b')
+detect_model      = os.environ.get('DETECT_MODEL',      'qwen/qwen3-30b-a3b-2507')
 guard_agent_model = os.environ.get('GUARD_AGENT_MODEL', 'ollama-server/qwen3.5:35b')
 endpoint          = os.environ.get('LOCAL_ENDPOINT',    'http://localhost:11434')
 provider          = os.environ.get('LOCAL_PROVIDER',    'ollama')

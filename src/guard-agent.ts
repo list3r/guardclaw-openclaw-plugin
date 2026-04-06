@@ -42,7 +42,7 @@ export function getGuardAgentConfig(config: PrivacyConfig): {
     return null;
   }
 
-  const fullModel = config.guardAgent?.model ?? "ollama/openbmb/minicpm4.1";
+  const fullModel = config.guardAgent?.model ?? "ollama/qwen/qwen3-30b-a3b-2507";
   const firstSlash = fullModel.indexOf("/");
   const defaultProvider = config.localModel?.provider ?? "ollama";
   const [provider, modelName] = firstSlash >= 0

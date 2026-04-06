@@ -63,7 +63,7 @@ const OPENROUTER_DEFAULT_MODEL = "auto";
 const DEFAULT_CONFIG: TokenSaverConfig = {
   enabled: false,
   judgeEndpoint: "http://localhost:11434",
-  judgeModel: "openbmb/minicpm4.1",
+  judgeModel: "qwen/qwen3-30b-a3b-2507",
   judgeProviderType: "openai-compatible",
   tiers: {
     SIMPLE:    { provider: "openai",    model: "gpt-4o-mini" },

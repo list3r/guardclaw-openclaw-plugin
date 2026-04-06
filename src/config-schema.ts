@@ -290,13 +290,13 @@ export const defaultPrivacyConfig = {
   localModel: {
     enabled: true,
     type: "openai-compatible" as const,
-    model: "openbmb/minicpm4.1",
-    endpoint: "http://localhost:11434",
+    model: "qwen/qwen3-30b-a3b-2507",
+    endpoint: "http://localhost:1234",
   },
   guardAgent: {
     id: "guard",
     workspace: "~/.openclaw/workspace-guard",
-    model: "ollama/openbmb/minicpm4.1",
+    model: "ollama/qwen/qwen3-30b-a3b-2507",
   },
   localProviders: [] as string[],
   toolAllowlist: [] as string[],

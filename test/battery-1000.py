@@ -14,7 +14,7 @@ CORRECTIONS_PATH = os.path.expanduser("~/.openclaw/guardclaw-corrections.json")
 # ── API helpers ──────────────────────────────────────────────────────────
 
 def chat(messages):
-    body = {"model": "lfm2-8b-a1b", "messages": messages, "temperature": 0.1, "max_tokens": 150, "stream": False}
+    body = {"model": "qwen/qwen3-30b-a3b-2507", "messages": messages, "temperature": 0.1, "max_tokens": 150, "stream": False}
     r = subprocess.run(["curl", "-s", "--max-time", "60", f"{API}/v1/chat/completions",
         "-H", "Content-Type: application/json", "-d", json.dumps(body)],
         capture_output=True, text=True, timeout=65)

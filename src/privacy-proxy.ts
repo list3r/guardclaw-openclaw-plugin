@@ -584,6 +584,97 @@ async function tryStreamUpstream(
   return true;
 }
 
+// ── GCF-031: Circuit breaker per upstream target ──
+
+type CircuitState = "closed" | "open" | "half-open";
+type CircuitEntry = {
+  state: CircuitState;
+  failures: number;
+  lastFailure: number;
+  lastSuccess: number;
+};
+
+const CIRCUIT_FAILURE_THRESHOLD = 3;
+const CIRCUIT_COOLDOWN_MS = 30_000;
+const circuitBreakers = new Map<string, CircuitEntry>();
+
+function getCircuit(key: string): CircuitEntry {
+  let entry = circuitBreakers.get(key);
+  if (!entry) {
+    entry = { state: "closed", failures: 0, lastFailure: 0, lastSuccess: 0 };
+    circuitBreakers.set(key, entry);
+  }
+  // Transition open → half-open after cooldown
+  if (entry.state === "open" && Date.now() - entry.lastFailure > CIRCUIT_COOLDOWN_MS) {
+    entry.state = "half-open";
+  }
+  return entry;
+}
+
+function recordUpstreamSuccess(key: string): void {
+  const entry = getCircuit(key);
+  entry.state = "closed";
+  entry.failures = 0;
+  entry.lastSuccess = Date.now();
+}
+
+function recordUpstreamFailure(key: string): boolean {
+  const entry = getCircuit(key);
+  entry.failures++;
+  entry.lastFailure = Date.now();
+  if (entry.failures >= CIRCUIT_FAILURE_THRESHOLD) {
+    entry.state = "open";
+    return true; // circuit just opened
+  }
+  return false;
+}
+
+function isCircuitOpen(key: string): boolean {
+  return getCircuit(key).state === "open";
+}
+
+// ── GCF-032: Upstream concurrency limiter ──
+
+class Semaphore {
+  private _current = 0;
+  private _queue: Array<() => void> = [];
+  constructor(private _max: number) {}
+
+  async acquire(timeoutMs: number): Promise<boolean> {
+    if (this._current < this._max) {
+      this._current++;
+      return true;
+    }
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        const idx = this._queue.indexOf(cb);
+        if (idx !== -1) this._queue.splice(idx, 1);
+        resolve(false);
+      }, timeoutMs);
+      const cb = () => {
+        clearTimeout(timer);
+        this._current++;
+        resolve(true);
+      };
+      this._queue.push(cb);
+    });
+  }
+
+  release(): void {
+    this._current--;
+    if (this._queue.length > 0) {
+      const next = this._queue.shift()!;
+      next();
+    }
+  }
+
+  get active(): number { return this._current; }
+  get queued(): number { return this._queue.length; }
+}
+
+const DEFAULT_PROXY_CONCURRENCY = 5;
+const SEMAPHORE_TIMEOUT_MS = 10_000;
+
 // ── Proxy server ──
 
 export async function startPrivacyProxy(
@@ -597,6 +688,9 @@ export async function startPrivacyProxy(
   };
   /** Per-request tracing — only emits when guardclaw.json → privacy.debugLogging is true. */
   const logDebug = (m: string): void => { if (getLiveConfig().debugLogging) log.info(m); };
+
+  const proxyConcurrency = (getLiveConfig() as Record<string, unknown>).proxyConcurrency as number | undefined ?? DEFAULT_PROXY_CONCURRENCY;
+  const upstreamSemaphore = new Semaphore(proxyConcurrency);
 
   const server = http.createServer(async (req, res) => {
     if (req.method !== "POST") {
@@ -812,6 +906,26 @@ export async function startPrivacyProxy(
       // Step 4: Build upstream URL (transparent path forwarding)
       const upstreamUrl = buildUpstreamUrl(target.baseUrl, req.url, target);
 
+      // GCF-031: Circuit breaker — reject immediately if upstream is known-down
+      const circuitKey = target.baseUrl;
+      if (isCircuitOpen(circuitKey)) {
+        log.warn(`[GuardClaw Proxy] Circuit OPEN for ${circuitKey} — rejecting without upstream call`);
+        res.writeHead(503, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({ error: { message: "Upstream circuit breaker open — retrying in 30s", type: "circuit_open" } }));
+        req.socket.destroy();
+        return;
+      }
+
+      // GCF-032: Concurrency limiter — queue or reject if at capacity
+      const acquired = await upstreamSemaphore.acquire(SEMAPHORE_TIMEOUT_MS);
+      if (!acquired) {
+        log.warn(`[GuardClaw Proxy] Upstream concurrency limit reached (active=${upstreamSemaphore.active}, queued=${upstreamSemaphore.queued}) — rejecting`);
+        res.writeHead(503, { "Content-Type": "application/json", "Connection": "close" });
+        res.end(JSON.stringify({ error: { message: "Upstream concurrency limit exceeded", type: "concurrency_limit" } }));
+        req.socket.destroy();
+        return;
+      }
+
       // Step 5: Forward cleaned request with provider-aware auth
       const upstreamHeaders: Record<string, string> = {
         "Content-Type": "application/json",
@@ -831,9 +945,11 @@ export async function startPrivacyProxy(
       const streamUpstream = clientWantsStream;
       logDebug(`[GuardClaw Proxy] → ${upstreamUrl} (stream=${clientWantsStream}, upstreamStream=${streamUpstream}, model=${requestModel ?? "unknown"}, provider=${target.provider})`);
 
+      let upstreamOk = false;
+      try {
       if (streamUpstream) {
         const streamOk = await tryStreamUpstream(parsed, upstreamUrl, upstreamHeaders, res, log);
-        if (streamOk) return;
+        if (streamOk) { upstreamOk = true; recordUpstreamSuccess(circuitKey); return; }
         logDebug("[GuardClaw Proxy] Streaming unavailable, falling back to non-streaming + SSE conversion");
       }
 
@@ -851,6 +967,8 @@ export async function startPrivacyProxy(
         });
       } catch (fetchErr) {
         clearTimeout(nonStreamTimeout);
+        const opened = recordUpstreamFailure(circuitKey);
+        if (opened) log.warn(`[GuardClaw Proxy] Circuit OPENED for ${circuitKey} after ${CIRCUIT_FAILURE_THRESHOLD} consecutive failures`);
         const isTimeout = fetchErr instanceof Error && fetchErr.name === "AbortError";
         const clientMsg = isTimeout ? "Upstream request timed out (120s)" : "Upstream request failed";
         log.error(`[GuardClaw Proxy] Upstream fetch failed: ${String(fetchErr)}`);
@@ -860,6 +978,8 @@ export async function startPrivacyProxy(
         return;
       }
       clearTimeout(nonStreamTimeout);
+      upstreamOk = true;
+      recordUpstreamSuccess(circuitKey);
 
       // Read the upstream response body safely
       const responseText = await upstream.text();
@@ -899,6 +1019,10 @@ export async function startPrivacyProxy(
         const contentType = upstream.headers.get("content-type") ?? "application/json";
         res.writeHead(upstream.status, { "Content-Type": contentType });
         res.end(responseText);
+      }
+      } finally {
+        // GCF-032: Always release semaphore
+        upstreamSemaphore.release();
       }
     } catch (err) {
       log.error(`[GuardClaw Proxy] Request failed: ${String(err)}`);

@@ -407,7 +407,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             api.logger.info("[GuardClaw] Budget exceeded — routing to local model");
             const guardCfg = getGuardAgentConfig(privacyConfig);
             const localProvider = guardCfg?.provider ?? privacyConfig.localModel?.provider ?? "ollama";
-            const localModel = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
+            const localModel = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
             return { providerOverride: localProvider, modelOverride: localModel };
           }
         } else if (budgetStatus.warning) {
@@ -693,7 +693,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
+        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
         gcDebug(api.logger, `[GuardClaw] S3 (rule fast-path) — routing to ${provider}/${model}`);
         return { providerOverride: provider, modelOverride: model };
       }
@@ -753,10 +753,10 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
-        gcDebug(api.logger, `[GuardClaw] S3 — routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"} [${decision.routerId}]`);
+        gcDebug(api.logger, `[GuardClaw] S3 — routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"} [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
         };
       }
 
@@ -781,7 +781,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const fallbackProvider = privacyConfig.localModel?.provider ?? "ollama";
           return {
             providerOverride: guardCfg?.provider ?? fallbackProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
           };
         }
         desensitized = result.desensitized;
@@ -856,7 +856,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         api.logger.warn(`[GuardClaw] ${decision.level} BLOCK — redirecting to edge model [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
         };
       }
 
@@ -879,7 +879,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           gcDebug(api.logger, `[GuardClaw] S3 TRANSFORM — routing to edge model [${decision.routerId}]`);
           return {
             providerOverride: guardCfg?.provider ?? defaultProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
           };
         }
 
@@ -901,7 +901,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             gcDebug(api.logger, `[GuardClaw] S2 TRANSFORM — routing to local ${guardCfg?.provider ?? defaultProvider} [${decision.routerId}]`);
             return {
               providerOverride: guardCfg?.provider ?? defaultProvider,
-              modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+              modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
             };
           }
 
@@ -1480,6 +1480,27 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       const textContent = extractMessageText(msg);
       if (!textContent || textContent.length < 10) return;
+
+      // ── GCF-030: Tool-noise early exit ────────────────────────────────────
+      // Short status messages from tool calls ("✓ Created", "Running grep...",
+      // exit codes, whitespace-only) are overwhelmingly S1. Running them
+      // through the full S2 pipeline (rules, rolling buffer, injection
+      // heuristics, sync LLM, taint tracking) generates useless proxy
+      // requests that amplify into TCP connection storms during multi-tool
+      // turns. Skip the heavy path for clearly benign output; still write
+      // to dual-track for audit if the session is already private.
+      if (textContent.length < 200 && isToolNoise(textContent, ctx.toolName)) {
+        if (isSessionMarkedPrivate(sessionKey)) {
+          const sessionManager = getDefaultSessionManager();
+          sessionManager.writeToFull(sessionKey, {
+            role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
+          }).catch(() => {});
+          sessionManager.writeToClean(sessionKey, {
+            role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
+          }).catch(() => {});
+        }
+        return;
+      }
 
       // ── GCF-002: Cross-turn rolling buffer detection ──────────────────────
       // Append content to the per-session 500-char sliding window and run
@@ -2120,7 +2141,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
+        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
         api.logger.info(`[GuardClaw] Subagent ${decision.level} — routing to ${provider}/${model}`);
         return {
           providerOverride: provider,
@@ -2134,7 +2155,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const guardCfg = getGuardAgentConfig(privacyCfg);
           const fallbackProvider = privacyCfg.localModel?.provider ?? "ollama";
           const provider = guardCfg?.provider ?? fallbackProvider;
-          const model = guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "openbmb/minicpm4.1";
+          const model = guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
           api.logger.warn(`[GuardClaw] Subagent S2 desensitization failed — routing to local ${provider}/${model}`);
           return { providerOverride: provider, modelOverride: model };
         }
@@ -2306,6 +2327,40 @@ function isGuardNetworkCommand(command: string): string | null {
     if (pattern.test(command)) return tool;
   }
   return null;
+}
+
+/**
+ * GCF-030: Detect tool-noise — short, non-sensitive tool status output that
+ * should bypass the heavy S2 pipeline (rules, injection heuristics, sync LLM,
+ * taint tracking, proxy forwarding) to prevent connection storms.
+ *
+ * Returns true when the text is overwhelmingly likely to be benign status.
+ * Conservative: any doubt → returns false → full pipeline runs.
+ */
+const TOOL_NOISE_PATTERNS = /^\s*(?:[\u2713\u2714\u2715\u2716\u2022\u25cf\u25cb•·\-\*]\s*)?(?:ok|done|success|created|updated|deleted|wrote|saved|started|stopped|finished|completed|running|exited?\s*(?:code\s*)?\d*|true|false|null|undefined|\d+(?:\.\d+)?\s*(?:ms|s|sec|bytes?|[kmg]b)?|no\s+(?:results?|matches?|changes?|output)|\[\d+\/\d+\]|\d+\s+files?|empty|skipped|unchanged|passed|failed|error|warning|\{\}|\[\]|\s*)$/i;
+
+const TOOL_NOISE_TOOL_NAMES = new Set([
+  "list_dir", "list_directory", "ls", "search_files", "find_files",
+  "task_status", "task_progress", "get_status", "ping", "health_check",
+  "list_sessions", "list_agents",
+]);
+
+// Words that signal potentially sensitive content — never treat as noise
+const SENSITIVE_WORDS_RE = /\b(?:password|passphrase|passwd|secret|token|credential|api.?key|private.?key|auth|ssn|salary|payroll|diagnosis|diagnos|patient|medical|prescription|bank|account|routing|bsb|acn|abn|tfn|medicare|ssn|license|passport|encrypt|decrypt)\b/i;
+
+function isToolNoise(text: string, toolName?: string): boolean {
+  const trimmed = text.trim();
+  // Empty or whitespace-only
+  if (!trimmed) return true;
+  // Known status-only tools
+  if (toolName && TOOL_NOISE_TOOL_NAMES.has(toolName)) return true;
+  // Matches common status patterns ("done", "ok", exit codes, etc.)
+  if (TOOL_NOISE_PATTERNS.test(trimmed)) return true;
+  // Single-line short output with no PII-indicative characters AND no sensitive words
+  if (!trimmed.includes("\n") && trimmed.length < 80
+      && !/[@\d]{4,}|\b\d{3}[-.]\d{3}/.test(trimmed)
+      && !SENSITIVE_WORDS_RE.test(trimmed)) return true;
+  return false;
 }
 
 function shouldSkipMessage(msg: string): boolean {

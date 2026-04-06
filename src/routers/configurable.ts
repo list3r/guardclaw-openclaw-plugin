@@ -154,7 +154,7 @@ function resolveTargetForLevel(
     const defaultProvider = pCfg.localModel?.provider ?? "ollama";
     return {
       provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "openbmb/minicpm4.1",
+      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
     };
   }
   // S2
@@ -164,7 +164,7 @@ function resolveTargetForLevel(
     const defaultProvider = pCfg.localModel?.provider ?? "ollama";
     return {
       provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "openbmb/minicpm4.1",
+      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
     };
   }
   return { provider: "guardclaw-privacy", model: "" };

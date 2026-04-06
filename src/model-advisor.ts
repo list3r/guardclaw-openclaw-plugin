@@ -458,7 +458,7 @@ async function checkLLMFitModels(minDiskGb: number): Promise<ModelSuggestion[]> 
     return [];
   }
 
-  const currentJudge = getLiveConfig().localModel?.model ?? "openbmb/minicpm4.1";
+  const currentJudge = getLiveConfig().localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
 
   const freeDiskGb = await getFreeDiskGb();
   const suggestions: ModelSuggestion[] = [];
@@ -692,7 +692,7 @@ export async function runAdvisorChecks(): Promise<void> {
     if (benchmarkEnabled) {
       const privacy = getLiveConfig();
       const localEndpoint = privacy.localModel?.endpoint ?? "http://localhost:11434";
-      const localModel = privacy.localModel?.model ?? "openbmb/minicpm4.1";
+      const localModel = privacy.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
       const providerType = (privacy.localModel?.type ?? "openai-compatible") as EdgeProviderType;
 
       // Benchmark current judge model as baseline

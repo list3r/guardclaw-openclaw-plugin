@@ -272,13 +272,13 @@ var defaultPrivacyConfig = {
   localModel: {
     enabled: true,
     type: "openai-compatible",
-    model: "openbmb/minicpm4.1",
-    endpoint: "http://localhost:11434"
+    model: "qwen/qwen3-30b-a3b-2507",
+    endpoint: "http://localhost:1234"
   },
   guardAgent: {
     id: "guard",
     workspace: "~/.openclaw/workspace-guard",
-    model: "ollama/openbmb/minicpm4.1"
+    model: "ollama/qwen/qwen3-30b-a3b-2507"
   },
   localProviders: [],
   toolAllowlist: [],
@@ -1741,7 +1741,8 @@ async function callOpenAICompatible(endpoint, model, messages, options) {
       stream: true,
       ...options?.stop ? { stop: options.stop } : {},
       ...options?.frequencyPenalty != null ? { frequency_penalty: options.frequencyPenalty } : {},
-      ...options?.disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {}
+      ...options?.disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {},
+      ...options?.responseFormat ? { response_format: options.responseFormat } : {}
     }),
     signal: AbortSignal.timeout(GUARDCLAW_FETCH_TIMEOUT_MS)
   });
@@ -1972,7 +1973,7 @@ async function buildDetectionMessages(context) {
   return { system, user: fewShotPrefix + contentParts.join("\n") };
 }
 async function callLocalModel(systemPrompt, userContent, config) {
-  const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
   const providerType = config.localModel?.type ?? "openai-compatible";
   return await callChatCompletion(
@@ -1989,7 +1990,24 @@ async function callLocalModel(systemPrompt, userContent, config) {
       apiKey: config.localModel?.apiKey,
       disableThinking: true,
       providerType,
-      customModule: config.localModel?.module
+      customModule: config.localModel?.module,
+      // GCF-033: Enforce structured JSON output for classification
+      responseFormat: {
+        type: "json_schema",
+        json_schema: {
+          name: "sensitivity_classification",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              level: { type: "string", enum: ["S1", "S2", "S3"] },
+              reason: { type: "string" }
+            },
+            required: ["level", "reason"],
+            additionalProperties: false
+          }
+        }
+      }
     }
   );
 }
@@ -2054,7 +2072,7 @@ async function desensitizeWithLocalModel(content, config, sessionKey) {
   const preRedacted = preRedactCredentials(content);
   try {
     const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-    const model = config.localModel?.model ?? "openbmb/minicpm4.1";
+    const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
     const providerType = config.localModel?.type ?? "openai-compatible";
     const customModule = config.localModel?.module;
     const piiItems = await extractPiiWithModel(endpoint, model, preRedacted, {
@@ -2163,7 +2181,34 @@ async function extractPiiWithModel(endpoint, model, content, opts) {
       apiKey: opts?.apiKey,
       disableThinking: true,
       providerType: opts?.providerType,
-      customModule: opts?.customModule
+      customModule: opts?.customModule,
+      // GCF-033: Enforce structured JSON output for PII extraction
+      responseFormat: {
+        type: "json_schema",
+        json_schema: {
+          name: "pii_extraction",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              items: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    type: { type: "string" },
+                    value: { type: "string" }
+                  },
+                  required: ["type", "value"],
+                  additionalProperties: false
+                }
+              }
+            },
+            required: ["items"],
+            additionalProperties: false
+          }
+        }
+      }
     }
   );
   if (result.usage) {
@@ -2182,6 +2227,15 @@ async function extractPiiWithModel(endpoint, model, content, opts) {
 function parsePiiJson(raw) {
   let cleaned = raw.replace(/\s+/g, " ").trim();
   cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  try {
+    const wrapper = JSON.parse(cleaned);
+    if (Array.isArray(wrapper.items)) {
+      return wrapper.items.filter(
+        (item) => item && typeof item === "object" && typeof item.type === "string" && typeof item.value === "string"
+      );
+    }
+  } catch {
+  }
   const arrayStart = cleaned.indexOf("[");
   if (arrayStart < 0) return [];
   let jsonStr = cleaned.slice(arrayStart);
