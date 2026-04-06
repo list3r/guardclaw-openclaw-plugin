@@ -1,761 +1,275 @@
-// src/config-schema.ts
-import { Type } from "@sinclair/typebox";
-var guardClawConfigSchema = Type.Object({
-  injection: Type.Optional(
-    Type.Object({
-      enabled: Type.Optional(Type.Boolean()),
-      heuristics_only: Type.Optional(Type.Boolean()),
-      block_threshold: Type.Optional(Type.Number()),
-      sanitise_threshold: Type.Optional(Type.Number()),
-      alert_channel: Type.Optional(Type.String()),
-      exempt_sources: Type.Optional(Type.Array(Type.String())),
-      exempt_senders: Type.Optional(Type.Array(Type.String())),
-      banned_senders: Type.Optional(Type.Array(Type.String()))
-    })
-  ),
-  privacy: Type.Optional(
-    Type.Object({
-      enabled: Type.Optional(Type.Boolean()),
-      s2Policy: Type.Optional(
-        Type.Union([Type.Literal("proxy"), Type.Literal("local")])
-      ),
-      s3Policy: Type.Optional(
-        Type.Union([
-          Type.Literal("local-only"),
-          Type.Literal("redact-and-forward"),
-          Type.Literal("synthesize")
-        ])
-      ),
-      synthesis: Type.Optional(
-        Type.Object({
-          fallback: Type.Optional(Type.Union([Type.Literal("local-only"), Type.Literal("block")])),
-          verifyOutput: Type.Optional(Type.Boolean()),
-          maxRetries: Type.Optional(Type.Number()),
-          maxInputChars: Type.Optional(Type.Number()),
-          timeoutMs: Type.Optional(Type.Number())
-        })
-      ),
-      proxyPort: Type.Optional(Type.Number()),
-      checkpoints: Type.Optional(
-        Type.Object({
-          onUserMessage: Type.Optional(
-            Type.Array(
-              Type.Union([Type.Literal("ruleDetector"), Type.Literal("localModelDetector")])
-            )
-          ),
-          onToolCallProposed: Type.Optional(
-            Type.Array(
-              Type.Union([Type.Literal("ruleDetector"), Type.Literal("localModelDetector")])
-            )
-          ),
-          onToolCallExecuted: Type.Optional(
-            Type.Array(
-              Type.Union([Type.Literal("ruleDetector"), Type.Literal("localModelDetector")])
-            )
-          )
-        })
-      ),
-      rules: Type.Optional(
-        Type.Object({
-          keywords: Type.Optional(
-            Type.Object({
-              S2: Type.Optional(Type.Array(Type.String())),
-              S3: Type.Optional(Type.Array(Type.String()))
-            })
-          ),
-          patterns: Type.Optional(
-            Type.Object({
-              S2: Type.Optional(Type.Array(Type.String())),
-              S3: Type.Optional(Type.Array(Type.String()))
-            })
-          ),
-          tools: Type.Optional(
-            Type.Object({
-              S2: Type.Optional(
-                Type.Object({
-                  tools: Type.Optional(Type.Array(Type.String())),
-                  paths: Type.Optional(Type.Array(Type.String()))
-                })
-              ),
-              S3: Type.Optional(
-                Type.Object({
-                  tools: Type.Optional(Type.Array(Type.String())),
-                  paths: Type.Optional(Type.Array(Type.String()))
-                })
-              )
-            })
-          )
-        })
-      ),
-      localModel: Type.Optional(
-        Type.Object({
-          enabled: Type.Optional(Type.Boolean()),
-          type: Type.Optional(
-            Type.Union([
-              Type.Literal("openai-compatible"),
-              Type.Literal("ollama-native"),
-              Type.Literal("custom")
-            ])
-          ),
-          provider: Type.Optional(Type.String()),
-          model: Type.Optional(Type.String()),
-          endpoint: Type.Optional(Type.String()),
-          apiKey: Type.Optional(Type.String()),
-          module: Type.Optional(Type.String())
-        })
-      ),
-      guardAgent: Type.Optional(
-        Type.Object({
-          id: Type.Optional(Type.String()),
-          workspace: Type.Optional(Type.String()),
-          model: Type.Optional(Type.String())
-        })
-      ),
-      localProviders: Type.Optional(Type.Array(Type.String())),
-      toolAllowlist: Type.Optional(Type.Array(Type.String())),
-      modelPricing: Type.Optional(
-        Type.Record(
-          Type.String(),
-          Type.Object({
-            inputPer1M: Type.Optional(Type.Number()),
-            outputPer1M: Type.Optional(Type.Number())
-          })
-        )
-      ),
-      session: Type.Optional(
-        Type.Object({
-          isolateGuardHistory: Type.Optional(Type.Boolean()),
-          baseDir: Type.Optional(Type.String()),
-          injectDualHistory: Type.Optional(Type.Boolean()),
-          historyLimit: Type.Optional(Type.Number())
-        })
-      ),
-      routers: Type.Optional(
-        Type.Record(
-          Type.String(),
-          Type.Object({
-            enabled: Type.Optional(Type.Boolean()),
-            type: Type.Optional(Type.Union([Type.Literal("builtin"), Type.Literal("custom"), Type.Literal("configurable")])),
-            module: Type.Optional(Type.String()),
-            weight: Type.Optional(Type.Number()),
-            options: Type.Optional(Type.Record(Type.String(), Type.Unknown()))
-          })
-        )
-      ),
-      pipeline: Type.Optional(
-        Type.Object({
-          onUserMessage: Type.Optional(Type.Array(Type.String())),
-          onToolCallProposed: Type.Optional(Type.Array(Type.String())),
-          onToolCallExecuted: Type.Optional(Type.Array(Type.String()))
-        })
-      ),
-      redaction: Type.Optional(
-        Type.Object({
-          internalIp: Type.Optional(Type.Boolean()),
-          email: Type.Optional(Type.Boolean()),
-          envVar: Type.Optional(Type.Boolean()),
-          creditCard: Type.Optional(Type.Boolean()),
-          chinesePhone: Type.Optional(Type.Boolean()),
-          chineseId: Type.Optional(Type.Boolean()),
-          chineseAddress: Type.Optional(Type.Boolean()),
-          pin: Type.Optional(Type.Boolean())
-        })
-      ),
-      webhooks: Type.Optional(
-        Type.Array(
-          Type.Object({
-            url: Type.String(),
-            format: Type.Optional(
-              Type.Union([
-                Type.Literal("json"),
-                Type.Literal("discord"),
-                Type.Literal("slack")
-              ])
-            ),
-            events: Type.Optional(Type.Array(Type.String())),
-            secret: Type.Optional(Type.String())
-          })
-        )
-      ),
-      responseScanning: Type.Optional(
-        Type.Object({
-          enabled: Type.Optional(Type.Boolean()),
-          action: Type.Optional(
-            Type.Union([
-              Type.Literal("warn"),
-              Type.Literal("redact"),
-              Type.Literal("block")
-            ])
-          ),
-          scanSecrets: Type.Optional(Type.Boolean()),
-          scanPii: Type.Optional(Type.Boolean())
-        })
-      ),
-      budget: Type.Optional(
-        Type.Object({
-          enabled: Type.Optional(Type.Boolean()),
-          dailyCap: Type.Optional(Type.Number()),
-          monthlyCap: Type.Optional(Type.Number()),
-          action: Type.Optional(
-            Type.Union([
-              Type.Literal("warn"),
-              Type.Literal("pause_cloud"),
-              Type.Literal("block")
-            ])
-          ),
-          warnAt: Type.Optional(Type.Number())
-        })
-      ),
-      behavioralAttestation: Type.Optional(
-        Type.Object({
-          enabled: Type.Optional(Type.Boolean()),
-          logOnly: Type.Optional(Type.Boolean()),
-          windowSize: Type.Optional(Type.Number()),
-          blockThreshold: Type.Optional(Type.Number())
-        })
-      ),
-      modelAdvisor: Type.Optional(
-        Type.Object({
-          enabled: Type.Optional(Type.Boolean()),
-          checkIntervalWeeks: Type.Optional(Type.Number()),
-          minSavingsPercent: Type.Optional(Type.Number()),
-          minDiskSpaceGb: Type.Optional(Type.Number()),
-          openrouterApiKey: Type.Optional(Type.String()),
-          openrouter: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
-          llmfit: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
-          deberta: Type.Optional(Type.Object({
-            enabled: Type.Optional(Type.Boolean()),
-            autoUpdate: Type.Optional(Type.Boolean())
-          })),
-          benchmark: Type.Optional(
-            Type.Object({
-              enabled: Type.Optional(Type.Boolean()),
-              runs: Type.Optional(Type.Number())
-            })
-          )
-        })
-      ),
-      taintTracking: Type.Optional(
-        Type.Object({
-          enabled: Type.Optional(Type.Boolean()),
-          minValueLength: Type.Optional(Type.Number()),
-          trackS2: Type.Optional(Type.Boolean())
-        })
-      ),
-      debugLogging: Type.Optional(Type.Boolean())
-    })
-  )
-});
-var defaultPrivacyConfig = {
-  enabled: true,
-  s2Policy: "proxy",
-  proxyPort: 8403,
-  checkpoints: {
-    onUserMessage: ["ruleDetector", "localModelDetector"],
-    onToolCallProposed: ["ruleDetector"],
-    onToolCallExecuted: ["ruleDetector"]
-  },
-  rules: {
-    keywords: {
-      S2: [],
-      S3: []
-    },
-    patterns: {
-      S2: [],
-      S3: []
-    },
-    tools: {
-      S2: { tools: [], paths: [] },
-      S3: { tools: [], paths: [] }
-    }
-  },
-  localModel: {
-    enabled: true,
-    type: "openai-compatible",
-    model: "qwen/qwen3-30b-a3b-2507",
-    endpoint: "http://localhost:1234"
-  },
-  guardAgent: {
-    id: "guard",
-    workspace: "~/.openclaw/workspace-guard",
-    model: "ollama/qwen/qwen3-30b-a3b-2507"
-  },
-  localProviders: [],
-  toolAllowlist: [],
-  modelPricing: {
-    "claude-sonnet-4.6": { inputPer1M: 3, outputPer1M: 15 },
-    "claude-3.5-sonnet": { inputPer1M: 3, outputPer1M: 15 },
-    "claude-3.5-haiku": { inputPer1M: 0.8, outputPer1M: 4 },
-    "gpt-4o": { inputPer1M: 2.5, outputPer1M: 10 },
-    "gpt-4o-mini": { inputPer1M: 0.15, outputPer1M: 0.6 },
-    "o4-mini": { inputPer1M: 1.1, outputPer1M: 4.4 },
-    "gemini-2.0-flash": { inputPer1M: 0.1, outputPer1M: 0.4 },
-    "deepseek-chat": { inputPer1M: 0.27, outputPer1M: 1.1 }
-  },
-  debugLogging: false,
-  redaction: {
-    internalIp: false,
-    email: false,
-    envVar: false,
-    creditCard: false,
-    chinesePhone: false,
-    chineseId: false,
-    chineseAddress: false,
-    pin: false
-  },
-  session: {
-    isolateGuardHistory: true,
-    baseDir: "~/.openclaw",
-    injectDualHistory: true,
-    historyLimit: 20
-  },
-  routers: {
-    privacy: { enabled: true, type: "builtin" }
-  },
-  pipeline: {
-    onUserMessage: ["privacy"],
-    onToolCallProposed: ["privacy"],
-    onToolCallExecuted: ["privacy"]
-  },
-  responseScanning: {
-    enabled: true,
-    action: "warn",
-    scanSecrets: true,
-    scanPii: false
-  },
-  behavioralAttestation: {
-    enabled: false,
-    // flip to true to start collecting data
-    logOnly: true,
-    // true = log+score only, never blocks; false = active gating
-    windowSize: 10,
-    blockThreshold: 0.8
-  },
-  modelAdvisor: {
-    enabled: false,
-    checkIntervalWeeks: 2,
-    minSavingsPercent: 20,
-    minDiskSpaceGb: 10,
-    openrouter: { enabled: true },
-    llmfit: { enabled: true },
-    deberta: { enabled: true, autoUpdate: true },
-    benchmark: { enabled: true, runs: 3 }
-  },
-  taintTracking: {
-    enabled: true,
-    minValueLength: 8,
-    trackS2: false
+// src/prompt-loader.ts
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+var __filename = fileURLToPath(import.meta.url);
+var __dirname = dirname(__filename);
+function resolvePromptsDir() {
+  const candidates = [
+    resolve(__dirname, "../prompts"),
+    // from src/  → prompts/
+    resolve(__dirname, "../../prompts")
+    // from dist/src/ → prompts/
+  ];
+  for (const dir of candidates) {
+    if (existsSync(dir)) return dir;
   }
-};
-var defaultInjectionConfig = {
-  enabled: true,
-  heuristics_only: false,
-  block_threshold: 70,
-  sanitise_threshold: 30,
-  alert_channel: "1483608914774986943",
-  exempt_sources: [],
-  exempt_senders: ["1317396442993922061"],
-  banned_senders: []
-};
-
-// src/injection/deberta.ts
-var BASE_URL = (() => {
-  const envUrl = process.env.GUARDCLAW_DEBERTA_URL;
-  const DEFAULT = "http://127.0.0.1:8404";
-  if (!envUrl) return DEFAULT;
-  const base = envUrl.endsWith("/classify") ? envUrl.slice(0, -"/classify".length) : envUrl;
+  return candidates[0];
+}
+var PROMPTS_DIR = resolvePromptsDir();
+var cache = /* @__PURE__ */ new Map();
+function loadPrompt(name, fallback) {
+  const cached = cache.get(name);
+  if (cached !== void 0) return cached;
+  const filePath = resolve(PROMPTS_DIR, `${name}.md`);
+  let content;
   try {
-    const parsed = new URL(base);
-    if (parsed.protocol !== "http:") {
-      console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL rejected \u2014 only http: scheme allowed (got ${parsed.protocol}). Using default.`);
-      return DEFAULT;
+    if (existsSync(filePath)) {
+      content = readFileSync(filePath, "utf-8").trim();
+      console.log(`[GuardClaw] Loaded custom prompt: prompts/${name}.md`);
+    } else {
+      content = fallback;
     }
-    const host = parsed.hostname;
-    if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
-      console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL rejected \u2014 non-loopback host '${host}' not allowed (SSRF prevention). Using default.`);
-      return DEFAULT;
-    }
-    return base;
   } catch {
-    console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL is not a valid URL \u2014 using default.`);
-    return DEFAULT;
+    console.warn(`[GuardClaw] Failed to read prompts/${name}.md, using default`);
+    content = fallback;
   }
-})();
-var ENDPOINT = `${BASE_URL}/classify`;
-var RELOAD_ENDPOINT = `${BASE_URL}/reload`;
-var TIMEOUT_MS = 5e3;
-var RELOAD_TIMEOUT_MS = 3e5;
-var ALLOWED_DEBERTA_MODELS = /* @__PURE__ */ new Set([
-  "protectai/deberta-v3-base-prompt-injection-v2",
-  "protectai/deberta-v3-base-prompt-injection",
-  "laiyer/deberta-v3-base-prompt-injection"
-]);
-var RELOAD_API_TOKEN = process.env.GUARDCLAW_DEBERTA_RELOAD_TOKEN ?? "";
-async function triggerDebertaReload(modelId) {
-  if (!ALLOWED_DEBERTA_MODELS.has(modelId)) {
-    console.warn(`[GuardClaw] DeBERTa reload rejected \u2014 model '${modelId}' is not in the allowlist.`);
-    return { ok: false, message: `Model '${modelId}' not in allowed list` };
+  cache.set(name, content);
+  return content;
+}
+function loadPromptWithVars(name, fallback, vars) {
+  let prompt = loadPrompt(name, fallback);
+  for (const [key, value] of Object.entries(vars)) {
+    prompt = prompt.replaceAll(`{{${key}}}`, value);
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RELOAD_TIMEOUT_MS);
+  return prompt;
+}
+function invalidatePrompt(name) {
+  cache.delete(name);
+}
+function sanitizePromptName(name) {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+}
+function writePrompt(name, content) {
+  const safe = sanitizePromptName(name);
+  if (!safe) throw new Error(`Invalid prompt name: ${name}`);
+  mkdirSync(PROMPTS_DIR, { recursive: true });
+  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
+  writeFileSync(filePath, content, { encoding: "utf-8", mode: 384 });
+  invalidatePrompt(safe);
+}
+function readPromptFromDisk(name) {
+  const safe = sanitizePromptName(name);
+  if (!safe) return null;
+  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
   try {
-    const headers = { "Content-Type": "application/json" };
-    if (RELOAD_API_TOKEN) {
-      headers["X-GuardClaw-Token"] = RELOAD_API_TOKEN;
+    if (existsSync(filePath)) {
+      return readFileSync(filePath, "utf-8").trim();
     }
-    const res = await fetch(RELOAD_ENDPOINT, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ model: modelId }),
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    if (!res.ok) return { ok: false, message: `HTTP ${res.status}` };
-    const data = await res.json();
-    return { ok: true, message: data.note ?? `Loaded ${data.model ?? modelId}` };
-  } catch (err) {
-    clearTimeout(timer);
-    return { ok: false, message: err.name === "AbortError" ? "Timeout" : err.message ?? "Service unreachable" };
+  } catch {
   }
+  return null;
 }
-async function runDebertaClassifier(content) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+// src/correction-store.ts
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
+import { join, dirname as dirname2 } from "path";
+var DEFAULT_FILE_PATH = join(
+  process.env.HOME ?? "/tmp",
+  ".openclaw",
+  "guardclaw-corrections.json"
+);
+var DEFAULT_EMBEDDING_ENDPOINT = "http://localhost:1234";
+var DEFAULT_EMBEDDING_MODEL = "text-embedding-nomic-embed-text-v1.5";
+var DEFAULT_MAX_CORRECTIONS = 200;
+var DEFAULT_TOP_K = 3;
+var EMBEDDING_TIMEOUT_MS = 1e4;
+var corrections = [];
+var storeConfig = {};
+var loaded = false;
+function resolveFilePath() {
+  return storeConfig.filePath ?? DEFAULT_FILE_PATH;
+}
+function loadCorrections(config) {
+  if (config) storeConfig = config;
+  const filePath = resolveFilePath();
   try {
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    if (!res.ok) {
-      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
+    if (existsSync2(filePath)) {
+      const raw = JSON.parse(readFileSync2(filePath, "utf-8"));
+      corrections = Array.isArray(raw.corrections) ? raw.corrections : [];
     }
-    const data = await res.json();
-    return data;
+  } catch {
+    console.warn("[GuardClaw] Failed to load corrections, starting fresh");
+    corrections = [];
+  }
+  loaded = true;
+  return corrections;
+}
+function saveCorrections() {
+  const filePath = resolveFilePath();
+  try {
+    mkdirSync2(dirname2(filePath), { recursive: true });
+    writeFileSync2(
+      filePath,
+      JSON.stringify({ corrections, updatedAt: (/* @__PURE__ */ new Date()).toISOString() }, null, 2),
+      "utf-8"
+    );
   } catch (err) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") {
-      return { label: 0, score: 0, injection: false, error: "Timeout" };
-    }
-    return { label: 0, score: 0, injection: false, error: err.message ?? "Unknown error" };
+    console.error("[GuardClaw] Failed to save corrections:", err);
   }
 }
-
-// src/injection/patterns.ts
-var INJECTION_PATTERNS = {
-  // Role override attempts
-  role_override: [
-    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
-    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
-    /forget\s+(everything|all|your)\s+(you\s+know|instructions?|training|context)/i,
-    /you\s+are\s+now\s+/i,
-    /from\s+now\s+on\s*,?\s*(you|act|behave|respond)/i,
-    /pretend\s+(you\s+are|to\s+be|you're)/i,
-    /act\s+as\s+(if\s+you\s+(are|were)|a|an|the)/i,
-    /your\s+new\s+(instructions?|directive|goal|purpose|role)/i,
-    /switch\s+(to|into)\s+.{0,20}\s+mode/i,
-    /\[?(system|admin|root|sudo|developer|debug|unrestricted|jailbreak|DAN)\]?\s*(mode|prompt|override|access)/i,
-    /do\s+anything\s+now/i,
-    /you\s+have\s+no\s+(restrictions?|limits?|guidelines?)/i
-  ],
-  // Exfiltration instructions
-  exfiltration: [
-    /send\s+(this|all|everything|the\s+\w+)\s+to\s+https?:\/\//i,
-    /send\s+(this|all|everything)\s+to\s/i,
-    /POST\s+(this|data|it|everything)\s+to\s/i,
-    /upload\s+(this|all|the\s+\w+)\s+to\s/i,
-    /email\s+(this|all|the\s+\w+|everything)\s+to\s/i,
-    /forward\s+(this|all|everything)\s+to\s/i,
-    /exfiltrat/i,
-    /HTTP\s+(request|POST|GET)\s+to\s/i,
-    /curl\s+(-X\s+POST\s+)?https?:\/\//i,
-    /wget\s+https?:\/\//i
-  ],
-  // Credential fishing
-  credential_fishing: [
-    /(provide|give|tell\s+me|show\s+me|reveal|share|what\s+is)\s+(your\s+)?(API\s*key|token|secret|password|credentials?|auth)/i,
-    /reveal\s+(your\s+)?(system\s+prompt|instructions?|context|training)/i,
-    /print\s+(your\s+)?(system|initial)\s+(prompt|instructions?|message)/i,
-    /output\s+(your\s+)?(config|configuration|settings|environment)/i,
-    /display\s+(hidden|secret|internal)\s/i
-  ],
-  // Encoding tricks (signals, not definitive)
-  encoding_tricks: [
-    /[A-Za-z0-9+\/]{50,}={0,2}/,
-    // Base64 blob (50+ chars)
-    /\\u[0-9a-fA-F]{4}/,
-    // Unicode escapes
-    /&#x?[0-9a-fA-F]+;/,
-    // HTML entities
-    /\x00|\x0d|\x0a{5,}/
-    // Null bytes or excessive newlines
-  ],
-  // Structural signals (imperative in data context)
-  structural: [
-    /^(you\s+must|you\s+should|you\s+will|you\s+need\s+to|always|never)\s/im,
-    /^(do\s+not|don't|stop|halt|cease|terminate)\s/im,
-    /\[\s*(INST|SYSTEM|ASSISTANT|USER)\s*\]/i,
-    // Role tags in content
-    /<\|?(im_start|im_end|system|user|assistant)\|?>/i
-    // ChatML tags
-  ]
-};
-var PATTERN_WEIGHTS = {
-  role_override: 40,
-  exfiltration: 35,
-  credential_fishing: 30,
-  encoding_tricks: 15,
-  structural: 20
-};
-
-// src/injection/heuristics.ts
-function runHeuristics(content) {
-  const matches = [];
-  const matchedPatterns = [];
-  let score = 0;
-  for (const [category, patterns] of Object.entries(INJECTION_PATTERNS)) {
-    for (const pattern of patterns) {
-      const match = content.match(pattern);
-      if (match) {
-        if (!matches.includes(category)) {
-          matches.push(category);
-          score += PATTERN_WEIGHTS[category] || 10;
-        }
-        matchedPatterns.push({
-          category,
-          pattern: pattern.toString(),
-          match: match[0].slice(0, 100)
-        });
-      }
-    }
-  }
-  score = Math.min(score, 100);
-  return { score, matches, matchedPatterns };
+function getCorrections() {
+  if (!loaded) loadCorrections();
+  return corrections;
 }
-
-// src/injection/sanitiser.ts
-var REDACTION_MARKER = "[CONTENT REDACTED \u2014 POTENTIAL INJECTION]";
-function sanitiseContent(content, matchedPatterns) {
-  let sanitised = content;
-  const sorted = [...matchedPatterns].filter((p) => p.match.length > 0).sort((a, b) => b.match.length - a.match.length);
-  for (const { match } of sorted) {
-    const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const regex = new RegExp(escaped, "gi");
-    sanitised = sanitised.replace(regex, REDACTION_MARKER);
+async function addCorrection(input) {
+  if (!loaded) loadCorrections();
+  const correction = {
+    ...input,
+    id: generateId(),
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  try {
+    correction.embedding = await embedText(input.message);
+  } catch (err) {
+    console.warn("[GuardClaw] Could not compute correction embedding:", err);
   }
-  const escapedMarker = REDACTION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  sanitised = sanitised.replace(
-    new RegExp(`(${escapedMarker}\\s*)+`, "g"),
-    REDACTION_MARKER + "\n"
+  corrections.push(correction);
+  const max = storeConfig.maxCorrections ?? DEFAULT_MAX_CORRECTIONS;
+  if (corrections.length > max) {
+    corrections = corrections.slice(-max);
+  }
+  saveCorrections();
+  console.log(
+    `[GuardClaw] Correction added: ${correction.predicted} \u2192 ${correction.corrected} (${correction.id})`
   );
-  return sanitised.trim();
+  return correction;
 }
-
-// src/injection/index.ts
-var DEFAULT_BLOCK_THRESHOLD = 70;
-var DEFAULT_SANITISE_THRESHOLD = 30;
-var SECURITY_CHANNEL = "1483608914774986943";
-function formatBlockAlert(result, source, preview) {
-  return `\u{1F6E1}\uFE0F **GuardClaw S0 \u2014 Injection Blocked**
-> **Source:** ${source}
-> **Score:** ${result.score}/100
-> **Patterns:** ${result.matches.join(", ")}
-> **Preview:** \`${preview.slice(0, 100)}${preview.length > 100 ? "..." : ""}\`
->
-> Content blocked and not passed to model. Review in guardclaw-injections.log`;
+function deleteCorrection(id) {
+  if (!loaded) loadCorrections();
+  const before = corrections.length;
+  corrections = corrections.filter((c) => c.id !== id);
+  if (corrections.length < before) {
+    saveCorrections();
+    return true;
+  }
+  return false;
 }
-var _injectionConfig = {};
-function initInjectionConfig(config) {
-  _injectionConfig = config;
+async function findSimilarCorrections(message, topK) {
+  if (!loaded) loadCorrections();
+  const k = topK ?? storeConfig.topK ?? DEFAULT_TOP_K;
+  const withEmbeddings = corrections.filter((c) => c.embedding && c.embedding.length > 0);
+  if (withEmbeddings.length === 0) return [];
+  let queryEmbedding;
+  try {
+    queryEmbedding = await embedText(message);
+  } catch {
+    return [];
+  }
+  const scored = withEmbeddings.map((c) => ({
+    ...c,
+    similarity: cosineSimilarity(queryEmbedding, c.embedding)
+  })).filter((c) => c.similarity > 0.3).sort((a, b) => b.similarity - a.similarity).slice(0, k);
+  return scored;
 }
-function updateInjectionConfig(config) {
-  _injectionConfig = config;
+async function buildFewShotExamples(message) {
+  const similar = await findSimilarCorrections(message);
+  if (similar.length === 0) return "";
+  const examples = similar.map(
+    (c) => `[EXAMPLE]
+Message: ${c.message.slice(0, 300)}
+Correct: {"level":"${c.corrected}","reason":"${c.reason ?? "corrected from " + c.predicted}"}
+[/EXAMPLE]`
+  );
+  return "The following are corrected examples for similar messages:\n" + examples.join("\n") + "\n\nNow classify the following:\n";
 }
-async function detectInjection(content, source, config) {
-  const cfg = config ?? _injectionConfig;
-  if (cfg.exempt_sources?.includes(source)) {
-    return { pass: true, score: 0, action: "pass", matches: [] };
-  }
-  const blockThreshold = cfg.block_threshold ?? DEFAULT_BLOCK_THRESHOLD;
-  const sanitiseThreshold = cfg.sanitise_threshold ?? DEFAULT_SANITISE_THRESHOLD;
-  const heuristic = runHeuristics(content);
-  let finalScore = heuristic.score;
-  let debertaResult = null;
-  if (!cfg.heuristics_only && heuristic.score >= 20 && heuristic.score <= 80) {
-    debertaResult = await runDebertaClassifier(content);
-    if (!debertaResult.error) {
-      if (debertaResult.injection) {
-        finalScore = Math.max(finalScore, 70 + debertaResult.score * 30);
-      } else if (debertaResult.score > 0.7 && debertaResult.label === 0) {
-        finalScore = Math.min(finalScore, 25);
-      }
-    }
-  }
-  let action;
-  if (finalScore < sanitiseThreshold) {
-    action = "pass";
-  } else if (finalScore < blockThreshold) {
-    action = "sanitise";
-  } else {
-    action = "block";
-  }
-  let sanitised;
-  if (action === "sanitise") {
-    sanitised = sanitiseContent(content, heuristic.matchedPatterns);
-  }
+var AUTHORITATIVE_THRESHOLD = 0.7;
+async function getAuthoritativeOverride(message) {
+  const similar = await findSimilarCorrections(message, 1);
+  if (similar.length === 0) return null;
+  const best = similar[0];
+  if (best.similarity < AUTHORITATIVE_THRESHOLD) return null;
   return {
-    pass: action === "pass",
-    score: Math.round(finalScore),
-    action,
-    sanitised,
-    matches: heuristic.matches,
-    blocked_reason: action === "block" ? `Injection detected (score ${Math.round(finalScore)}): ${heuristic.matches.join(", ")}` : void 0
+    level: best.corrected,
+    reason: `Correction override (${(best.similarity * 100).toFixed(0)}% match): ${best.reason ?? "corrected from " + best.predicted}`,
+    correctionId: best.id,
+    similarity: best.similarity
   };
 }
+async function embedText(text) {
+  const endpoint = storeConfig.embeddingEndpoint ?? DEFAULT_EMBEDDING_ENDPOINT;
+  const model = storeConfig.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
+  const url = `${endpoint}/v1/embeddings`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      input: text.slice(0, 2e3)
+      // nomic-embed-text handles up to 8K tokens but truncate for speed
+    }),
+    signal: AbortSignal.timeout(EMBEDDING_TIMEOUT_MS)
+  });
+  if (!response.ok) {
+    throw new Error(`Embedding API error: ${response.status} ${response.statusText}`);
+  }
+  const data = await response.json();
+  const embedding = data.data?.[0]?.embedding;
+  if (!embedding || embedding.length === 0) {
+    throw new Error("Embedding response missing vector data");
+  }
+  return embedding;
+}
+function cosineSimilarity(a, b) {
+  if (a.length !== b.length || a.length === 0) return 0;
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  return denominator === 0 ? 0 : dotProduct / denominator;
+}
+function generateId() {
+  return `corr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
 
-// src/live-config.ts
-import { readFileSync, watch } from "fs";
-import { readFile, writeFile, rename } from "fs/promises";
-import { join } from "path";
-var liveConfig = { ...defaultPrivacyConfig };
-var liveInjectionConfig = { ...defaultInjectionConfig };
-var configWatcher = null;
-var ATTEMPT_TTL_MS = 24 * 60 * 60 * 1e3;
-var injectionAttemptCounts = /* @__PURE__ */ new Map();
-var pendingBans = /* @__PURE__ */ new Set();
-var _attemptCountsPath = null;
-function getAttemptCountsPath() {
-  if (!_attemptCountsPath) {
-    const home = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
-    _attemptCountsPath = join(home, ".openclaw", "guardclaw-attempt-counts.json");
-  }
-  return _attemptCountsPath;
-}
-async function loadInjectionAttemptCounts() {
-  try {
-    const raw = await readFile(getAttemptCountsPath(), "utf-8");
-    const data = JSON.parse(raw);
-    const now = Date.now();
-    for (const [id, entry] of Object.entries(data)) {
-      if (now - entry.ts < ATTEMPT_TTL_MS) {
-        injectionAttemptCounts.set(id, entry);
-      }
-    }
-  } catch (err) {
-    const code = err.code;
-    if (code !== "ENOENT") {
-      console.warn("[GuardClaw] guardclaw-attempt-counts.json appears corrupt, starting fresh:", String(err));
-    }
+// src/types.ts
+function levelToNumeric(level) {
+  switch (level) {
+    case "S1":
+      return 1;
+    case "S2":
+      return 2;
+    case "S3":
+      return 3;
   }
 }
-async function persistInjectionAttemptCounts() {
-  try {
-    const filePath = getAttemptCountsPath();
-    const tmp = filePath + ".tmp";
-    const data = {};
-    for (const [id, entry] of injectionAttemptCounts.entries()) {
-      data[id] = entry;
-    }
-    await writeFile(tmp, JSON.stringify(data));
-    await rename(tmp, filePath);
-  } catch {
+function numericToLevel(numeric) {
+  switch (numeric) {
+    case 1:
+      return "S1";
+    case 2:
+      return "S2";
+    case 3:
+      return "S3";
+    default:
+      return "S1";
   }
 }
-function recordInjectionAttempt(senderId) {
-  const now = Date.now();
-  const entry = injectionAttemptCounts.get(senderId);
-  const count = entry && now - entry.ts < ATTEMPT_TTL_MS ? entry.count + 1 : 1;
-  injectionAttemptCounts.set(senderId, { count, ts: now });
-  persistInjectionAttemptCounts().catch(() => {
-  });
-  return count;
-}
-function initLiveConfig(pluginConfig) {
-  const userConfig = pluginConfig?.privacy ?? {};
-  liveConfig = mergeConfig(userConfig);
-  const userInjection = pluginConfig?.privacy?.injection ?? {};
-  liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
-  updateInjectionConfig(liveInjectionConfig);
-}
-function watchConfigFile(configPath, logger) {
-  if (configWatcher) return;
-  let debounce = null;
-  try {
-    configWatcher = watch(configPath, () => {
-      if (debounce) clearTimeout(debounce);
-      debounce = setTimeout(() => {
-        try {
-          const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-          const privacy = raw.privacy ?? {};
-          liveConfig = mergeConfig(privacy);
-          const injection = raw.privacy?.injection ?? {};
-          liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
-          updateInjectionConfig(liveInjectionConfig);
-          logger.info("[GuardClaw] guardclaw.json changed \u2014 config hot-reloaded");
-        } catch (err) {
-          console.warn("[GuardClaw] Config reload failed (partial write?) \u2014 retaining previous config:", String(err));
-        }
-      }, 300);
-    });
-  } catch {
-  }
-}
-function getLiveConfig() {
-  return liveConfig;
-}
-function getLiveInjectionConfig() {
-  return liveInjectionConfig;
-}
-function updateLiveConfig(patch) {
-  liveConfig = mergeConfig({ ...liveConfig, ...patch });
-}
-var _configWriteLock = Promise.resolve();
-function withConfigWriteLock(fn) {
-  let resolve2;
-  const gate = new Promise((r) => {
-    resolve2 = r;
-  });
-  const result = _configWriteLock.then(() => fn()).finally(resolve2);
-  _configWriteLock = gate;
-  return result;
-}
-function updateLiveInjectionConfig(patch) {
-  liveInjectionConfig = { ...liveInjectionConfig, ...patch };
-  updateInjectionConfig(liveInjectionConfig);
-}
-function mergeConfig(userConfig) {
-  return {
-    ...defaultPrivacyConfig,
-    ...userConfig,
-    checkpoints: { ...defaultPrivacyConfig.checkpoints, ...userConfig.checkpoints },
-    rules: {
-      keywords: { ...defaultPrivacyConfig.rules?.keywords, ...userConfig.rules?.keywords },
-      patterns: { ...defaultPrivacyConfig.rules?.patterns, ...userConfig.rules?.patterns },
-      tools: {
-        S2: { ...defaultPrivacyConfig.rules?.tools?.S2, ...userConfig.rules?.tools?.S2 },
-        S3: { ...defaultPrivacyConfig.rules?.tools?.S3, ...userConfig.rules?.tools?.S3 }
-      }
-    },
-    localModel: { ...defaultPrivacyConfig.localModel, ...userConfig.localModel },
-    guardAgent: { ...defaultPrivacyConfig.guardAgent, ...userConfig.guardAgent },
-    session: { ...defaultPrivacyConfig.session, ...userConfig.session },
-    localProviders: [
-      ...defaultPrivacyConfig.localProviders,
-      ...userConfig.localProviders ?? []
-    ],
-    modelPricing: {
-      ...defaultPrivacyConfig.modelPricing,
-      ...userConfig.modelPricing
-    },
-    redaction: { ...defaultPrivacyConfig.redaction, ...userConfig.redaction }
-  };
+function maxLevel(...levels) {
+  if (levels.length === 0) return "S1";
+  const numeric = levels.map(levelToNumeric);
+  const max = Math.max(...numeric);
+  return numericToLevel(max);
 }
 
 // src/token-stats.ts
 import { readFile as readFile2, writeFile as writeFile2, mkdir } from "fs/promises";
-import { dirname } from "path";
+import { dirname as dirname3 } from "path";
 
 // src/loop-detection-level.ts
 var sessionStates = /* @__PURE__ */ new Map();
@@ -1004,6 +518,765 @@ function getHigherLevel(a, b) {
   return order[a] >= order[b] ? a : b;
 }
 
+// src/live-config.ts
+import { readFileSync as readFileSync3, watch } from "fs";
+import { readFile, writeFile, rename } from "fs/promises";
+import { join as join2 } from "path";
+
+// src/config-schema.ts
+import { Type } from "@sinclair/typebox";
+var guardClawConfigSchema = Type.Object({
+  injection: Type.Optional(
+    Type.Object({
+      enabled: Type.Optional(Type.Boolean()),
+      heuristics_only: Type.Optional(Type.Boolean()),
+      block_threshold: Type.Optional(Type.Number()),
+      sanitise_threshold: Type.Optional(Type.Number()),
+      alert_channel: Type.Optional(Type.String()),
+      exempt_sources: Type.Optional(Type.Array(Type.String())),
+      exempt_senders: Type.Optional(Type.Array(Type.String())),
+      banned_senders: Type.Optional(Type.Array(Type.String()))
+    })
+  ),
+  privacy: Type.Optional(
+    Type.Object({
+      enabled: Type.Optional(Type.Boolean()),
+      s2Policy: Type.Optional(
+        Type.Union([Type.Literal("proxy"), Type.Literal("local")])
+      ),
+      s3Policy: Type.Optional(
+        Type.Union([
+          Type.Literal("local-only"),
+          Type.Literal("redact-and-forward"),
+          Type.Literal("synthesize")
+        ])
+      ),
+      synthesis: Type.Optional(
+        Type.Object({
+          fallback: Type.Optional(Type.Union([Type.Literal("local-only"), Type.Literal("block")])),
+          verifyOutput: Type.Optional(Type.Boolean()),
+          maxRetries: Type.Optional(Type.Number()),
+          maxInputChars: Type.Optional(Type.Number()),
+          timeoutMs: Type.Optional(Type.Number())
+        })
+      ),
+      proxyPort: Type.Optional(Type.Number()),
+      checkpoints: Type.Optional(
+        Type.Object({
+          onUserMessage: Type.Optional(
+            Type.Array(
+              Type.Union([Type.Literal("ruleDetector"), Type.Literal("localModelDetector")])
+            )
+          ),
+          onToolCallProposed: Type.Optional(
+            Type.Array(
+              Type.Union([Type.Literal("ruleDetector"), Type.Literal("localModelDetector")])
+            )
+          ),
+          onToolCallExecuted: Type.Optional(
+            Type.Array(
+              Type.Union([Type.Literal("ruleDetector"), Type.Literal("localModelDetector")])
+            )
+          )
+        })
+      ),
+      rules: Type.Optional(
+        Type.Object({
+          keywords: Type.Optional(
+            Type.Object({
+              S2: Type.Optional(Type.Array(Type.String())),
+              S3: Type.Optional(Type.Array(Type.String()))
+            })
+          ),
+          patterns: Type.Optional(
+            Type.Object({
+              S2: Type.Optional(Type.Array(Type.String())),
+              S3: Type.Optional(Type.Array(Type.String()))
+            })
+          ),
+          tools: Type.Optional(
+            Type.Object({
+              S2: Type.Optional(
+                Type.Object({
+                  tools: Type.Optional(Type.Array(Type.String())),
+                  paths: Type.Optional(Type.Array(Type.String()))
+                })
+              ),
+              S3: Type.Optional(
+                Type.Object({
+                  tools: Type.Optional(Type.Array(Type.String())),
+                  paths: Type.Optional(Type.Array(Type.String()))
+                })
+              )
+            })
+          )
+        })
+      ),
+      localModel: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          type: Type.Optional(
+            Type.Union([
+              Type.Literal("openai-compatible"),
+              Type.Literal("ollama-native"),
+              Type.Literal("custom")
+            ])
+          ),
+          provider: Type.Optional(Type.String()),
+          model: Type.Optional(Type.String()),
+          endpoint: Type.Optional(Type.String()),
+          apiKey: Type.Optional(Type.String()),
+          module: Type.Optional(Type.String())
+        })
+      ),
+      guardAgent: Type.Optional(
+        Type.Object({
+          id: Type.Optional(Type.String()),
+          workspace: Type.Optional(Type.String()),
+          model: Type.Optional(Type.String())
+        })
+      ),
+      localProviders: Type.Optional(Type.Array(Type.String())),
+      toolAllowlist: Type.Optional(Type.Array(Type.String())),
+      modelPricing: Type.Optional(
+        Type.Record(
+          Type.String(),
+          Type.Object({
+            inputPer1M: Type.Optional(Type.Number()),
+            outputPer1M: Type.Optional(Type.Number())
+          })
+        )
+      ),
+      session: Type.Optional(
+        Type.Object({
+          isolateGuardHistory: Type.Optional(Type.Boolean()),
+          baseDir: Type.Optional(Type.String()),
+          injectDualHistory: Type.Optional(Type.Boolean()),
+          historyLimit: Type.Optional(Type.Number())
+        })
+      ),
+      routers: Type.Optional(
+        Type.Record(
+          Type.String(),
+          Type.Object({
+            enabled: Type.Optional(Type.Boolean()),
+            type: Type.Optional(Type.Union([Type.Literal("builtin"), Type.Literal("custom"), Type.Literal("configurable")])),
+            module: Type.Optional(Type.String()),
+            weight: Type.Optional(Type.Number()),
+            options: Type.Optional(Type.Record(Type.String(), Type.Unknown()))
+          })
+        )
+      ),
+      pipeline: Type.Optional(
+        Type.Object({
+          onUserMessage: Type.Optional(Type.Array(Type.String())),
+          onToolCallProposed: Type.Optional(Type.Array(Type.String())),
+          onToolCallExecuted: Type.Optional(Type.Array(Type.String()))
+        })
+      ),
+      redaction: Type.Optional(
+        Type.Object({
+          internalIp: Type.Optional(Type.Boolean()),
+          email: Type.Optional(Type.Boolean()),
+          envVar: Type.Optional(Type.Boolean()),
+          creditCard: Type.Optional(Type.Boolean()),
+          chinesePhone: Type.Optional(Type.Boolean()),
+          chineseId: Type.Optional(Type.Boolean()),
+          chineseAddress: Type.Optional(Type.Boolean()),
+          pin: Type.Optional(Type.Boolean())
+        })
+      ),
+      webhooks: Type.Optional(
+        Type.Array(
+          Type.Object({
+            url: Type.String(),
+            format: Type.Optional(
+              Type.Union([
+                Type.Literal("json"),
+                Type.Literal("discord"),
+                Type.Literal("slack")
+              ])
+            ),
+            events: Type.Optional(Type.Array(Type.String())),
+            secret: Type.Optional(Type.String())
+          })
+        )
+      ),
+      responseScanning: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          action: Type.Optional(
+            Type.Union([
+              Type.Literal("warn"),
+              Type.Literal("redact"),
+              Type.Literal("block")
+            ])
+          ),
+          scanSecrets: Type.Optional(Type.Boolean()),
+          scanPii: Type.Optional(Type.Boolean())
+        })
+      ),
+      budget: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          dailyCap: Type.Optional(Type.Number()),
+          monthlyCap: Type.Optional(Type.Number()),
+          action: Type.Optional(
+            Type.Union([
+              Type.Literal("warn"),
+              Type.Literal("pause_cloud"),
+              Type.Literal("block")
+            ])
+          ),
+          warnAt: Type.Optional(Type.Number())
+        })
+      ),
+      behavioralAttestation: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          logOnly: Type.Optional(Type.Boolean()),
+          windowSize: Type.Optional(Type.Number()),
+          blockThreshold: Type.Optional(Type.Number())
+        })
+      ),
+      modelAdvisor: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          checkIntervalWeeks: Type.Optional(Type.Number()),
+          minSavingsPercent: Type.Optional(Type.Number()),
+          minDiskSpaceGb: Type.Optional(Type.Number()),
+          openrouterApiKey: Type.Optional(Type.String()),
+          openrouter: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
+          llmfit: Type.Optional(Type.Object({ enabled: Type.Optional(Type.Boolean()) })),
+          deberta: Type.Optional(Type.Object({
+            enabled: Type.Optional(Type.Boolean()),
+            autoUpdate: Type.Optional(Type.Boolean())
+          })),
+          benchmark: Type.Optional(
+            Type.Object({
+              enabled: Type.Optional(Type.Boolean()),
+              runs: Type.Optional(Type.Number())
+            })
+          )
+        })
+      ),
+      taintTracking: Type.Optional(
+        Type.Object({
+          enabled: Type.Optional(Type.Boolean()),
+          minValueLength: Type.Optional(Type.Number()),
+          trackS2: Type.Optional(Type.Boolean())
+        })
+      ),
+      debugLogging: Type.Optional(Type.Boolean()),
+      fastS2: Type.Optional(Type.Boolean()),
+      s2Channels: Type.Optional(Type.Array(Type.String()))
+    })
+  )
+});
+var defaultPrivacyConfig = {
+  enabled: true,
+  s2Policy: "proxy",
+  proxyPort: 8403,
+  checkpoints: {
+    onUserMessage: ["ruleDetector", "localModelDetector"],
+    onToolCallProposed: ["ruleDetector"],
+    onToolCallExecuted: ["ruleDetector"]
+  },
+  rules: {
+    keywords: {
+      S2: [],
+      S3: []
+    },
+    patterns: {
+      S2: [],
+      S3: []
+    },
+    tools: {
+      S2: { tools: [], paths: [] },
+      S3: { tools: [], paths: [] }
+    }
+  },
+  localModel: {
+    enabled: true,
+    type: "openai-compatible",
+    model: "qwen/qwen3-30b-a3b-2507",
+    endpoint: "http://localhost:1234"
+  },
+  guardAgent: {
+    id: "guard",
+    workspace: "~/.openclaw/workspace-guard",
+    model: "ollama/qwen/qwen3-30b-a3b-2507"
+  },
+  localProviders: [],
+  toolAllowlist: [],
+  modelPricing: {
+    "claude-sonnet-4.6": { inputPer1M: 3, outputPer1M: 15 },
+    "claude-3.5-sonnet": { inputPer1M: 3, outputPer1M: 15 },
+    "claude-3.5-haiku": { inputPer1M: 0.8, outputPer1M: 4 },
+    "gpt-4o": { inputPer1M: 2.5, outputPer1M: 10 },
+    "gpt-4o-mini": { inputPer1M: 0.15, outputPer1M: 0.6 },
+    "o4-mini": { inputPer1M: 1.1, outputPer1M: 4.4 },
+    "gemini-2.0-flash": { inputPer1M: 0.1, outputPer1M: 0.4 },
+    "deepseek-chat": { inputPer1M: 0.27, outputPer1M: 1.1 }
+  },
+  debugLogging: false,
+  redaction: {
+    internalIp: false,
+    email: false,
+    envVar: false,
+    creditCard: false,
+    chinesePhone: false,
+    chineseId: false,
+    chineseAddress: false,
+    pin: false
+  },
+  session: {
+    isolateGuardHistory: true,
+    baseDir: "~/.openclaw",
+    injectDualHistory: true,
+    historyLimit: 20
+  },
+  routers: {
+    privacy: { enabled: true, type: "builtin" }
+  },
+  pipeline: {
+    onUserMessage: ["privacy"],
+    onToolCallProposed: ["privacy"],
+    onToolCallExecuted: ["privacy"]
+  },
+  responseScanning: {
+    enabled: true,
+    action: "warn",
+    scanSecrets: true,
+    scanPii: false
+  },
+  behavioralAttestation: {
+    enabled: false,
+    // flip to true to start collecting data
+    logOnly: true,
+    // true = log+score only, never blocks; false = active gating
+    windowSize: 10,
+    blockThreshold: 0.8
+  },
+  modelAdvisor: {
+    enabled: false,
+    checkIntervalWeeks: 2,
+    minSavingsPercent: 20,
+    minDiskSpaceGb: 10,
+    openrouter: { enabled: true },
+    llmfit: { enabled: true },
+    deberta: { enabled: true, autoUpdate: true },
+    benchmark: { enabled: true, runs: 3 }
+  },
+  taintTracking: {
+    enabled: true,
+    minValueLength: 8,
+    trackS2: false
+  }
+};
+var defaultInjectionConfig = {
+  enabled: true,
+  heuristics_only: false,
+  block_threshold: 70,
+  sanitise_threshold: 30,
+  alert_channel: "1483608914774986943",
+  exempt_sources: [],
+  exempt_senders: ["1317396442993922061"],
+  banned_senders: []
+};
+
+// src/injection/patterns.ts
+var INJECTION_PATTERNS = {
+  // Role override attempts
+  role_override: [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
+    /forget\s+(everything|all|your)\s+(you\s+know|instructions?|training|context)/i,
+    /you\s+are\s+now\s+/i,
+    /from\s+now\s+on\s*,?\s*(you|act|behave|respond)/i,
+    /pretend\s+(you\s+are|to\s+be|you're)/i,
+    /act\s+as\s+(if\s+you\s+(are|were)|a|an|the)/i,
+    /your\s+new\s+(instructions?|directive|goal|purpose|role)/i,
+    /switch\s+(to|into)\s+.{0,20}\s+mode/i,
+    /\[?(system|admin|root|sudo|developer|debug|unrestricted|jailbreak|DAN)\]?\s*(mode|prompt|override|access)/i,
+    /do\s+anything\s+now/i,
+    /you\s+have\s+no\s+(restrictions?|limits?|guidelines?)/i
+  ],
+  // Exfiltration instructions
+  exfiltration: [
+    /send\s+(this|all|everything|the\s+\w+)\s+to\s+https?:\/\//i,
+    /send\s+(this|all|everything)\s+to\s/i,
+    /POST\s+(this|data|it|everything)\s+to\s/i,
+    /upload\s+(this|all|the\s+\w+)\s+to\s/i,
+    /email\s+(this|all|the\s+\w+|everything)\s+to\s/i,
+    /forward\s+(this|all|everything)\s+to\s/i,
+    /exfiltrat/i,
+    /HTTP\s+(request|POST|GET)\s+to\s/i,
+    /curl\s+(-X\s+POST\s+)?https?:\/\//i,
+    /wget\s+https?:\/\//i
+  ],
+  // Credential fishing
+  credential_fishing: [
+    /(provide|give|tell\s+me|show\s+me|reveal|share|what\s+is)\s+(your\s+)?(API\s*key|token|secret|password|credentials?|auth)/i,
+    /reveal\s+(your\s+)?(system\s+prompt|instructions?|context|training)/i,
+    /print\s+(your\s+)?(system|initial)\s+(prompt|instructions?|message)/i,
+    /output\s+(your\s+)?(config|configuration|settings|environment)/i,
+    /display\s+(hidden|secret|internal)\s/i
+  ],
+  // Encoding tricks (signals, not definitive)
+  encoding_tricks: [
+    /[A-Za-z0-9+\/]{50,}={0,2}/,
+    // Base64 blob (50+ chars)
+    /\\u[0-9a-fA-F]{4}/,
+    // Unicode escapes
+    /&#x?[0-9a-fA-F]+;/,
+    // HTML entities
+    /\x00|\x0d|\x0a{5,}/
+    // Null bytes or excessive newlines
+  ],
+  // Structural signals (imperative in data context)
+  structural: [
+    /^(you\s+must|you\s+should|you\s+will|you\s+need\s+to|always|never)\s/im,
+    /^(do\s+not|don't|stop|halt|cease|terminate)\s/im,
+    /\[\s*(INST|SYSTEM|ASSISTANT|USER)\s*\]/i,
+    // Role tags in content
+    /<\|?(im_start|im_end|system|user|assistant)\|?>/i
+    // ChatML tags
+  ]
+};
+var PATTERN_WEIGHTS = {
+  role_override: 40,
+  exfiltration: 35,
+  credential_fishing: 30,
+  encoding_tricks: 15,
+  structural: 20
+};
+
+// src/injection/heuristics.ts
+function runHeuristics(content) {
+  const matches = [];
+  const matchedPatterns = [];
+  let score = 0;
+  for (const [category, patterns] of Object.entries(INJECTION_PATTERNS)) {
+    for (const pattern of patterns) {
+      const match = content.match(pattern);
+      if (match) {
+        if (!matches.includes(category)) {
+          matches.push(category);
+          score += PATTERN_WEIGHTS[category] || 10;
+        }
+        matchedPatterns.push({
+          category,
+          pattern: pattern.toString(),
+          match: match[0].slice(0, 100)
+        });
+      }
+    }
+  }
+  score = Math.min(score, 100);
+  return { score, matches, matchedPatterns };
+}
+
+// src/injection/deberta.ts
+var BASE_URL = (() => {
+  const envUrl = process.env.GUARDCLAW_DEBERTA_URL;
+  const DEFAULT = "http://127.0.0.1:8404";
+  if (!envUrl) return DEFAULT;
+  const base = envUrl.endsWith("/classify") ? envUrl.slice(0, -"/classify".length) : envUrl;
+  try {
+    const parsed = new URL(base);
+    if (parsed.protocol !== "http:") {
+      console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL rejected \u2014 only http: scheme allowed (got ${parsed.protocol}). Using default.`);
+      return DEFAULT;
+    }
+    const host = parsed.hostname;
+    if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
+      console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL rejected \u2014 non-loopback host '${host}' not allowed (SSRF prevention). Using default.`);
+      return DEFAULT;
+    }
+    return base;
+  } catch {
+    console.warn(`[GuardClaw] GUARDCLAW_DEBERTA_URL is not a valid URL \u2014 using default.`);
+    return DEFAULT;
+  }
+})();
+var ENDPOINT = `${BASE_URL}/classify`;
+var RELOAD_ENDPOINT = `${BASE_URL}/reload`;
+var TIMEOUT_MS = 5e3;
+var RELOAD_TIMEOUT_MS = 3e5;
+var ALLOWED_DEBERTA_MODELS = /* @__PURE__ */ new Set([
+  "protectai/deberta-v3-base-prompt-injection-v2",
+  "protectai/deberta-v3-base-prompt-injection",
+  "laiyer/deberta-v3-base-prompt-injection"
+]);
+var RELOAD_API_TOKEN = process.env.GUARDCLAW_DEBERTA_RELOAD_TOKEN ?? "";
+async function triggerDebertaReload(modelId) {
+  if (!ALLOWED_DEBERTA_MODELS.has(modelId)) {
+    console.warn(`[GuardClaw] DeBERTa reload rejected \u2014 model '${modelId}' is not in the allowlist.`);
+    return { ok: false, message: `Model '${modelId}' not in allowed list` };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RELOAD_TIMEOUT_MS);
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (RELOAD_API_TOKEN) {
+      headers["X-GuardClaw-Token"] = RELOAD_API_TOKEN;
+    }
+    const res = await fetch(RELOAD_ENDPOINT, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: modelId }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) return { ok: false, message: `HTTP ${res.status}` };
+    const data = await res.json();
+    return { ok: true, message: data.note ?? `Loaded ${data.model ?? modelId}` };
+  } catch (err) {
+    clearTimeout(timer);
+    return { ok: false, message: err.name === "AbortError" ? "Timeout" : err.message ?? "Service unreachable" };
+  }
+}
+async function runDebertaClassifier(content) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      return { label: 0, score: 0, injection: false, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") {
+      return { label: 0, score: 0, injection: false, error: "Timeout" };
+    }
+    return { label: 0, score: 0, injection: false, error: err.message ?? "Unknown error" };
+  }
+}
+
+// src/injection/sanitiser.ts
+var REDACTION_MARKER = "[CONTENT REDACTED \u2014 POTENTIAL INJECTION]";
+function sanitiseContent(content, matchedPatterns) {
+  let sanitised = content;
+  const sorted = [...matchedPatterns].filter((p) => p.match.length > 0).sort((a, b) => b.match.length - a.match.length);
+  for (const { match } of sorted) {
+    const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(escaped, "gi");
+    sanitised = sanitised.replace(regex, REDACTION_MARKER);
+  }
+  const escapedMarker = REDACTION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  sanitised = sanitised.replace(
+    new RegExp(`(${escapedMarker}\\s*)+`, "g"),
+    REDACTION_MARKER + "\n"
+  );
+  return sanitised.trim();
+}
+
+// src/injection/index.ts
+var DEFAULT_BLOCK_THRESHOLD = 70;
+var DEFAULT_SANITISE_THRESHOLD = 30;
+var SECURITY_CHANNEL = "1483608914774986943";
+function formatBlockAlert(result, source, preview) {
+  return `\u{1F6E1}\uFE0F **GuardClaw S0 \u2014 Injection Blocked**
+> **Source:** ${source}
+> **Score:** ${result.score}/100
+> **Patterns:** ${result.matches.join(", ")}
+> **Preview:** \`${preview.slice(0, 100)}${preview.length > 100 ? "..." : ""}\`
+>
+> Content blocked and not passed to model. Review in guardclaw-injections.log`;
+}
+var _injectionConfig = {};
+function initInjectionConfig(config) {
+  _injectionConfig = config;
+}
+function updateInjectionConfig(config) {
+  _injectionConfig = config;
+}
+async function detectInjection(content, source, config) {
+  const cfg = config ?? _injectionConfig;
+  if (cfg.exempt_sources?.includes(source)) {
+    return { pass: true, score: 0, action: "pass", matches: [] };
+  }
+  const blockThreshold = cfg.block_threshold ?? DEFAULT_BLOCK_THRESHOLD;
+  const sanitiseThreshold = cfg.sanitise_threshold ?? DEFAULT_SANITISE_THRESHOLD;
+  const heuristic = runHeuristics(content);
+  let finalScore = heuristic.score;
+  let debertaResult = null;
+  if (!cfg.heuristics_only && heuristic.score >= 20 && heuristic.score <= 80) {
+    debertaResult = await runDebertaClassifier(content);
+    if (!debertaResult.error) {
+      if (debertaResult.injection) {
+        finalScore = Math.max(finalScore, 70 + debertaResult.score * 30);
+      } else if (debertaResult.score > 0.7 && debertaResult.label === 0) {
+        finalScore = Math.min(finalScore, 25);
+      }
+    }
+  }
+  let action;
+  if (finalScore < sanitiseThreshold) {
+    action = "pass";
+  } else if (finalScore < blockThreshold) {
+    action = "sanitise";
+  } else {
+    action = "block";
+  }
+  let sanitised;
+  if (action === "sanitise") {
+    sanitised = sanitiseContent(content, heuristic.matchedPatterns);
+  }
+  return {
+    pass: action === "pass",
+    score: Math.round(finalScore),
+    action,
+    sanitised,
+    matches: heuristic.matches,
+    blocked_reason: action === "block" ? `Injection detected (score ${Math.round(finalScore)}): ${heuristic.matches.join(", ")}` : void 0
+  };
+}
+
+// src/live-config.ts
+var liveConfig = { ...defaultPrivacyConfig };
+var liveInjectionConfig = { ...defaultInjectionConfig };
+var configWatcher = null;
+var ATTEMPT_TTL_MS = 24 * 60 * 60 * 1e3;
+var injectionAttemptCounts = /* @__PURE__ */ new Map();
+var pendingBans = /* @__PURE__ */ new Set();
+var _attemptCountsPath = null;
+function getAttemptCountsPath() {
+  if (!_attemptCountsPath) {
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+    _attemptCountsPath = join2(home, ".openclaw", "guardclaw-attempt-counts.json");
+  }
+  return _attemptCountsPath;
+}
+async function loadInjectionAttemptCounts() {
+  try {
+    const raw = await readFile(getAttemptCountsPath(), "utf-8");
+    const data = JSON.parse(raw);
+    const now = Date.now();
+    for (const [id, entry] of Object.entries(data)) {
+      if (now - entry.ts < ATTEMPT_TTL_MS) {
+        injectionAttemptCounts.set(id, entry);
+      }
+    }
+  } catch (err) {
+    const code = err.code;
+    if (code !== "ENOENT") {
+      console.warn("[GuardClaw] guardclaw-attempt-counts.json appears corrupt, starting fresh:", String(err));
+    }
+  }
+}
+async function persistInjectionAttemptCounts() {
+  try {
+    const filePath = getAttemptCountsPath();
+    const tmp = filePath + ".tmp";
+    const data = {};
+    for (const [id, entry] of injectionAttemptCounts.entries()) {
+      data[id] = entry;
+    }
+    await writeFile(tmp, JSON.stringify(data));
+    await rename(tmp, filePath);
+  } catch {
+  }
+}
+function recordInjectionAttempt(senderId) {
+  const now = Date.now();
+  const entry = injectionAttemptCounts.get(senderId);
+  const count = entry && now - entry.ts < ATTEMPT_TTL_MS ? entry.count + 1 : 1;
+  injectionAttemptCounts.set(senderId, { count, ts: now });
+  persistInjectionAttemptCounts().catch(() => {
+  });
+  return count;
+}
+function initLiveConfig(pluginConfig) {
+  const userConfig = pluginConfig?.privacy ?? {};
+  liveConfig = mergeConfig(userConfig);
+  const userInjection = pluginConfig?.privacy?.injection ?? {};
+  liveInjectionConfig = { ...defaultInjectionConfig, ...userInjection };
+  updateInjectionConfig(liveInjectionConfig);
+}
+function watchConfigFile(configPath, logger) {
+  if (configWatcher) return;
+  let debounce = null;
+  try {
+    configWatcher = watch(configPath, () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        try {
+          const raw = JSON.parse(readFileSync3(configPath, "utf-8"));
+          const privacy = raw.privacy ?? {};
+          liveConfig = mergeConfig(privacy);
+          const injection = raw.privacy?.injection ?? {};
+          liveInjectionConfig = { ...defaultInjectionConfig, ...injection };
+          updateInjectionConfig(liveInjectionConfig);
+          logger.info("[GuardClaw] guardclaw.json changed \u2014 config hot-reloaded");
+        } catch (err) {
+          console.warn("[GuardClaw] Config reload failed (partial write?) \u2014 retaining previous config:", String(err));
+        }
+      }, 300);
+    });
+  } catch {
+  }
+}
+function getLiveConfig() {
+  return liveConfig;
+}
+function getLiveInjectionConfig() {
+  return liveInjectionConfig;
+}
+function updateLiveConfig(patch) {
+  liveConfig = mergeConfig({ ...liveConfig, ...patch });
+}
+var _configWriteLock = Promise.resolve();
+function withConfigWriteLock(fn) {
+  let resolve2;
+  const gate = new Promise((r) => {
+    resolve2 = r;
+  });
+  const result = _configWriteLock.then(() => fn()).finally(resolve2);
+  _configWriteLock = gate;
+  return result;
+}
+function updateLiveInjectionConfig(patch) {
+  liveInjectionConfig = { ...liveInjectionConfig, ...patch };
+  updateInjectionConfig(liveInjectionConfig);
+}
+function mergeConfig(userConfig) {
+  return {
+    ...defaultPrivacyConfig,
+    ...userConfig,
+    checkpoints: { ...defaultPrivacyConfig.checkpoints, ...userConfig.checkpoints },
+    rules: {
+      keywords: { ...defaultPrivacyConfig.rules?.keywords, ...userConfig.rules?.keywords },
+      patterns: { ...defaultPrivacyConfig.rules?.patterns, ...userConfig.rules?.patterns },
+      tools: {
+        S2: { ...defaultPrivacyConfig.rules?.tools?.S2, ...userConfig.rules?.tools?.S2 },
+        S3: { ...defaultPrivacyConfig.rules?.tools?.S3, ...userConfig.rules?.tools?.S3 }
+      }
+    },
+    localModel: { ...defaultPrivacyConfig.localModel, ...userConfig.localModel },
+    guardAgent: { ...defaultPrivacyConfig.guardAgent, ...userConfig.guardAgent },
+    session: { ...defaultPrivacyConfig.session, ...userConfig.session },
+    localProviders: [
+      ...defaultPrivacyConfig.localProviders,
+      ...userConfig.localProviders ?? []
+    ],
+    modelPricing: {
+      ...defaultPrivacyConfig.modelPricing,
+      ...userConfig.modelPricing
+    },
+    redaction: { ...defaultPrivacyConfig.redaction, ...userConfig.redaction }
+  };
+}
+
 // src/token-stats.ts
 var MAX_HOURLY_BUCKETS = 72;
 var MAX_SESSIONS = 200;
@@ -1206,7 +1479,7 @@ var TokenStatsCollector = class {
   /** Flush to disk. */
   async flush() {
     try {
-      await mkdir(dirname(this.filePath), { recursive: true });
+      await mkdir(dirname3(this.filePath), { recursive: true });
       await writeFile2(this.filePath, JSON.stringify(this.data, null, 2), { encoding: "utf-8", mode: 384 });
       this.dirty = false;
     } catch {
@@ -1219,275 +1492,6 @@ function setGlobalCollector(collector) {
 }
 function getGlobalCollector() {
   return globalCollector;
-}
-
-// src/prompt-loader.ts
-import { readFileSync as readFileSync2, writeFileSync, existsSync, mkdirSync } from "fs";
-import { resolve, dirname as dirname2 } from "path";
-import { fileURLToPath } from "url";
-var __filename = fileURLToPath(import.meta.url);
-var __dirname = dirname2(__filename);
-function resolvePromptsDir() {
-  const candidates = [
-    resolve(__dirname, "../prompts"),
-    // from src/  → prompts/
-    resolve(__dirname, "../../prompts")
-    // from dist/src/ → prompts/
-  ];
-  for (const dir of candidates) {
-    if (existsSync(dir)) return dir;
-  }
-  return candidates[0];
-}
-var PROMPTS_DIR = resolvePromptsDir();
-var cache = /* @__PURE__ */ new Map();
-function loadPrompt(name, fallback) {
-  const cached = cache.get(name);
-  if (cached !== void 0) return cached;
-  const filePath = resolve(PROMPTS_DIR, `${name}.md`);
-  let content;
-  try {
-    if (existsSync(filePath)) {
-      content = readFileSync2(filePath, "utf-8").trim();
-      console.log(`[GuardClaw] Loaded custom prompt: prompts/${name}.md`);
-    } else {
-      content = fallback;
-    }
-  } catch {
-    console.warn(`[GuardClaw] Failed to read prompts/${name}.md, using default`);
-    content = fallback;
-  }
-  cache.set(name, content);
-  return content;
-}
-function loadPromptWithVars(name, fallback, vars) {
-  let prompt = loadPrompt(name, fallback);
-  for (const [key, value] of Object.entries(vars)) {
-    prompt = prompt.replaceAll(`{{${key}}}`, value);
-  }
-  return prompt;
-}
-function invalidatePrompt(name) {
-  cache.delete(name);
-}
-function sanitizePromptName(name) {
-  return name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
-}
-function writePrompt(name, content) {
-  const safe = sanitizePromptName(name);
-  if (!safe) throw new Error(`Invalid prompt name: ${name}`);
-  mkdirSync(PROMPTS_DIR, { recursive: true });
-  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
-  writeFileSync(filePath, content, { encoding: "utf-8", mode: 384 });
-  invalidatePrompt(safe);
-}
-function readPromptFromDisk(name) {
-  const safe = sanitizePromptName(name);
-  if (!safe) return null;
-  const filePath = resolve(PROMPTS_DIR, `${safe}.md`);
-  try {
-    if (existsSync(filePath)) {
-      return readFileSync2(filePath, "utf-8").trim();
-    }
-  } catch {
-  }
-  return null;
-}
-
-// src/correction-store.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
-import { join as join2, dirname as dirname3 } from "path";
-var DEFAULT_FILE_PATH = join2(
-  process.env.HOME ?? "/tmp",
-  ".openclaw",
-  "guardclaw-corrections.json"
-);
-var DEFAULT_EMBEDDING_ENDPOINT = "http://localhost:1234";
-var DEFAULT_EMBEDDING_MODEL = "text-embedding-nomic-embed-text-v1.5";
-var DEFAULT_MAX_CORRECTIONS = 200;
-var DEFAULT_TOP_K = 3;
-var EMBEDDING_TIMEOUT_MS = 1e4;
-var corrections = [];
-var storeConfig = {};
-var loaded = false;
-function resolveFilePath() {
-  return storeConfig.filePath ?? DEFAULT_FILE_PATH;
-}
-function loadCorrections(config) {
-  if (config) storeConfig = config;
-  const filePath = resolveFilePath();
-  try {
-    if (existsSync2(filePath)) {
-      const raw = JSON.parse(readFileSync3(filePath, "utf-8"));
-      corrections = Array.isArray(raw.corrections) ? raw.corrections : [];
-    }
-  } catch {
-    console.warn("[GuardClaw] Failed to load corrections, starting fresh");
-    corrections = [];
-  }
-  loaded = true;
-  return corrections;
-}
-function saveCorrections() {
-  const filePath = resolveFilePath();
-  try {
-    mkdirSync2(dirname3(filePath), { recursive: true });
-    writeFileSync2(
-      filePath,
-      JSON.stringify({ corrections, updatedAt: (/* @__PURE__ */ new Date()).toISOString() }, null, 2),
-      "utf-8"
-    );
-  } catch (err) {
-    console.error("[GuardClaw] Failed to save corrections:", err);
-  }
-}
-function getCorrections() {
-  if (!loaded) loadCorrections();
-  return corrections;
-}
-async function addCorrection(input) {
-  if (!loaded) loadCorrections();
-  const correction = {
-    ...input,
-    id: generateId(),
-    timestamp: (/* @__PURE__ */ new Date()).toISOString()
-  };
-  try {
-    correction.embedding = await embedText(input.message);
-  } catch (err) {
-    console.warn("[GuardClaw] Could not compute correction embedding:", err);
-  }
-  corrections.push(correction);
-  const max = storeConfig.maxCorrections ?? DEFAULT_MAX_CORRECTIONS;
-  if (corrections.length > max) {
-    corrections = corrections.slice(-max);
-  }
-  saveCorrections();
-  console.log(
-    `[GuardClaw] Correction added: ${correction.predicted} \u2192 ${correction.corrected} (${correction.id})`
-  );
-  return correction;
-}
-function deleteCorrection(id) {
-  if (!loaded) loadCorrections();
-  const before = corrections.length;
-  corrections = corrections.filter((c) => c.id !== id);
-  if (corrections.length < before) {
-    saveCorrections();
-    return true;
-  }
-  return false;
-}
-async function findSimilarCorrections(message, topK) {
-  if (!loaded) loadCorrections();
-  const k = topK ?? storeConfig.topK ?? DEFAULT_TOP_K;
-  const withEmbeddings = corrections.filter((c) => c.embedding && c.embedding.length > 0);
-  if (withEmbeddings.length === 0) return [];
-  let queryEmbedding;
-  try {
-    queryEmbedding = await embedText(message);
-  } catch {
-    return [];
-  }
-  const scored = withEmbeddings.map((c) => ({
-    ...c,
-    similarity: cosineSimilarity(queryEmbedding, c.embedding)
-  })).filter((c) => c.similarity > 0.3).sort((a, b) => b.similarity - a.similarity).slice(0, k);
-  return scored;
-}
-async function buildFewShotExamples(message) {
-  const similar = await findSimilarCorrections(message);
-  if (similar.length === 0) return "";
-  const examples = similar.map(
-    (c) => `[EXAMPLE]
-Message: ${c.message.slice(0, 300)}
-Correct: {"level":"${c.corrected}","reason":"${c.reason ?? "corrected from " + c.predicted}"}
-[/EXAMPLE]`
-  );
-  return "The following are corrected examples for similar messages:\n" + examples.join("\n") + "\n\nNow classify the following:\n";
-}
-var AUTHORITATIVE_THRESHOLD = 0.7;
-async function getAuthoritativeOverride(message) {
-  const similar = await findSimilarCorrections(message, 1);
-  if (similar.length === 0) return null;
-  const best = similar[0];
-  if (best.similarity < AUTHORITATIVE_THRESHOLD) return null;
-  return {
-    level: best.corrected,
-    reason: `Correction override (${(best.similarity * 100).toFixed(0)}% match): ${best.reason ?? "corrected from " + best.predicted}`,
-    correctionId: best.id,
-    similarity: best.similarity
-  };
-}
-async function embedText(text) {
-  const endpoint = storeConfig.embeddingEndpoint ?? DEFAULT_EMBEDDING_ENDPOINT;
-  const model = storeConfig.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
-  const url = `${endpoint}/v1/embeddings`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      input: text.slice(0, 2e3)
-      // nomic-embed-text handles up to 8K tokens but truncate for speed
-    }),
-    signal: AbortSignal.timeout(EMBEDDING_TIMEOUT_MS)
-  });
-  if (!response.ok) {
-    throw new Error(`Embedding API error: ${response.status} ${response.statusText}`);
-  }
-  const data = await response.json();
-  const embedding = data.data?.[0]?.embedding;
-  if (!embedding || embedding.length === 0) {
-    throw new Error("Embedding response missing vector data");
-  }
-  return embedding;
-}
-function cosineSimilarity(a, b) {
-  if (a.length !== b.length || a.length === 0) return 0;
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
-  return denominator === 0 ? 0 : dotProduct / denominator;
-}
-function generateId() {
-  return `corr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-// src/types.ts
-function levelToNumeric(level) {
-  switch (level) {
-    case "S1":
-      return 1;
-    case "S2":
-      return 2;
-    case "S3":
-      return 3;
-  }
-}
-function numericToLevel(numeric) {
-  switch (numeric) {
-    case 1:
-      return "S1";
-    case 2:
-      return "S2";
-    case 3:
-      return "S3";
-    default:
-      return "S1";
-  }
-}
-function maxLevel(...levels) {
-  if (levels.length === 0) return "S1";
-  const numeric = levels.map(levelToNumeric);
-  const max = Math.max(...numeric);
-  return numericToLevel(max);
 }
 
 // src/usage-intel.ts
@@ -2070,6 +2074,9 @@ async function desensitizeWithLocalModel(content, config, sessionKey) {
     return { desensitized: content, wasModelUsed: false, failed: true };
   }
   const preRedacted = preRedactCredentials(content);
+  if (config.fastS2 === true) {
+    return { desensitized: preRedacted, wasModelUsed: false };
+  }
   try {
     const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
     const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
@@ -2368,6 +2375,7 @@ export {
   callChatCompletion,
   detectByLocalModel,
   DEFAULT_DETECTION_SYSTEM_PROMPT,
+  preRedactCredentials,
   desensitizeWithLocalModel,
   DEFAULT_PII_EXTRACTION_PROMPT
 };

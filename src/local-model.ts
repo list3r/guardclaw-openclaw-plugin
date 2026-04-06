@@ -657,6 +657,12 @@ export async function desensitizeWithLocalModel(
   // Redis URLs, pg_dump args, password colon-variants, etc.)
   const preRedacted = preRedactCredentials(content);
 
+  // GCF-034: fastS2 mode — skip LLM PII extraction, rely on regex + proxy defense-in-depth.
+  // Saves ~1-2s per S2 message. The proxy still runs redactSensitiveInfo() on all messages.
+  if ((config as Record<string, unknown>).fastS2 === true) {
+    return { desensitized: preRedacted, wasModelUsed: false };
+  }
+
   try {
     const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
     const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";

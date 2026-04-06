@@ -454,6 +454,66 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const msgStr = String(prompt);
       if (shouldSkipMessage(msgStr)) return;
 
+      // ── GCF-034: s2Channels fast path ─────────────────────────────────────
+      // Channels pre-classified as S2 skip the full pipeline (saves ~600ms LLM
+      // classification + ~1-2s LLM desensitization). Uses regex-only redaction
+      // + proxy defense-in-depth. S0 injection detection still runs below.
+      const s2ChannelSet = new Set((privacyConfig as Record<string, unknown>).s2Channels as string[] ?? []);
+      const channelId = ctx.channelId ?? "";
+      if (channelId && s2ChannelSet.has(channelId)) {
+        gcDebug(api.logger, `[GuardClaw] s2Channels fast path: channel=${channelId}`);
+
+        // S0 injection detection still runs on pre-classified channels
+        const injCfgFast = getLiveInjectionConfig();
+        if (injCfgFast.enabled !== false) {
+          const rawExtracted = extractUserContent(msgStr);
+          const userContent = rawExtracted ? stripThreadContextPrefix(rawExtracted) : stripThreadContextPrefix(msgStr) || null;
+          if (userContent) {
+            try {
+              const injResult = await detectInjection(userContent, "user_message", injCfgFast);
+              if (injResult.action === "block") {
+                throw new Error(`[GuardClaw S0] Message blocked: ${injResult.blocked_reason ?? "Prompt injection detected"}`);
+              }
+            } catch (err) {
+              const msg = String(err);
+              if (msg.includes("[GuardClaw S0] Message blocked")) throw err;
+            }
+          }
+        }
+
+        // Regex-only desensitization (preRedactCredentials + redactSensitiveInfo)
+        const { preRedactCredentials } = await import("./local-model.js");
+        const desensitized = redactSensitiveInfo(preRedactCredentials(msgStr), privacyConfig.redaction);
+
+        recordDetection(sessionKey, "S2", "onUserMessage", "s2Channels pre-classified");
+        updateGuardclawStats("S2").catch(() => {});
+        markSessionAsPrivate(sessionKey, "S2");
+        stashDetection(sessionKey, {
+          level: "S2",
+          reason: "s2Channels pre-classified",
+          desensitized,
+          originalPrompt: msgStr,
+          timestamp: Date.now(),
+        });
+
+        // Route through privacy proxy
+        const defaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
+        const primaryModel = (defaults?.model as Record<string, unknown> | undefined)?.primary as string ?? "";
+        const defaultProvider = (defaults?.provider as string) || primaryModel.split("/")[0] || "openai";
+        const providerConfig = api.config.models?.providers?.[defaultProvider];
+        if (providerConfig) {
+          const pc = providerConfig as Record<string, unknown>;
+          const providerApi = (pc.api as string) ?? undefined;
+          stashOriginalProvider(sessionKey, {
+            baseUrl: (pc.baseUrl as string) ?? resolveDefaultBaseUrl(defaultProvider, providerApi),
+            apiKey: (pc.apiKey as string) ?? "",
+            provider: defaultProvider,
+            api: providerApi,
+          });
+        }
+        return { providerOverride: "guardclaw-privacy" };
+      }
+
       // ── S0: Prompt injection detection (runs before S1/S2/S3 pipeline) ──
       const injectionCfg = getLiveInjectionConfig();
       if (injectionCfg.enabled !== false) {
@@ -731,6 +791,27 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       if (decision.level === "S1" && decision.action === "passthrough") {
         return;
+      }
+
+      // ── GCF-034: Auto-learn — promote channel to s2Channels on first S2 detection ──
+      // When the LLM classifier detects S2 for a channel not yet in s2Channels,
+      // auto-add it so subsequent messages skip the LLM entirely.
+      if (decision.level === "S2" && channelId && !s2ChannelSet.has(channelId)) {
+        s2ChannelSet.add(channelId);
+        const updatedChannels = [...s2ChannelSet];
+        // Hot-update live config
+        updateLiveConfig({ s2Channels: updatedChannels } as Partial<PrivacyConfig>);
+        // Persist to guardclaw.json (fire-and-forget, under write lock)
+        withConfigWriteLock(async () => {
+          try {
+            const raw = await fs.promises.readFile(GUARDCLAW_JSON_PATH, "utf8");
+            const cfg = JSON.parse(raw) as Record<string, unknown>;
+            if (!cfg.privacy) cfg.privacy = {};
+            (cfg.privacy as Record<string, unknown>).s2Channels = updatedChannels;
+            await fs.promises.writeFile(GUARDCLAW_JSON_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+          } catch { /* best-effort */ }
+        }).catch(() => {});
+        api.logger.info(`[GuardClaw] Auto-learned S2 channel: ${channelId} (${updatedChannels.length} total)`);
       }
 
       // S3 from LLM detector (rules didn't catch it above): route to local

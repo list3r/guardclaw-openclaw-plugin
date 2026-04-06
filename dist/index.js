@@ -55,12 +55,12 @@ import {
   stashDetection,
   trackSessionLevel,
   triggerDebertaReload,
-  updateLiveConfig,
+  updateLiveConfig as updateLiveConfig2,
   updateLiveInjectionConfig,
   watchConfigFile,
   withConfigWriteLock,
   writePrompt
-} from "./chunk-LOWUVBCG.js";
+} from "./chunk-FMLGWCSX.js";
 import {
   fireWebhooks
 } from "./chunk-DLV362LL.js";
@@ -3572,6 +3572,55 @@ function registerHooks(api) {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
       const msgStr = String(prompt);
       if (shouldSkipMessage(msgStr)) return;
+      const s2ChannelSet = new Set(privacyConfig.s2Channels ?? []);
+      const channelId = ctx.channelId ?? "";
+      if (channelId && s2ChannelSet.has(channelId)) {
+        gcDebug(api.logger, `[GuardClaw] s2Channels fast path: channel=${channelId}`);
+        const injCfgFast = getLiveInjectionConfig();
+        if (injCfgFast.enabled !== false) {
+          const rawExtracted = extractUserContent(msgStr);
+          const userContent = rawExtracted ? stripThreadContextPrefix(rawExtracted) : stripThreadContextPrefix(msgStr) || null;
+          if (userContent) {
+            try {
+              const injResult = await detectInjection(userContent, "user_message", injCfgFast);
+              if (injResult.action === "block") {
+                throw new Error(`[GuardClaw S0] Message blocked: ${injResult.blocked_reason ?? "Prompt injection detected"}`);
+              }
+            } catch (err) {
+              const msg = String(err);
+              if (msg.includes("[GuardClaw S0] Message blocked")) throw err;
+            }
+          }
+        }
+        const { preRedactCredentials } = await import("./local-model-JSDO5IU4.js");
+        const desensitized2 = redactSensitiveInfo(preRedactCredentials(msgStr), privacyConfig.redaction);
+        recordDetection(sessionKey, "S2", "onUserMessage", "s2Channels pre-classified");
+        updateGuardclawStats("S2").catch(() => {
+        });
+        markSessionAsPrivate(sessionKey, "S2");
+        stashDetection(sessionKey, {
+          level: "S2",
+          reason: "s2Channels pre-classified",
+          desensitized: desensitized2,
+          originalPrompt: msgStr,
+          timestamp: Date.now()
+        });
+        const defaults = api.config.agents?.defaults;
+        const primaryModel = defaults?.model?.primary ?? "";
+        const defaultProvider = defaults?.provider || primaryModel.split("/")[0] || "openai";
+        const providerConfig = api.config.models?.providers?.[defaultProvider];
+        if (providerConfig) {
+          const pc = providerConfig;
+          const providerApi = pc.api ?? void 0;
+          stashOriginalProvider(sessionKey, {
+            baseUrl: pc.baseUrl ?? resolveDefaultBaseUrl(defaultProvider, providerApi),
+            apiKey: pc.apiKey ?? "",
+            provider: defaultProvider,
+            api: providerApi
+          });
+        }
+        return { providerOverride: "guardclaw-privacy" };
+      }
       const injectionCfg = getLiveInjectionConfig();
       if (injectionCfg.enabled !== false) {
         let senderId = ctx.senderId;
@@ -3778,6 +3827,23 @@ function registerHooks(api) {
       }
       if (decision.level === "S1" && decision.action === "passthrough") {
         return;
+      }
+      if (decision.level === "S2" && channelId && !s2ChannelSet.has(channelId)) {
+        s2ChannelSet.add(channelId);
+        const updatedChannels = [...s2ChannelSet];
+        updateLiveConfig({ s2Channels: updatedChannels });
+        withConfigWriteLock(async () => {
+          try {
+            const raw = await fs4.promises.readFile(GUARDCLAW_JSON_PATH2, "utf8");
+            const cfg = JSON.parse(raw);
+            if (!cfg.privacy) cfg.privacy = {};
+            cfg.privacy.s2Channels = updatedChannels;
+            await fs4.promises.writeFile(GUARDCLAW_JSON_PATH2, JSON.stringify(cfg, null, 2), { mode: 384 });
+          } catch {
+          }
+        }).catch(() => {
+        });
+        api.logger.info(`[GuardClaw] Auto-learned S2 channel: ${channelId} (${updatedChannels.length} total)`);
       }
       if (decision.level === "S3") {
         trackSessionLevel(sessionKey, "S3");
@@ -5702,7 +5768,7 @@ function applyPreset(id, opts) {
   const preset = allPresets.find((p) => p.id === id);
   if (!preset) return { ok: false, error: `Preset not found: ${id}` };
   const currentGuardAgent = getLiveConfig().guardAgent;
-  updateLiveConfig({
+  updateLiveConfig2({
     localModel: { ...preset.localModel, enabled: true },
     guardAgent: { ...currentGuardAgent, model: preset.guardAgent.model }
   });
@@ -6447,7 +6513,7 @@ async function acceptSuggestion(id) {
       const tiers = routers["token-saver"].options.tiers ?? {};
       tiers[tier] = { provider: "openrouter", model: newModel };
       routers["token-saver"].options.tiers = tiers;
-      updateLiveConfig({ routers });
+      updateLiveConfig2({ routers });
       const configPath = join10(HOME4, ".openclaw", "guardclaw.json");
       let fileCfg = {};
       try {
@@ -6471,7 +6537,7 @@ async function acceptSuggestion(id) {
     if (suggestion.type === "local_model") {
       const newModel = suggestion.suggestedValue;
       if (!newModel) return { ok: false, message: "Missing model name" };
-      updateLiveConfig({ localModel: { ...getLiveConfig().localModel, model: newModel } });
+      updateLiveConfig2({ localModel: { ...getLiveConfig().localModel, model: newModel } });
       const configPath = join10(HOME4, ".openclaw", "guardclaw.json");
       let fileCfg = {};
       try {
@@ -6765,7 +6831,7 @@ async function statsHttpHandler(req, res) {
     try {
       const body = JSON.parse(await readBody(req));
       if (body.privacy) {
-        updateLiveConfig(body.privacy);
+        updateLiveConfig2(body.privacy);
         const existingPrivacy = deps.pluginConfig.privacy ?? {};
         const incomingRouters = body.privacy.routers;
         const incomingPipeline = body.privacy.pipeline;

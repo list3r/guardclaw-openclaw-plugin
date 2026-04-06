@@ -146,6 +146,21 @@ export type PrivacyConfig = {
    * Enable via guardclaw.json → privacy.debugLogging: true for troubleshooting.
    */
   debugLogging?: boolean;
+  /**
+   * Use regex-only desensitization for S2 messages instead of the two-step
+   * LLM extraction. Saves ~1-2s per message at the cost of missing semantic
+   * PII that has no regex pattern (e.g. names in context, freeform addresses).
+   * The proxy's defense-in-depth regex still runs regardless.
+   * Default: false.
+   */
+  fastS2?: boolean;
+  /**
+   * Channel IDs pre-classified as S2. Messages from these channels skip the
+   * LLM classification step entirely and go straight to desensitization + proxy.
+   * Combined with fastS2, this reduces S2 overhead from ~2s to ~5ms.
+   * Channels are auto-added when first LLM-classified as S2 (auto-learn).
+   */
+  s2Channels?: string[];
 };
 
 export type TaintTrackingConfig = {

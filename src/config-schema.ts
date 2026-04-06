@@ -249,6 +249,8 @@ export const guardClawConfigSchema = Type.Object({
         }),
       ),
       debugLogging: Type.Optional(Type.Boolean()),
+      fastS2: Type.Optional(Type.Boolean()),
+      s2Channels: Type.Optional(Type.Array(Type.String())),
     }),
   ),
 });
