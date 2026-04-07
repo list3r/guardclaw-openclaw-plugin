@@ -55,7 +55,7 @@ import {
   stashDetection,
   trackSessionLevel,
   triggerDebertaReload,
-  updateLiveConfig as updateLiveConfig2,
+  updateLiveConfig,
   updateLiveInjectionConfig,
   watchConfigFile,
   withConfigWriteLock,
@@ -5781,7 +5781,7 @@ function applyPreset(id, opts) {
   const preset = allPresets.find((p) => p.id === id);
   if (!preset) return { ok: false, error: `Preset not found: ${id}` };
   const currentGuardAgent = getLiveConfig().guardAgent;
-  updateLiveConfig2({
+  updateLiveConfig({
     localModel: { ...preset.localModel, enabled: true },
     guardAgent: { ...currentGuardAgent, model: preset.guardAgent.model }
   });
@@ -6526,7 +6526,7 @@ async function acceptSuggestion(id) {
       const tiers = routers["token-saver"].options.tiers ?? {};
       tiers[tier] = { provider: "openrouter", model: newModel };
       routers["token-saver"].options.tiers = tiers;
-      updateLiveConfig2({ routers });
+      updateLiveConfig({ routers });
       const configPath = join10(HOME4, ".openclaw", "guardclaw.json");
       let fileCfg = {};
       try {
@@ -6550,7 +6550,7 @@ async function acceptSuggestion(id) {
     if (suggestion.type === "local_model") {
       const newModel = suggestion.suggestedValue;
       if (!newModel) return { ok: false, message: "Missing model name" };
-      updateLiveConfig2({ localModel: { ...getLiveConfig().localModel, model: newModel } });
+      updateLiveConfig({ localModel: { ...getLiveConfig().localModel, model: newModel } });
       const configPath = join10(HOME4, ".openclaw", "guardclaw.json");
       let fileCfg = {};
       try {
@@ -6844,7 +6844,7 @@ async function statsHttpHandler(req, res) {
     try {
       const body = JSON.parse(await readBody(req));
       if (body.privacy) {
-        updateLiveConfig2(body.privacy);
+        updateLiveConfig(body.privacy);
         const existingPrivacy = deps.pluginConfig.privacy ?? {};
         const incomingRouters = body.privacy.routers;
         const incomingPipeline = body.privacy.pipeline;

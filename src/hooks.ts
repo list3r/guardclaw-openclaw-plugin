@@ -64,7 +64,7 @@ import {
 } from "./privacy-proxy.js";
 import { getGlobalPipeline } from "./router-pipeline.js";
 import { getGlobalCollector } from "./token-stats.js";
-import { getLiveConfig, getLiveInjectionConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans, withConfigWriteLock } from "./live-config.js";
+import { getLiveConfig, getLiveInjectionConfig, updateLiveConfig, updateLiveInjectionConfig, recordInjectionAttempt, pendingBans, withConfigWriteLock } from "./live-config.js";
 import { detectInjection, SECURITY_CHANNEL, formatBlockAlert } from "./injection/index.js";
 import { runHeuristics } from "./injection/heuristics.js";
 import { sanitiseContent } from "./injection/sanitiser.js";
