@@ -841,6 +841,24 @@ export function registerHooks(api: OpenClawPluginApi): void {
         };
       }
 
+      // ── GCF-035: Skip S2 proxy when original model is already local ──────
+      // If the request was already destined for a local model (e.g. cron jobs
+      // using lmstudio/qwen3.5:35b), S2 proxy redaction is unnecessary —
+      // the data never leaves the machine. Let it through unchanged.
+      if (decision.level === "S2") {
+        const requestedModel = (event as Record<string, unknown>).model as string ?? "";
+        const requestedProvider = requestedModel.includes("/") ? requestedModel.split("/")[0] : "";
+        const allLocalProviders = privacyConfig.localProviders ?? [];
+        if (requestedProvider && isLocalProvider(requestedProvider, allLocalProviders)) {
+          gcDebug(api.logger, `[GuardClaw] S2 skip — original model "${requestedModel}" is already local, no proxy needed`);
+          recordDetection(sessionKey, "S2", "onUserMessage", `${decision.reason}; local model — proxy skipped`);
+          updateGuardclawStats("S2").catch(() => {});
+          markSessionAsPrivate(sessionKey, "S2");
+          // No override — let the original local model handle it
+          return;
+        }
+      }
+
       // Desensitize for S2 (needed for both proxy markers and local prompt).
       // If desensitization fails (local model down), escalate to S3 so the
       // message stays entirely local — never send raw PII to cloud.

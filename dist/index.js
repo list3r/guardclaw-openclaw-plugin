@@ -3870,6 +3870,19 @@ function registerHooks(api) {
           modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
         };
       }
+      if (decision.level === "S2") {
+        const requestedModel = event.model ?? "";
+        const requestedProvider = requestedModel.includes("/") ? requestedModel.split("/")[0] : "";
+        const allLocalProviders = privacyConfig.localProviders ?? [];
+        if (requestedProvider && isLocalProvider(requestedProvider, allLocalProviders)) {
+          gcDebug(api.logger, `[GuardClaw] S2 skip \u2014 original model "${requestedModel}" is already local, no proxy needed`);
+          recordDetection(sessionKey, "S2", "onUserMessage", `${decision.reason}; local model \u2014 proxy skipped`);
+          updateGuardclawStats("S2").catch(() => {
+          });
+          markSessionAsPrivate(sessionKey, "S2");
+          return;
+        }
+      }
       let desensitized;
       if (decision.level === "S2") {
         const result = await desensitizeWithLocalModel(msgStr, privacyConfig, sessionKey);
