@@ -1,0 +1,296 @@
+{
+  // ─────────────────────────────────────────────────────────────────────────
+  // GuardClaw v2 — Annotated Example Configuration
+  //
+  // Copy this file to your OpenClaw config directory as guardclaw.json
+  // and edit the values for your environment.
+  //
+  // All provider references use aliases defined in openclaw.json.
+  // GuardClaw does not define inference endpoints — it references them.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  "privacy": {
+
+    // ── Master switch ────────────────────────────────────────────────────────
+    // Set to false to disable all GuardClaw processing (S0 and S1–S3).
+    // Not recommended for production. Useful for debugging.
+    "enabled": true,
+
+
+    // ── S0: Inbound injection detection ──────────────────────────────────────
+    // Runs on every inbound message (user → model) BEFORE S1–S3 classification.
+    // Uses a local DeBERTa model — lightweight, purpose-built for this task.
+    // Independent of S1–S3. A message can be S0-clean and S3-sensitive.
+    "s0": {
+      "enabled": true,
+
+      // The local model used for injection detection.
+      // DeBERTa-v3-base is the recommended default.
+      "model": "deberta-v3-base",
+
+      // Confidence threshold above which a message is flagged/blocked.
+      // Range: 0.0–1.0. Default: 0.85.
+      // Lower = more sensitive (more false positives).
+      // Higher = less sensitive (may miss subtle injections).
+      "threshold": 0.85,
+
+      // What to do when injection is detected above threshold.
+      // "allow"  — log and continue (monitoring only)
+      // "flag"   — annotate the message and continue (session sees a warning)
+      // "block"  — reject the message entirely
+      "action": "flag"
+    },
+
+
+    // ── Outbound classifier ───────────────────────────────────────────────────
+    // The local model used to classify outbound messages as S1/S2/S3.
+    // Stage 1 (rules) always runs first. This model runs Stage 2 when
+    // Stage 1 returns an ambiguous or S1 result.
+    //
+    // IMPORTANT: This must be a local provider alias. Never cloud.
+    // Recommended: 7B–14B parameter, non-thinking, instruction-tuned model.
+    // Below 7B: GuardClaw will warn at startup — misclassification risk.
+    // Thinking models (e.g. -r1, qwq, -o1): GuardClaw will warn — high latency,
+    // no accuracy benefit for classification tasks.
+    "classifier": {
+
+      // OpenClaw provider alias (must exist in openclaw.json)
+      "provider": "ollama-local",
+
+      // Model name on that provider
+      "model": "llama3.2:8b",
+
+      // Warn at startup if model param count (inferred from name) is below this.
+      // Default: 7 (billion). Set to 0 to disable the warning.
+      "warnBelowBillions": 7,
+
+      // Run a benchmark of ~20 labelled test messages at startup.
+      // Reports accuracy score to logs. Advisory only — does not block startup.
+      // Adds ~5–10s to startup time. Recommended when first configuring a new model.
+      "runBenchmark": false
+    },
+
+
+    // ── S3 guard agent ────────────────────────────────────────────────────────
+    // The local provider(s) used to handle S3-classified content.
+    // S3 content will ONLY be sent to providers listed here.
+    // Providers are tried in order — first healthy one is used.
+    "guardAgent": {
+
+      // Ordered list of OpenClaw provider aliases.
+      // All aliases must exist in openclaw.json or additionalProviders below.
+      // GuardClaw validates all aliases at startup — unknown aliases are a hard error.
+      "providers": [
+        "gpu-primary",
+        "gpu-secondary"
+      ],
+
+      // Optional per-alias model overrides.
+      // Use this to pin a specific model for S3 work without changing the
+      // provider's default model in openclaw.json.
+      "providerOverrides": {
+        "gpu-primary": {
+          "model": "qwen3:14b"
+        }
+      },
+
+      // Additional providers defined only for GuardClaw — not in openclaw.json.
+      // Use for dedicated privacy inference machines that should not appear
+      // in OpenClaw's general provider routing.
+      // Supported types: "ollama" | "lmstudio" | "openai-compatible"
+      "additionalProviders": {
+        // Example: a dedicated GuardClaw machine on the LAN
+        // "guardclaw-dedicated": {
+        //   "type": "ollama",
+        //   "endpoint": "http://10.0.0.120:11434",
+        //   "model": "qwen3.5:9b"
+        // }
+      },
+
+      // What happens when S3 content reaches a local provider.
+      //
+      // "respond"    — local model generates the full response.
+      //               Cloud never sees the content. Strong privacy guarantee.
+      //               DEFAULT when a local provider is available.
+      //               Requires a capable local model (7B+ recommended).
+      //
+      // "filter"     — local model sanitises the message with placeholder tokens,
+      //               sanitised version forwarded to cloud provider,
+      //               tokens swapped back in the response.
+      //               LIMITATION: if the specific value changes the answer
+      //               (e.g. $340k vs $3k), cloud response may be less useful.
+      //
+      // "synthesise" — [BETA] local model abstracts the question (strips PII,
+      //               preserves intent), cloud returns a reasoning framework,
+      //               local model synthesises a final response using the
+      //               framework + full unredacted original.
+      //               Cloud never sees PII. Best response quality.
+      //               Requires 7B+ local model for acceptable synthesis.
+      //               Must also set intelligence.synthesisMode.enabled: true.
+      "s3Mode": "respond",
+
+      // OpenClaw agent ID for the guard agent session.
+      // Leave as "guard" unless you have a specific reason to change it.
+      "id": "guard",
+
+      // Workspace directory for the guard agent.
+      "workspace": "~/.openclaw/workspace-guard"
+    },
+
+
+    // ── S2 forwarding ─────────────────────────────────────────────────────────
+    // Where redacted S2 content is forwarded after PII stripping.
+    //
+    // "default"    — uses OpenClaw's current default provider (same as S1)
+    // "<alias>"    — a specific named provider alias from openclaw.json
+    //
+    // In most cases "default" is correct. Override only if you want S2 content
+    // on a specific provider (e.g. a cheaper model for sensitive-but-not-critical data).
+    "s2ForwardTo": "default",
+
+
+    // ── S3 non-local override ─────────────────────────────────────────────────
+    // When NO local S3 provider is configured or all are unhealthy,
+    // GuardClaw redacts with rules and forwards to the default cloud provider.
+    // A warning is logged every time this occurs.
+    //
+    // If allowNonLocalForS3 is true, this also applies when the user has
+    // explicitly opted in to cloud forwarding for S3 content.
+    //
+    // ⚠️  WARNING: Setting this to true means S3 content (highly sensitive:
+    // financial, legal, medical records) will be sent to cloud providers
+    // with best-effort rule-based redaction only. This is NOT a privacy
+    // guarantee. Only set this if you understand and accept the risk.
+    //
+    // This setting is intended to be managed via the dashboard (v2.1+)
+    // which will present a prominent warning before allowing this change.
+    "allowNonLocalForS3": false,
+
+
+    // ── Local network definition ──────────────────────────────────────────────
+    // GuardClaw validates that S3 providers resolve to local endpoints.
+    // RFC 1918 ranges (10.x, 172.16-31.x, 192.168.x) are always trusted.
+    // Add additional CIDRs here for VPN ranges, Tailscale, WireGuard, etc.
+    "localNetwork": {
+
+      // Additional CIDR ranges considered local/trusted.
+      // Examples:
+      //   "100.64.0.0/10"  — Tailscale
+      //   "10.8.0.0/24"    — WireGuard subnet
+      //   "172.20.0.0/16"  — corporate VPN
+      "trustedCidrs": [
+        // "100.64.0.0/10"
+      ]
+    },
+
+
+    // ── Health checking ───────────────────────────────────────────────────────
+    // GuardClaw pings each S3 provider at startup and on a regular interval.
+    // Unhealthy providers are skipped in the priority chain.
+    // If all providers are unhealthy, S3 falls to the no-local-provider path.
+    "healthCheck": {
+      "enabled": true,
+
+      // How often to ping each provider (milliseconds).
+      // Default: 30000 (30 seconds)
+      "intervalMs": 30000,
+
+      // How long to wait for a ping response before marking unhealthy (ms).
+      // Default: 3000 (3 seconds)
+      "timeoutMs": 3000
+    },
+
+
+    // ── Intelligence & learning ───────────────────────────────────────────────
+    // Controls classification logging, provider scoring, and beta features.
+    "intelligence": {
+
+      // Master switch for intelligence features.
+      "enabled": true,
+
+      // Phase 1: Log every classification event locally.
+      // Stores: timestamp, content fingerprint (SimHash — NOT raw content),
+      // provider, model, result, latency, user override (ground truth).
+      // This data is the prerequisite for Phase 2 rule refinement (v3)
+      // and Phase 3 fine-tuning (v4). Disabling it now means no learning later.
+      // All data stays local — never transmitted.
+      "logClassifications": true,
+
+      // Algorithm used to fingerprint classified content segments.
+      // "simhash"  — recommended. Fast, privacy-safe, good clustering.
+      // "minhash"  — alternative for set-similarity workloads.
+      "fingerprintAlgorithm": "simhash",
+
+      // Provider scoring: tracks latency, override rate, and fallback rate
+      // per provider and surfaces advisory suggestions when a lower-priority
+      // provider consistently outperforms the primary.
+      // GuardClaw never auto-reorders providers in v2 — suggestions only.
+      "providerScoring": {
+        "enabled": true,
+
+        // Scoring weights. Must sum to 1.0.
+        // quality     — based on override rate (how often users correct the result)
+        // availability — based on fallback rate (how often this provider was skipped)
+        // speed        — based on normalised latency vs baseline
+        "weights": {
+          "quality": 0.5,
+          "availability": 0.3,
+          "speed": 0.2
+        }
+      },
+
+      // [BETA] Synthesise mode for S3 content.
+      // When enabled and s3Mode is "synthesise", GuardClaw uses a three-step
+      // flow: local abstracts → cloud frameworks → local synthesises.
+      // Cloud never sees PII. Response quality depends on local model (7B+ required).
+      //
+      // Enable this toggle to activate synthesise mode. Also set
+      // guardAgent.s3Mode: "synthesise" above.
+      //
+      // Logs all three steps (abstraction, framework, synthesis) so you can
+      // inspect whether the synthesis is producing useful results.
+      "synthesisMode": {
+        "enabled": false,
+
+        // How long to wait for the cloud framework response before falling
+        // back to respond mode (milliseconds).
+        "timeoutMs": 15000
+      }
+    },
+
+
+    // ── Detection rules ───────────────────────────────────────────────────────
+    // Override or extend the built-in keyword and pattern rules.
+    // Built-in rules are always loaded. These are merged on top.
+    // See docs/rules-reference.md for built-in rule names and formats.
+    "rules": {
+      // Example: add a custom S3 keyword
+      // "keywords": {
+      //   "S3": {
+      //     "custom": ["my-secret-project", "project-phoenix"]
+      //   }
+      // }
+    },
+
+
+    // ── Checkpoints ───────────────────────────────────────────────────────────
+    // Control which parts of the message pipeline are checked.
+    // All enabled by default. Disable specific checkpoints for performance
+    // tuning in low-risk environments.
+    "checkpoints": {
+      // "userMessage": true,
+      // "toolResults": true,
+      // "systemPrompt": false
+    },
+
+
+    // ── Session config ────────────────────────────────────────────────────────
+    // Per-session behaviour overrides.
+    "session": {
+      // Cache the classification result for the session to avoid
+      // re-classifying identical content. Useful for long sessions.
+      // "cacheResults": true
+    }
+
+  }
+}
