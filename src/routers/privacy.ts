@@ -23,6 +23,7 @@ import { desensitizeWithLocalModel } from "../local-model.js";
 import { getGuardAgentConfig } from "../guard-agent.js";
 import { defaultPrivacyConfig } from "../config-schema.js";
 
+
 /**
  * Map a DetectionResult (from detector.ts) into a RouterDecision.
  * This bridges the legacy detector API to the new router pipeline API.
@@ -38,14 +39,17 @@ function detectionToDecision(
 
   if (level === "S3") {
     const guardCfg = getGuardAgentConfig(privacyConfig);
-    const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
+    // No fallback provider — guard agent must be explicitly configured.
+    // If unconfigured, target is omitted and the caller/hook handles the warning.
     return {
       level: "S3",
       action: "redirect",
-      target: {
-        provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
-      },
+      ...(guardCfg ? {
+        target: {
+          provider: guardCfg.provider,
+          ...(guardCfg.modelName ? { model: guardCfg.modelName } : {}),
+        },
+      } : {}),
       reason,
     };
   }
@@ -54,14 +58,15 @@ function detectionToDecision(
   const s2Policy = privacyConfig.s2Policy ?? "proxy";
   if (s2Policy === "local") {
     const guardCfg = getGuardAgentConfig(privacyConfig);
-    const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
     return {
       level: "S2",
       action: "redirect",
-      target: {
-        provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
-      },
+      ...(guardCfg ? {
+        target: {
+          provider: guardCfg.provider,
+          ...(guardCfg.modelName ? { model: guardCfg.modelName } : {}),
+        },
+      } : {}),
       reason,
     };
   }

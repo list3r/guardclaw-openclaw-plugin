@@ -5,6 +5,7 @@
  */
 
 import { Type } from "@sinclair/typebox";
+import { DEFAULT_LOCAL_CLASSIFIER_MODEL } from "./model-defaults.js";
 
 export const guardClawConfigSchema = Type.Object({
   injection: Type.Optional(
@@ -114,6 +115,24 @@ export const guardClawConfigSchema = Type.Object({
         Type.Object({
           id: Type.Optional(Type.String()),
           workspace: Type.Optional(Type.String()),
+          /**
+           * The OpenClaw provider alias to route S3 (and optionally S2-local) content to.
+           * This must match a provider key in your openclaw.json providers config.
+           *
+           * Examples: "ollama", "ollama-remote", "ollama-120", "financial-llm", "image-llm"
+           *
+           * No default — GuardClaw will warn at startup and refuse to route sensitive
+           * content until this is explicitly configured.
+           */
+          provider: Type.Optional(Type.String()),
+          /**
+           * Optional model override within the provider.
+           * Omit to use whatever model the provider has configured in openclaw.json.
+           * Use this only when you need to pin a specific model for privacy routing
+           * (e.g. a smaller/faster model on the same provider endpoint).
+           *
+           * Examples: "llama3.2:3b", "qwen3:14b"
+           */
           model: Type.Optional(Type.String()),
         }),
       ),
@@ -292,14 +311,17 @@ export const defaultPrivacyConfig = {
   localModel: {
     enabled: true,
     type: "openai-compatible" as const,
-    model: "qwen/qwen3-30b-a3b-2507",
+    model: DEFAULT_LOCAL_CLASSIFIER_MODEL,
     endpoint: "http://localhost:1234",
   },
   guardAgent: {
     id: "guard",
     workspace: "~/.openclaw/workspace-guard",
-    model: "ollama/qwen/qwen3-30b-a3b-2507",
-  },
+    // No default provider — must be set by the user in guardclaw.json.
+    // GuardClaw will warn at startup if provider is not configured.
+    // Example: provider: "ollama", or provider: "ollama-remote", or any alias
+    // defined in your openclaw.json providers config.
+  } as { id: string; workspace: string; provider?: string; model?: string },
   localProviders: [] as string[],
   toolAllowlist: [] as string[],
   modelPricing: {

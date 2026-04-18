@@ -15,6 +15,43 @@ import { redactSensitiveInfo } from "./utils.js";
 export const GUARD_SECTION_BEGIN = "<!-- guardclaw:guard-begin -->";
 export const GUARD_SECTION_END = "<!-- guardclaw:guard-end -->";
 
+/** Maximum chars for MEMORY.md (clean). OpenClaw truncates at 20K anyway;
+ *  keeping well below avoids the warning and leaves room for system prompt. */
+const CLEAN_MEMORY_MAX_CHARS = 4000;
+
+/** Maximum chars for MEMORY-FULL.md. Local models have limited context windows
+ *  (~32K tokens for Qwen3-30B); 6K chars ≈ 1.5-2K tokens leaves room for
+ *  system prompt + conversation history + tool results. */
+const FULL_MEMORY_MAX_CHARS = 6000;
+
+/**
+ * Truncate content to maxChars by dropping the OLDEST lines (top of file)
+ * while preserving the header (first 3 lines) and keeping newest content.
+ */
+function truncateKeepRecent(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content;
+
+  const lines = content.split("\n");
+  // Preserve header lines (title, date, separator)
+  const headerLines = lines.slice(0, 3);
+  const bodyLines = lines.slice(3);
+
+  // Walk backwards from end, accumulating lines until we hit the budget
+  const headerSize = headerLines.join("\n").length + 1; // +1 for joining newline
+  const budget = maxChars - headerSize;
+  const kept: string[] = [];
+  let size = 0;
+
+  for (let i = bodyLines.length - 1; i >= 0; i--) {
+    const lineSize = bodyLines[i].length + 1;
+    if (size + lineSize > budget) break;
+    kept.unshift(bodyLines[i]);
+    size += lineSize;
+  }
+
+  return [...headerLines, ...kept].join("\n");
+}
+
 export class MemoryIsolationManager {
   private workspaceDir: string;
 
@@ -144,10 +181,11 @@ export class MemoryIsolationManager {
         return 0;
       }
 
-      // Append new lines to FULL under a merged section
+      // Append new lines to FULL under a merged section, then cap total size
       const appendBlock = `\n\n## Cloud Session Additions\n${newLines.join("\n")}\n`;
-      await this.writeMemory(fullContent + appendBlock, false, options);
-      console.log(`[GuardClaw] Merged ${newLines.length} line(s) from clean → full`);
+      const merged = truncateKeepRecent(fullContent + appendBlock, FULL_MEMORY_MAX_CHARS);
+      await this.writeMemory(merged, false, options);
+      console.log(`[GuardClaw] Merged ${newLines.length} line(s) from clean → full (${merged.length} chars)`);
       return newLines.length;
     } catch (err) {
       console.error("[GuardClaw] Failed to merge clean into full:", err);
@@ -187,8 +225,12 @@ export class MemoryIsolationManager {
       // Phase 2: Redact PII — prefer local model, fall back to regex rules
       const cleanMemory = await this.redactContent(guardStripped, privacyConfig);
 
-      // Write to clean memory
-      await this.writeMemory(cleanMemory, true);
+      // Write to clean memory — enforce size cap so MEMORY.md never blows out context
+      const cappedClean = truncateKeepRecent(cleanMemory, CLEAN_MEMORY_MAX_CHARS);
+      if (cappedClean.length < cleanMemory.length) {
+        console.log(`[GuardClaw] MEMORY.md capped: ${cleanMemory.length} → ${cappedClean.length} chars`);
+      }
+      await this.writeMemory(cappedClean, true);
 
       // ── Integrity check (#15) ──────────────────────────────────────────────
       // Re-read the written MEMORY.md and verify no guard section marker leaked

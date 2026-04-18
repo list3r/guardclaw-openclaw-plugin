@@ -1,5 +1,6 @@
 import {
   DEFAULT_DETECTION_SYSTEM_PROMPT,
+  DEFAULT_LOCAL_CLASSIFIER_MODEL,
   DEFAULT_PII_EXTRACTION_PROMPT,
   SECURITY_CHANNEL,
   TokenStatsCollector,
@@ -60,7 +61,7 @@ import {
   watchConfigFile,
   withConfigWriteLock,
   writePrompt
-} from "./chunk-FMLGWCSX.js";
+} from "./chunk-6JG7VSVH.js";
 import {
   fireWebhooks
 } from "./chunk-DLV362LL.js";
@@ -76,43 +77,36 @@ import { join as join8 } from "path";
 
 // src/guard-agent.ts
 function isGuardAgentConfigured(config) {
-  return Boolean(
-    config.guardAgent?.id && config.guardAgent?.model && config.guardAgent?.workspace
-  );
+  return Boolean(config.guardAgent?.provider);
 }
 function getGuardAgentConfig(config) {
   if (!isGuardAgentConfigured(config)) {
     return null;
   }
-  const fullModel = config.guardAgent?.model ?? "ollama/qwen/qwen3-30b-a3b-2507";
-  const firstSlash = fullModel.indexOf("/");
-  const defaultProvider = config.localModel?.provider ?? "ollama";
-  const [provider, modelName] = firstSlash >= 0 ? [fullModel.slice(0, firstSlash), fullModel.slice(firstSlash + 1)] : [defaultProvider, fullModel];
   return {
     id: config.guardAgent?.id ?? "guard",
-    model: fullModel,
     workspace: config.guardAgent?.workspace ?? "~/.openclaw/workspace-guard",
-    provider,
-    modelName
+    provider: config.guardAgent.provider,
+    modelName: config.guardAgent?.model || void 0
   };
 }
-function isGuardSessionKey(sessionKey) {
-  return sessionKey.endsWith(":guard") || sessionKey.includes(":guard:");
+function isGuardSessionKey(sessionKey2) {
+  return sessionKey2.endsWith(":guard") || sessionKey2.includes(":guard:");
 }
 var registeredGuardParents = /* @__PURE__ */ new Set();
 function registerGuardSessionParent(parentSessionKey) {
   registeredGuardParents.add(parentSessionKey);
 }
-function isVerifiedGuardSession(sessionKey) {
-  if (!isGuardSessionKey(sessionKey)) return false;
-  const idx = sessionKey.indexOf(":guard");
+function isVerifiedGuardSession(sessionKey2) {
+  if (!isGuardSessionKey(sessionKey2)) return false;
+  const idx = sessionKey2.indexOf(":guard");
   if (idx === -1) return false;
-  const parentKey = sessionKey.slice(0, idx);
+  const parentKey = sessionKey2.slice(0, idx);
   return registeredGuardParents.has(parentKey);
 }
-function deregisterGuardSession(sessionKey) {
-  const idx = sessionKey.indexOf(":guard");
-  if (idx !== -1) registeredGuardParents.delete(sessionKey.slice(0, idx));
+function deregisterGuardSession(sessionKey2) {
+  const idx = sessionKey2.indexOf(":guard");
+  if (idx !== -1) registeredGuardParents.delete(sessionKey2.slice(0, idx));
 }
 function buildMainSessionPlaceholder(level, reason, timestamp) {
   const emoji = level === "S3" ? "\u{1F512}" : "\u{1F511}";
@@ -200,7 +194,7 @@ function resolveConfig(config) {
 }
 async function callSynthesis(content, taskContext, config, timeoutMs) {
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+  const model = config.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
   const providerType = config.localModel?.type ?? "openai-compatible";
   const prompt = loadPromptWithVars("s3-synthesis", DEFAULT_SYNTHESIS_PROMPT, {
     CONTENT: content,
@@ -229,7 +223,7 @@ async function callSynthesis(content, taskContext, config, timeoutMs) {
 }
 async function verifySynthesis(synthetic, config, timeoutMs) {
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+  const model = config.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
   const providerType = config.localModel?.type ?? "openai-compatible";
   const prompt = loadPromptWithVars("s3-verify", DEFAULT_VERIFY_PROMPT, {
     CONTENT: synthetic.slice(0, 2e3)
@@ -267,7 +261,7 @@ async function verifySynthesis(synthetic, config, timeoutMs) {
     return { safe: true };
   }
 }
-async function synthesizeContent(original, taskContext, config, sessionKey) {
+async function synthesizeContent(original, taskContext, config, sessionKey2) {
   if (!config.localModel?.enabled) {
     return { ok: false, reason: "Local model not enabled" };
   }
@@ -301,14 +295,14 @@ async function synthesizeContent(original, taskContext, config, sessionKey) {
   }
   return { ok: false, reason: lastFailReason };
 }
-async function synthesizeToolResult(toolName, toolResult, taskContext, config, sessionKey) {
+async function synthesizeToolResult(toolName, toolResult, taskContext, config, sessionKey2) {
   if (!config.localModel?.enabled) {
     return { ok: false, reason: "Local model not enabled" };
   }
   const cfg = resolveConfig(config);
   const toolContext = `Tool "${toolName}" returned a result. Task context: ${taskContext || "general assistance"}`;
   const input = toolResult.slice(0, cfg.maxInputChars);
-  return synthesizeContent(input, toolContext, config, sessionKey);
+  return synthesizeContent(input, toolContext, config, sessionKey2);
 }
 
 // src/memory-isolation.ts
@@ -512,6 +506,25 @@ function resolveDefaultBaseUrl(provider, api) {
 // src/memory-isolation.ts
 var GUARD_SECTION_BEGIN = "<!-- guardclaw:guard-begin -->";
 var GUARD_SECTION_END = "<!-- guardclaw:guard-end -->";
+var CLEAN_MEMORY_MAX_CHARS = 4e3;
+var FULL_MEMORY_MAX_CHARS = 6e3;
+function truncateKeepRecent(content, maxChars) {
+  if (content.length <= maxChars) return content;
+  const lines = content.split("\n");
+  const headerLines = lines.slice(0, 3);
+  const bodyLines = lines.slice(3);
+  const headerSize = headerLines.join("\n").length + 1;
+  const budget = maxChars - headerSize;
+  const kept = [];
+  let size = 0;
+  for (let i = bodyLines.length - 1; i >= 0; i--) {
+    const lineSize = bodyLines[i].length + 1;
+    if (size + lineSize > budget) break;
+    kept.unshift(bodyLines[i]);
+    size += lineSize;
+  }
+  return [...headerLines, ...kept].join("\n");
+}
 var MemoryIsolationManager = class {
   workspaceDir;
   constructor(workspaceDir = "~/.openclaw/workspace") {
@@ -606,8 +619,9 @@ var MemoryIsolationManager = class {
 ## Cloud Session Additions
 ${newLines.join("\n")}
 `;
-      await this.writeMemory(fullContent + appendBlock, false, options);
-      console.log(`[GuardClaw] Merged ${newLines.length} line(s) from clean \u2192 full`);
+      const merged = truncateKeepRecent(fullContent + appendBlock, FULL_MEMORY_MAX_CHARS);
+      await this.writeMemory(merged, false, options);
+      console.log(`[GuardClaw] Merged ${newLines.length} line(s) from clean \u2192 full (${merged.length} chars)`);
       return newLines.length;
     } catch (err) {
       console.error("[GuardClaw] Failed to merge clean into full:", err);
@@ -637,7 +651,11 @@ ${newLines.join("\n")}
       }
       const guardStripped = this.filterGuardContent(fullMemory);
       const cleanMemory = await this.redactContent(guardStripped, privacyConfig);
-      await this.writeMemory(cleanMemory, true);
+      const cappedClean = truncateKeepRecent(cleanMemory, CLEAN_MEMORY_MAX_CHARS);
+      if (cappedClean.length < cleanMemory.length) {
+        console.log(`[GuardClaw] MEMORY.md capped: ${cleanMemory.length} \u2192 ${cappedClean.length} chars`);
+      }
+      await this.writeMemory(cappedClean, true);
       const writtenClean = await this.readMemory(true);
       if (writtenClean.includes(GUARD_SECTION_BEGIN)) {
         console.warn("[GuardClaw] INTEGRITY: GUARD_SECTION_BEGIN found in MEMORY.md after sync \u2014 re-filtering");
@@ -879,10 +897,10 @@ var DualSessionManager = class _DualSessionManager {
    * - Full history: includes all messages (including guard agent interactions)
    * - Clean history: excludes guard agent interactions (for cloud models)
    */
-  async persistMessage(sessionKey, message, agentId = "main") {
-    await this.writeToHistory(sessionKey, message, agentId, "full");
+  async persistMessage(sessionKey2, message, agentId = "main") {
+    await this.writeToHistory(sessionKey2, message, agentId, "full");
     if (!this.isGuardAgentMessage(message)) {
-      await this.writeToHistory(sessionKey, message, agentId, "clean");
+      await this.writeToHistory(sessionKey2, message, agentId, "clean");
     }
   }
   /**
@@ -892,15 +910,15 @@ var DualSessionManager = class _DualSessionManager {
    * pattern of mergeCleanIntoFull.
    */
   seededSessions = /* @__PURE__ */ new Set();
-  async ensureFullTrackSeeded(sessionKey, agentId) {
-    const key = `${sessionKey}:${agentId}`;
+  async ensureFullTrackSeeded(sessionKey2, agentId) {
+    const key = `${sessionKey2}:${agentId}`;
     if (this.seededSessions.has(key)) return;
-    const fullPath = this.getHistoryPath(sessionKey, agentId, "full");
+    const fullPath = this.getHistoryPath(sessionKey2, agentId, "full");
     if (fs2.existsSync(fullPath)) {
       this.seededSessions.add(key);
       return;
     }
-    const cleanPath = this.getHistoryPath(sessionKey, agentId, "clean");
+    const cleanPath = this.getHistoryPath(sessionKey2, agentId, "clean");
     if (!fs2.existsSync(cleanPath)) {
       this.seededSessions.add(key);
       return;
@@ -909,9 +927,9 @@ var DualSessionManager = class _DualSessionManager {
       const dir = path2.dirname(fullPath);
       await fs2.promises.mkdir(dir, { recursive: true });
       await fs2.promises.copyFile(cleanPath, fullPath);
-      console.log(`[GuardClaw] Seeded full track from clean track for ${sessionKey}`);
+      console.log(`[GuardClaw] Seeded full track from clean track for ${sessionKey2}`);
     } catch (err) {
-      console.error(`[GuardClaw] Failed to seed full track for ${sessionKey}:`, err);
+      console.error(`[GuardClaw] Failed to seed full track for ${sessionKey2}:`, err);
     }
     this.seededSessions.add(key);
   }
@@ -920,24 +938,24 @@ var DualSessionManager = class _DualSessionManager {
    * On first write, seeds the full track with existing clean track content
    * so it contains the complete conversation history.
    */
-  async writeToFull(sessionKey, message, agentId = "main") {
-    await this.ensureFullTrackSeeded(sessionKey, agentId);
-    await this.writeToHistory(sessionKey, message, agentId, "full");
+  async writeToFull(sessionKey2, message, agentId = "main") {
+    await this.ensureFullTrackSeeded(sessionKey2, agentId);
+    await this.writeToHistory(sessionKey2, message, agentId, "full");
   }
   /**
    * Write a message to the clean history only.
    */
-  async writeToClean(sessionKey, message, agentId = "main") {
-    await this.writeToHistory(sessionKey, message, agentId, "clean");
+  async writeToClean(sessionKey2, message, agentId = "main") {
+    await this.writeToHistory(sessionKey2, message, agentId, "clean");
   }
   /**
    * Load session history based on model type
    * - Cloud models: get clean history only
    * - Local models: get full history
    */
-  async loadHistory(sessionKey, isCloudModel, agentId = "main", limit) {
+  async loadHistory(sessionKey2, isCloudModel, agentId = "main", limit) {
     const historyType = isCloudModel ? "clean" : "full";
-    return await this.readHistory(sessionKey, agentId, historyType, limit);
+    return await this.readHistory(sessionKey2, agentId, historyType, limit);
   }
   /**
    * Check if a message is from guard agent interactions
@@ -964,8 +982,8 @@ var DualSessionManager = class _DualSessionManager {
    * (e.g. from fire-and-forget calls in sync hooks).
    * Auto-trims files that exceed MAX_FILE_BYTES.
    */
-  async writeToHistory(sessionKey, message, agentId, historyType) {
-    const historyPath = this.getHistoryPath(sessionKey, agentId, historyType);
+  async writeToHistory(sessionKey2, message, agentId, historyType) {
+    const historyPath = this.getHistoryPath(sessionKey2, agentId, historyType);
     await this.withWriteLock(historyPath, async () => {
       try {
         const dir = path2.dirname(historyPath);
@@ -978,7 +996,7 @@ var DualSessionManager = class _DualSessionManager {
         await this.maybeAutoTrim(historyPath);
       } catch (err) {
         console.error(
-          `[GuardClaw] Failed to write to ${historyType} history for ${sessionKey}:`,
+          `[GuardClaw] Failed to write to ${historyType} history for ${sessionKey2}:`,
           err
         );
       }
@@ -1004,9 +1022,9 @@ var DualSessionManager = class _DualSessionManager {
   /**
    * Read messages from history file
    */
-  async readHistory(sessionKey, agentId, historyType, limit) {
+  async readHistory(sessionKey2, agentId, historyType, limit) {
     try {
-      const historyPath = this.getHistoryPath(sessionKey, agentId, historyType);
+      const historyPath = this.getHistoryPath(sessionKey2, agentId, historyType);
       if (!fs2.existsSync(historyPath)) {
         return [];
       }
@@ -1025,7 +1043,7 @@ var DualSessionManager = class _DualSessionManager {
       return messages;
     } catch (err) {
       console.error(
-        `[GuardClaw] Failed to read ${historyType} history for ${sessionKey}:`,
+        `[GuardClaw] Failed to read ${historyType} history for ${sessionKey2}:`,
         err
       );
       return [];
@@ -1034,8 +1052,8 @@ var DualSessionManager = class _DualSessionManager {
   /**
    * Get history file path
    */
-  getHistoryPath(sessionKey, agentId, historyType) {
-    const safeSessionKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, "_");
+  getHistoryPath(sessionKey2, agentId, historyType) {
+    const safeSessionKey = sessionKey2.replace(/[^a-zA-Z0-9_-]/g, "_");
     const fileName = `${safeSessionKey}.jsonl`;
     return path2.join(
       this.baseDir,
@@ -1049,17 +1067,17 @@ var DualSessionManager = class _DualSessionManager {
   /**
    * Clear history for a session
    */
-  async clearHistory(sessionKey, agentId = "main", historyType) {
+  async clearHistory(sessionKey2, agentId = "main", historyType) {
     const types = historyType ? [historyType] : ["full", "clean"];
     for (const type of types) {
       try {
-        const historyPath = this.getHistoryPath(sessionKey, agentId, type);
+        const historyPath = this.getHistoryPath(sessionKey2, agentId, type);
         if (fs2.existsSync(historyPath)) {
           await fs2.promises.unlink(historyPath);
         }
       } catch (err) {
         console.error(
-          `[GuardClaw] Failed to clear ${type} history for ${sessionKey}:`,
+          `[GuardClaw] Failed to clear ${type} history for ${sessionKey2}:`,
           err
         );
       }
@@ -1071,9 +1089,9 @@ var DualSessionManager = class _DualSessionManager {
    * stripped from the sanitized transcript — exactly the context a local
    * model needs to reconstruct the full conversation.
    */
-  async loadHistoryDelta(sessionKey, agentId = "main", limit) {
-    const full = await this.readHistory(sessionKey, agentId, "full");
-    const clean = await this.readHistory(sessionKey, agentId, "clean");
+  async loadHistoryDelta(sessionKey2, agentId = "main", limit) {
+    const full = await this.readHistory(sessionKey2, agentId, "full");
+    const clean = await this.readHistory(sessionKey2, agentId, "clean");
     if (full.length === 0) return [];
     if (clean.length === 0) return limit ? full.slice(-limit) : full;
     const cleanSet = new Set(
@@ -1107,9 +1125,9 @@ var DualSessionManager = class _DualSessionManager {
   /**
    * Get history statistics
    */
-  async getHistoryStats(sessionKey, agentId = "main") {
-    const full = await this.readHistory(sessionKey, agentId, "full");
-    const clean = await this.readHistory(sessionKey, agentId, "clean");
+  async getHistoryStats(sessionKey2, agentId = "main") {
+    const full = await this.readHistory(sessionKey2, agentId, "full");
+    const clean = await this.readHistory(sessionKey2, agentId, "clean");
     return {
       fullCount: full.length,
       cleanCount: clean.length,
@@ -1628,6 +1646,8 @@ function isOllamaTarget(target) {
   const api = (target.api ?? "").toLowerCase();
   const provider = target.provider.toLowerCase();
   const url = target.baseUrl.toLowerCase();
+  const OPENAI_COMPAT_APIS = ["openai-completions", "openai-chat", "openai"];
+  if (OPENAI_COMPAT_APIS.includes(api)) return false;
   if (OLLAMA_APIS.includes(api)) return true;
   if (provider.includes("ollama")) return true;
   if (OLLAMA_URL_MARKERS.some((p) => url.includes(p))) return true;
@@ -1720,10 +1740,11 @@ function buildUpstreamUrl(targetBaseUrl, reqUrl, target) {
     return `${baseUrl}${rawPath}`;
   }
   if (target && isOllamaTarget(target)) {
+    const ollamaBase = baseUrl.replace(/\/v1$/, "");
     if (rawPath.includes("/chat/completions") || rawPath.includes("/chat")) {
-      return `${baseUrl}/api/chat`;
+      return `${ollamaBase}/api/chat`;
     }
-    return `${baseUrl}/api${rawPath.replace(/^\/v1/, "")}`;
+    return `${ollamaBase}/api${rawPath.replace(/^\/v1/, "")}`;
   }
   const forwardPath = rawPath.replace(/^\/v1/, "");
   if (target && isGoogleTarget(target) && !baseUrl.includes("/openai")) {
@@ -2059,9 +2080,9 @@ async function startPrivacyProxy(port, logger) {
           }
         }
       }
-      const sessionKey = req.headers["x-guardclaw-session"];
+      const sessionKey2 = req.headers["x-guardclaw-session"];
       const requestModel = parsed.model;
-      const target = resolveTarget(sessionKey, requestModel);
+      const target = resolveTarget(sessionKey2, requestModel);
       if (!target) {
         log.error("[GuardClaw Proxy] No original provider target found");
         res.writeHead(502, { "Content-Type": "application/json" });
@@ -2552,35 +2573,35 @@ async function readKeychainSecret(service, account) {
 function isValidLabel(s) {
   return typeof s === "string" && s.length > 0 && s.length <= 255 && /^[\x20-\x7E]+$/.test(s);
 }
-function trackSecret(sessionKey, value) {
+function trackSecret(sessionKey2, value) {
   if (!value || value.length < MIN_SECRET_LENGTH) return;
-  let set = trackedSecrets.get(sessionKey);
+  let set = trackedSecrets.get(sessionKey2);
   if (!set) {
     set = /* @__PURE__ */ new Set();
-    trackedSecrets.set(sessionKey, set);
+    trackedSecrets.set(sessionKey2, set);
   }
   if (set.size < MAX_TRACKED_PER_SESSION) {
     set.add(value);
   }
 }
-function markKeychainFetchPending(sessionKey) {
-  pendingKeychainFetch.add(sessionKey);
+function markKeychainFetchPending(sessionKey2) {
+  pendingKeychainFetch.add(sessionKey2);
 }
-function consumeKeychainFetchPending(sessionKey) {
-  const had = pendingKeychainFetch.has(sessionKey);
-  pendingKeychainFetch.delete(sessionKey);
+function consumeKeychainFetchPending(sessionKey2) {
+  const had = pendingKeychainFetch.has(sessionKey2);
+  pendingKeychainFetch.delete(sessionKey2);
   return had;
 }
-function containsTrackedSecret(sessionKey, text) {
-  const set = trackedSecrets.get(sessionKey);
+function containsTrackedSecret(sessionKey2, text) {
+  const set = trackedSecrets.get(sessionKey2);
   if (!set) return false;
   for (const secret of set) {
     if (text.includes(secret)) return true;
   }
   return false;
 }
-function redactTrackedSecrets(sessionKey, text) {
-  const set = trackedSecrets.get(sessionKey);
+function redactTrackedSecrets(sessionKey2, text) {
+  const set = trackedSecrets.get(sessionKey2);
   if (!set || set.size === 0) return text;
   let result = text;
   for (const secret of set) {
@@ -2588,9 +2609,9 @@ function redactTrackedSecrets(sessionKey, text) {
   }
   return result;
 }
-function clearSessionSecrets(sessionKey) {
-  trackedSecrets.delete(sessionKey);
-  pendingKeychainFetch.delete(sessionKey);
+function clearSessionSecrets(sessionKey2) {
+  trackedSecrets.delete(sessionKey2);
+  pendingKeychainFetch.delete(sessionKey2);
 }
 var NETWORK_TOOL_EXACT = /* @__PURE__ */ new Set([
   "web_fetch",
@@ -2853,19 +2874,19 @@ function categoriseTool(toolName) {
   if (/api|call|invoke|rpc/.test(t)) return "api_call";
   return "other";
 }
-function agentFromSession(sessionKey) {
-  const parts = sessionKey.split(":");
+function agentFromSession(sessionKey2) {
+  const parts = sessionKey2.split(":");
   if (parts[0] === "agent" && parts.length >= 2) return parts[1];
   return parts[0] ?? "unknown";
 }
-function logToolEvent(sessionKey, toolName, params2, sensitivity) {
+function logToolEvent(sessionKey2, toolName, params2, sensitivity) {
   try {
-    const seq = (_seqCounters.get(sessionKey) ?? 0) + 1;
-    _seqCounters.set(sessionKey, seq);
+    const seq = (_seqCounters.get(sessionKey2) ?? 0) + 1;
+    _seqCounters.set(sessionKey2, seq);
     const event = {
       ts: (/* @__PURE__ */ new Date()).toISOString(),
-      session: sessionKey,
-      agent: agentFromSession(sessionKey),
+      session: sessionKey2,
+      agent: agentFromSession(sessionKey2),
       seq,
       tool: toolName,
       category: categoriseTool(toolName),
@@ -2873,20 +2894,20 @@ function logToolEvent(sessionKey, toolName, params2, sensitivity) {
       paramsHash: fnv32a(JSON.stringify(params2)),
       secretOpMs: null
     };
-    const pending = _pendingEvents.get(sessionKey) ?? [];
+    const pending = _pendingEvents.get(sessionKey2) ?? [];
     pending.push(event);
-    _pendingEvents.set(sessionKey, pending);
+    _pendingEvents.set(sessionKey2, pending);
     appendFile(LOG_PATH, JSON.stringify(event) + "\n", { encoding: "utf-8", mode: 384 }).catch(() => {
     });
   } catch {
   }
 }
-function clearBehavioralSession(sessionKey) {
-  _seqCounters.delete(sessionKey);
-  _pendingEvents.delete(sessionKey);
+function clearBehavioralSession(sessionKey2) {
+  _seqCounters.delete(sessionKey2);
+  _pendingEvents.delete(sessionKey2);
 }
-function getRecentEvents(sessionKey, limit = 10) {
-  const pending = _pendingEvents.get(sessionKey) ?? [];
+function getRecentEvents(sessionKey2, limit = 10) {
+  const pending = _pendingEvents.get(sessionKey2) ?? [];
   return pending.slice(-limit);
 }
 
@@ -3005,12 +3026,12 @@ async function resolveSecret(entry) {
   }
   return { error: "Unknown secret source type" };
 }
-async function verifyIntent(secretName, entry, operation, opParams, sessionKey, privacyConfig) {
+async function verifyIntent(secretName, entry, operation, opParams, sessionKey2, privacyConfig) {
   const localModelCfg = privacyConfig.localModel;
   if (!localModelCfg?.enabled || !localModelCfg.endpoint || !localModelCfg.model) {
     return { decision: "DENY", reason: "No local model configured for intent verification" };
   }
-  const recentEvents = getRecentEvents(sessionKey, 10);
+  const recentEvents = getRecentEvents(sessionKey2, 10);
   const eventSummary = recentEvents.length === 0 ? "(no prior tool calls in this session)" : recentEvents.map(
     (e, i) => `${i + 1}. [${e.category}] ${e.tool}${e.sensitivity ? ` (${e.sensitivity})` : ""}`
   ).join("\n");
@@ -3152,7 +3173,7 @@ async function opInjectEnvVars(secretValue, entry, params2) {
     throw new Error(`Command failed (exit ${e.code ?? "?"}): ${msg}`);
   }
 }
-async function handleUseSecret(rawParams, sessionKey, privacyConfig, webhooks, logger) {
+async function handleUseSecret(rawParams, sessionKey2, privacyConfig, webhooks, logger) {
   const name = String(rawParams.name ?? "").trim();
   const operation = String(rawParams.operation ?? "describe");
   const opParams = rawParams.params ?? {};
@@ -3173,7 +3194,7 @@ async function handleUseSecret(rawParams, sessionKey, privacyConfig, webhooks, l
   }
   const baConfig = privacyConfig.behavioralAttestation;
   const windowSize = baConfig?.windowSize ?? 10;
-  const recentEvents = getRecentEvents(sessionKey, windowSize);
+  const recentEvents = getRecentEvents(sessionKey2, windowSize);
   const { score: suspicionScore, signals } = score(recentEvents);
   logger.info(
     `[GuardClaw:secrets] use_secret "${name}":${operation} \u2014 behavioral score=${suspicionScore.toFixed(2)} signals=[${signals.join("; ")}]`
@@ -3181,7 +3202,7 @@ async function handleUseSecret(rawParams, sessionKey, privacyConfig, webhooks, l
   if (suspicionScore >= AUTO_DENY_SCORE) {
     const reason = `Behavioral attestation auto-denied: score=${suspicionScore.toFixed(2)} (${signals.join("; ")})`;
     logger.warn(`[GuardClaw:secrets] DENIED ${name}:${operation} \u2014 ${reason}`);
-    _notify("secret_denied", { name, operation, sessionKey, reason, score: suspicionScore }, webhooks);
+    _notify("secret_denied", { name, operation, sessionKey: sessionKey2, reason, score: suspicionScore }, webhooks);
     return { ok: false, reason, notify: true };
   }
   if (operation !== "describe") {
@@ -3190,17 +3211,17 @@ async function handleUseSecret(rawParams, sessionKey, privacyConfig, webhooks, l
       entry,
       operation,
       opParams,
-      sessionKey,
+      sessionKey2,
       privacyConfig
     );
     if (decision === "DENY") {
       const reason = `Intent verifier denied: ${verifierReason}`;
       logger.warn(`[GuardClaw:secrets] DENIED ${name}:${operation} \u2014 ${reason}`);
-      _notify("secret_denied", { name, operation, sessionKey, reason, score: suspicionScore }, webhooks);
+      _notify("secret_denied", { name, operation, sessionKey: sessionKey2, reason, score: suspicionScore }, webhooks);
       return { ok: false, reason, notify: true };
     }
     logger.info(`[GuardClaw:secrets] ALLOWED ${name}:${operation} \u2014 ${verifierReason}`);
-    _notify("secret_allowed", { name, operation, sessionKey, reason: verifierReason, score: suspicionScore }, webhooks);
+    _notify("secret_allowed", { name, operation, sessionKey: sessionKey2, reason: verifierReason, score: suspicionScore }, webhooks);
   }
   try {
     if (operation === "describe") {
@@ -3239,17 +3260,17 @@ var EVICTION_BATCH_FRACTION = 0.25;
 var _taints = /* @__PURE__ */ new Map();
 var _sources = /* @__PURE__ */ new Map();
 var _pending = /* @__PURE__ */ new Map();
-function registerTaint(sessionKey, value, source, sensitivity, minLength = MIN_TAINT_LENGTH) {
+function registerTaint(sessionKey2, value, source, sensitivity, minLength = MIN_TAINT_LENGTH) {
   const trimmed = value.trim();
   if (!trimmed || trimmed.length < minLength) return;
-  let set = _taints.get(sessionKey);
+  let set = _taints.get(sessionKey2);
   if (!set) {
     set = /* @__PURE__ */ new Set();
-    _taints.set(sessionKey, set);
+    _taints.set(sessionKey2, set);
   }
   if (set.has(trimmed)) return;
   if (set.size >= MAX_TAINTS_PER_SESSION) {
-    const srcMap2 = _sources.get(sessionKey);
+    const srcMap2 = _sources.get(sessionKey2);
     const batchTarget = Math.max(1, Math.floor(MAX_TAINTS_PER_SESSION * EVICTION_BATCH_FRACTION));
     let evictedCount = 0;
     if (srcMap2) {
@@ -3268,33 +3289,33 @@ function registerTaint(sessionKey, value, source, sensitivity, minLength = MIN_T
     }
     if (evictedCount > 0) {
       console.warn(
-        `[GuardClaw:taint] Cap hit (session=${sessionKey}): batch-evicted ${evictedCount} oldest evictable taints (cap=${MAX_TAINTS_PER_SESSION}, remaining=${set.size})`
+        `[GuardClaw:taint] Cap hit (session=${sessionKey2}): batch-evicted ${evictedCount} oldest evictable taints (cap=${MAX_TAINTS_PER_SESSION}, remaining=${set.size})`
       );
     } else {
       console.warn(
-        `[GuardClaw:taint] Cap hit (session=${sessionKey}): all ${MAX_TAINTS_PER_SESSION} slots are secrets-mount protected \u2014 dropping new entry from source="${source}"`
+        `[GuardClaw:taint] Cap hit (session=${sessionKey2}): all ${MAX_TAINTS_PER_SESSION} slots are secrets-mount protected \u2014 dropping new entry from source="${source}"`
       );
       return;
     }
   }
   set.add(trimmed);
-  let srcMap = _sources.get(sessionKey);
+  let srcMap = _sources.get(sessionKey2);
   if (!srcMap) {
     srcMap = /* @__PURE__ */ new Map();
-    _sources.set(sessionKey, srcMap);
+    _sources.set(sessionKey2, srcMap);
   }
   srcMap.set(trimmed, `${sensitivity}:${source}`);
 }
-function markPendingTaint(sessionKey, source, sensitivity) {
-  const queue = _pending.get(sessionKey) ?? [];
+function markPendingTaint(sessionKey2, source, sensitivity) {
+  const queue = _pending.get(sessionKey2) ?? [];
   queue.push({ source, sensitivity });
-  _pending.set(sessionKey, queue);
+  _pending.set(sessionKey2, queue);
 }
-function consumePendingTaint(sessionKey) {
-  const queue = _pending.get(sessionKey);
+function consumePendingTaint(sessionKey2) {
+  const queue = _pending.get(sessionKey2);
   if (!queue || queue.length === 0) return null;
   const entry = queue.shift();
-  if (queue.length === 0) _pending.delete(sessionKey);
+  if (queue.length === 0) _pending.delete(sessionKey2);
   return entry;
 }
 function extractTaintValues(content, minLength = MIN_TAINT_LENGTH) {
@@ -3334,13 +3355,38 @@ function isSecretsMountPath(filePath) {
 function getPipelineConfig() {
   return { privacy: getLiveConfig() };
 }
+var _lastPrimaryWasCloud = null;
+function isPrimaryModelCloud(api) {
+  const defaults = api.config.agents?.defaults;
+  const primaryModel = defaults?.model?.primary ?? "";
+  const provider = primaryModel.includes("/") ? primaryModel.split("/")[0] : "";
+  if (!provider) return true;
+  const liveConfig = getLiveConfig();
+  const isCloud = !isLocalProvider(provider, liveConfig.localProviders);
+  if (isCloud && _lastPrimaryWasCloud === false) {
+    api.logger.info("[GuardClaw] Primary model switched local \u2192 cloud \u2014 scrubbing MEMORY.md");
+    const memMgr = getDefaultMemoryManager();
+    memMgr.readMemory(true).then(async (content) => {
+      if (!content.trim()) return;
+      const scrubbed = redactSensitiveInfo(content, liveConfig.redaction);
+      if (scrubbed !== content) {
+        await memMgr.writeMemory(scrubbed, true);
+        api.logger.info(`[GuardClaw] MEMORY.md scrubbed on cloud transition (${content.length} \u2192 ${scrubbed.length} chars)`);
+      }
+    }).catch((err) => {
+      api.logger.error(`[GuardClaw] Failed to scrub MEMORY.md on cloud transition: ${String(err)}`);
+    });
+  }
+  _lastPrimaryWasCloud = isCloud;
+  return isCloud;
+}
 function gcDebug(logger, msg) {
   if (getLiveConfig().debugLogging) logger.info(msg);
 }
-function shouldUseFullMemoryTrack(sessionKey) {
-  if (isActiveLocalRouting(sessionKey)) return true;
-  if (isVerifiedGuardSession(sessionKey)) return true;
-  if (isSessionMarkedPrivate(sessionKey)) {
+function shouldUseFullMemoryTrack(sessionKey2) {
+  if (isActiveLocalRouting(sessionKey2)) return true;
+  if (isVerifiedGuardSession(sessionKey2)) return true;
+  if (isSessionMarkedPrivate(sessionKey2)) {
     const policy = getLiveConfig().s2Policy ?? "proxy";
     return policy === "local";
   }
@@ -3353,13 +3399,13 @@ function isToolAllowlisted(toolName) {
 }
 var _cachedWorkspaceDir;
 var _synthesisPendingQueue = /* @__PURE__ */ new Map();
-function _popSynthesisPending(sessionKey, toolName) {
-  const queue = _synthesisPendingQueue.get(sessionKey);
+function _popSynthesisPending(sessionKey2, toolName) {
+  const queue = _synthesisPendingQueue.get(sessionKey2);
   if (!queue || queue.length === 0) return void 0;
   const idx = queue.findIndex((e) => e.toolName === toolName);
   if (idx === -1) return void 0;
   const [entry] = queue.splice(idx, 1);
-  if (queue.length === 0) _synthesisPendingQueue.delete(sessionKey);
+  if (queue.length === 0) _synthesisPendingQueue.delete(sessionKey2);
   return entry.synthetic;
 }
 var _OPENCLAW_DIR2 = join8(process.env.HOME ?? "/tmp", ".openclaw");
@@ -3368,11 +3414,11 @@ var GUARDCLAW_INJECTIONS_PATH2 = join8(_OPENCLAW_DIR2, "guardclaw-injections.jso
 var GUARDCLAW_PENDING_CONFIG_PATH = join8(_OPENCLAW_DIR2, "workspace", "dashboard", "guardclaw-pending-config.json");
 var GUARDCLAW_JSON_PATH2 = join8(_OPENCLAW_DIR2, "guardclaw.json");
 var _pendingMemoryWrites = /* @__PURE__ */ new Map();
-function trackMemoryWrite(sessionKey, p) {
-  let set = _pendingMemoryWrites.get(sessionKey);
+function trackMemoryWrite(sessionKey2, p) {
+  let set = _pendingMemoryWrites.get(sessionKey2);
   if (!set) {
     set = /* @__PURE__ */ new Set();
-    _pendingMemoryWrites.set(sessionKey, set);
+    _pendingMemoryWrites.set(sessionKey2, set);
   }
   set.add(p);
   p.finally(() => {
@@ -3380,12 +3426,12 @@ function trackMemoryWrite(sessionKey, p) {
   }).catch(() => {
   });
 }
-async function awaitPendingMemoryWrites(sessionKey, logger) {
-  const set = _pendingMemoryWrites.get(sessionKey);
+async function awaitPendingMemoryWrites(sessionKey2, logger) {
+  const set = _pendingMemoryWrites.get(sessionKey2);
   if (!set || set.size === 0) return;
-  logger.warn(`[GuardClaw] Awaiting ${set.size} pending memory write(s) before session lifecycle event (session=${sessionKey})`);
+  logger.warn(`[GuardClaw] Awaiting ${set.size} pending memory write(s) before session lifecycle event (session=${sessionKey2})`);
   await Promise.allSettled([...set]);
-  _pendingMemoryWrites.delete(sessionKey);
+  _pendingMemoryWrites.delete(sessionKey2);
 }
 async function appendInjectionLog(entry) {
   let entries = [];
@@ -3511,11 +3557,11 @@ function registerHooks(api) {
   api.on("before_model_resolve", async (event, ctx) => {
     try {
       const { prompt } = event;
-      const sessionKey = ctx.sessionKey ?? "";
-      if (!sessionKey || !prompt) return;
-      clearActiveLocalRouting(sessionKey);
-      resetTurnLevel(sessionKey);
-      consumeDetection(sessionKey);
+      const sessionKey2 = ctx.sessionKey ?? "";
+      if (!sessionKey2 || !prompt) return;
+      clearActiveLocalRouting(sessionKey2);
+      resetTurnLevel(sessionKey2);
+      consumeDetection(sessionKey2);
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
       const budgetCfg = privacyConfig.budget;
@@ -3525,7 +3571,7 @@ function registerHooks(api) {
           const msg = `Budget cap exceeded \u2014 daily: $${budgetStatus.dailyCost.toFixed(4)}${budgetCfg.dailyCap ? `/$${budgetCfg.dailyCap}` : ""}, monthly: $${budgetStatus.monthlyCost.toFixed(4)}${budgetCfg.monthlyCap ? `/$${budgetCfg.monthlyCap}` : ""}`;
           api.logger.warn(`[GuardClaw] ${msg}`);
           const hooks = privacyConfig.webhooks ?? [];
-          fireWebhooks("budget_exceeded", { sessionKey, reason: msg }, hooks);
+          fireWebhooks("budget_exceeded", { sessionKey: sessionKey2, reason: msg }, hooks);
           if (budgetStatus.action === "block") {
             throw new Error(`[GuardClaw] Request blocked: ${msg}`);
           }
@@ -3533,17 +3579,16 @@ function registerHooks(api) {
             api.logger.info("[GuardClaw] Budget exceeded \u2014 routing to local model");
             const guardCfg = getGuardAgentConfig(privacyConfig);
             const localProvider = guardCfg?.provider ?? privacyConfig.localModel?.provider ?? "ollama";
-            const localModel = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-            return { providerOverride: localProvider, modelOverride: localModel };
+            return { providerOverride: localProvider, ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {} };
           }
         } else if (budgetStatus.warning) {
           const msg = `Budget warning \u2014 daily: $${budgetStatus.dailyCost.toFixed(4)}${budgetCfg.dailyCap ? `/$${budgetCfg.dailyCap}` : ""}, monthly: $${budgetStatus.monthlyCost.toFixed(4)}${budgetCfg.monthlyCap ? `/$${budgetCfg.monthlyCap}` : ""}`;
           api.logger.warn(`[GuardClaw] ${msg}`);
           const hooks = privacyConfig.webhooks ?? [];
-          fireWebhooks("budget_warning", { sessionKey, reason: msg }, hooks);
+          fireWebhooks("budget_warning", { sessionKey: sessionKey2, reason: msg }, hooks);
         }
       }
-      if (isGuardSessionKey(sessionKey)) {
+      if (isGuardSessionKey(sessionKey2)) {
         const guardInjCfg = getLiveInjectionConfig();
         if (guardInjCfg.enabled !== false) {
           const guardMsgStr = String(prompt);
@@ -3552,9 +3597,9 @@ function registerHooks(api) {
             const guardInjResult = await detectInjection(guardContent, "user_message", guardInjCfg);
             if (guardInjResult.action === "block") {
               api.logger.warn(
-                `[GuardClaw S0] BLOCKED guard session injection: session=${sessionKey} score=${guardInjResult.score} patterns=${guardInjResult.matches.join(",")}`
+                `[GuardClaw S0] BLOCKED guard session injection: session=${sessionKey2} score=${guardInjResult.score} patterns=${guardInjResult.matches.join(",")}`
               );
-              recordDetection(sessionKey, "S0", "onUserMessage", guardInjResult.blocked_reason ?? "Prompt injection in guard session");
+              recordDetection(sessionKey2, "S0", "onUserMessage", guardInjResult.blocked_reason ?? "Prompt injection in guard session");
               throw new Error(`[GuardClaw S0] Guard session message blocked: ${guardInjResult.blocked_reason ?? "Prompt injection detected"}`);
             }
           } catch (err) {
@@ -3565,7 +3610,7 @@ function registerHooks(api) {
         }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         if (guardCfg) {
-          return { providerOverride: guardCfg.provider, modelOverride: guardCfg.modelName };
+          return { providerOverride: guardCfg.provider, ...guardCfg.modelName ? { modelOverride: guardCfg.modelName } : {} };
         }
         return;
       }
@@ -3592,19 +3637,29 @@ function registerHooks(api) {
             }
           }
         }
-        const { preRedactCredentials } = await import("./local-model-JSDO5IU4.js");
+        const { preRedactCredentials } = await import("./local-model-KE5A4PTC.js");
         const desensitized2 = redactSensitiveInfo(preRedactCredentials(msgStr), privacyConfig.redaction);
-        recordDetection(sessionKey, "S2", "onUserMessage", "s2Channels pre-classified");
+        recordDetection(sessionKey2, "S2", "onUserMessage", "s2Channels pre-classified");
         updateGuardclawStats("S2").catch(() => {
         });
-        markSessionAsPrivate(sessionKey, "S2");
-        stashDetection(sessionKey, {
+        markSessionAsPrivate(sessionKey2, "S2");
+        stashDetection(sessionKey2, {
           level: "S2",
           reason: "s2Channels pre-classified",
           desensitized: desensitized2,
           originalPrompt: msgStr,
           timestamp: Date.now()
         });
+        const s2PolicyFast = privacyConfig.s2Policy ?? "proxy";
+        if (s2PolicyFast === "local") {
+          const guardCfgFast = getGuardAgentConfig(privacyConfig);
+          const fastLocalProvider = privacyConfig.localModel?.provider ?? "ollama";
+          gcDebug(api.logger, `[GuardClaw] s2Channels fast path \u2014 s2Policy=local, routing to ${guardCfgFast?.provider ?? fastLocalProvider}/${guardCfgFast?.modelName ?? privacyConfig.localModel?.model}`);
+          return {
+            providerOverride: guardCfgFast?.provider ?? fastLocalProvider,
+            modelOverride: guardCfgFast?.modelName ?? privacyConfig.localModel?.model
+          };
+        }
         const defaults = api.config.agents?.defaults;
         const primaryModel = defaults?.model?.primary ?? "";
         const defaultProvider = defaults?.provider || primaryModel.split("/")[0] || "openai";
@@ -3612,7 +3667,7 @@ function registerHooks(api) {
         if (providerConfig) {
           const pc = providerConfig;
           const providerApi = pc.api ?? void 0;
-          stashOriginalProvider(sessionKey, {
+          stashOriginalProvider(sessionKey2, {
             baseUrl: pc.baseUrl ?? resolveDefaultBaseUrl(defaultProvider, providerApi),
             apiKey: pc.apiKey ?? "",
             provider: defaultProvider,
@@ -3635,14 +3690,14 @@ function registerHooks(api) {
         const bannedSet = new Set(injectionCfg.banned_senders ?? []);
         const isBannedSender = senderId && bannedSet.has(senderId);
         if (isBannedSender) {
-          api.logger.warn(`[GuardClaw S0] BANNED sender blocked: senderId=${senderId} session=${sessionKey}`);
-          recordDetection(sessionKey, "S0", "onUserMessage", `Banned sender: ${senderId}`);
-          fireWebhooks("ban_triggered", { sessionKey, reason: `Banned sender: ${senderId}`, details: { senderId: senderId ?? "" } }, privacyConfig.webhooks ?? []);
+          api.logger.warn(`[GuardClaw S0] BANNED sender blocked: senderId=${senderId} session=${sessionKey2}`);
+          recordDetection(sessionKey2, "S0", "onUserMessage", `Banned sender: ${senderId}`);
+          fireWebhooks("ban_triggered", { sessionKey: sessionKey2, reason: `Banned sender: ${senderId}`, details: { senderId: senderId ?? "" } }, privacyConfig.webhooks ?? []);
           throw new Error(`[GuardClaw S0] Message blocked: Sender ${senderId} is banned`);
         }
         const isExemptSender = senderId && new Set(injectionCfg.exempt_senders ?? []).has(senderId);
         if (isExemptSender) {
-          gcDebug(api.logger, `[GuardClaw S0] Exempt sender bypass \u2014 skipping injection check: senderId=${senderId} session=${sessionKey}`);
+          gcDebug(api.logger, `[GuardClaw S0] Exempt sender bypass \u2014 skipping injection check: senderId=${senderId} session=${sessionKey2}`);
         }
         if (!isExemptSender) {
           const rawExtracted = extractUserContent(msgStr);
@@ -3654,11 +3709,11 @@ function registerHooks(api) {
               const injResult = await detectInjection(userContent, "user_message", injectionCfg);
               if (injResult.action === "block") {
                 api.logger.warn(
-                  `[GuardClaw S0] BLOCKED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
+                  `[GuardClaw S0] BLOCKED session=${sessionKey2} score=${injResult.score} patterns=${injResult.matches.join(",")}`
                 );
                 await appendInjectionLog({
                   ts: (/* @__PURE__ */ new Date()).toISOString(),
-                  session: sessionKey,
+                  session: sessionKey2,
                   senderId,
                   action: "block",
                   score: injResult.score,
@@ -3691,7 +3746,7 @@ function registerHooks(api) {
                     });
                   }
                 }
-                recordDetection(sessionKey, "S0", "onUserMessage", injResult.blocked_reason ?? "Prompt injection detected");
+                recordDetection(sessionKey2, "S0", "onUserMessage", injResult.blocked_reason ?? "Prompt injection detected");
                 const alertChannel = injectionCfg.alert_channel ?? SECURITY_CHANNEL;
                 const alertMsg = formatBlockAlert(injResult, "user_message", msgStr);
                 void api.discord?.sendMessage?.(alertChannel, alertMsg)?.catch?.(() => {
@@ -3701,11 +3756,11 @@ function registerHooks(api) {
                 );
               } else if (injResult.action === "sanitise" && injResult.sanitised) {
                 api.logger.warn(
-                  `[GuardClaw S0] SANITISED session=${sessionKey} score=${injResult.score} patterns=${injResult.matches.join(",")}`
+                  `[GuardClaw S0] SANITISED session=${sessionKey2} score=${injResult.score} patterns=${injResult.matches.join(",")}`
                 );
                 await appendInjectionLog({
                   ts: (/* @__PURE__ */ new Date()).toISOString(),
-                  session: sessionKey,
+                  session: sessionKey2,
                   action: "sanitise",
                   score: injResult.score,
                   patterns: injResult.matches,
@@ -3714,16 +3769,16 @@ function registerHooks(api) {
                   preview: redactSensitiveInfo(msgStr.slice(0, 80), getLiveConfig().redaction)
                 });
                 void updateS0Stats("sanitise");
-                recordDetection(sessionKey, "S0", "onUserMessage", `Injection sanitised (score ${Math.round(injResult.score)})`);
+                recordDetection(sessionKey2, "S0", "onUserMessage", `Injection sanitised (score ${Math.round(injResult.score)})`);
                 const sanitiseRecheck = detectByRules(
-                  { checkpoint: "onUserMessage", message: injResult.sanitised, sessionKey },
+                  { checkpoint: "onUserMessage", message: injResult.sanitised, sessionKey: sessionKey2 },
                   privacyConfig
                 );
                 if (sanitiseRecheck.level !== "S1") {
                   api.logger.warn(
                     `[GuardClaw S0] Sanitised content still triggers ${sanitiseRecheck.level} \u2014 escalating to block. reason=${sanitiseRecheck.reason}`
                   );
-                  recordDetection(sessionKey, "S0", "onUserMessage", `Post-sanitise escalation: ${sanitiseRecheck.reason}`);
+                  recordDetection(sessionKey2, "S0", "onUserMessage", `Post-sanitise escalation: ${sanitiseRecheck.reason}`);
                   throw new Error(`[GuardClaw S0] Message blocked after sanitise re-check: ${sanitiseRecheck.reason}`);
                 }
                 event.prompt = injResult.sanitised;
@@ -3738,18 +3793,18 @@ function registerHooks(api) {
         }
       }
       const rulePreCheck = detectByRules(
-        { checkpoint: "onUserMessage", message: msgStr, sessionKey },
+        { checkpoint: "onUserMessage", message: msgStr, sessionKey: sessionKey2 },
         privacyConfig
       );
       if (rulePreCheck.level === "S3") {
-        recordDetection(sessionKey, "S3", "onUserMessage", rulePreCheck.reason);
+        recordDetection(sessionKey2, "S3", "onUserMessage", rulePreCheck.reason);
         updateGuardclawStats("S3").catch(() => {
         });
-        trackSessionLevel(sessionKey, "S3");
+        trackSessionLevel(sessionKey2, "S3");
         const s3Policy = privacyConfig.s3Policy ?? "local-only";
         if (s3Policy === "redact-and-forward") {
           api.logger.warn(`[GuardClaw] S3 redact-and-forward mode \u2014 aggressively redacting before cloud`);
-          stashDetection(sessionKey, {
+          stashDetection(sessionKey2, {
             level: "S2",
             // treat as S2 so desensitization pipeline runs
             reason: `s3-redact-forward: ${rulePreCheck.reason}`,
@@ -3765,7 +3820,7 @@ function registerHooks(api) {
             userMessage,
             taskContext,
             privacyConfig,
-            sessionKey
+            sessionKey2
           );
           const _synthLatency = Date.now() - _synthT0;
           updateSynthesisStats("user_message", _synthLatency, synthResult.ok).catch(() => {
@@ -3773,20 +3828,20 @@ function registerHooks(api) {
           if (synthResult.ok) {
             gcDebug(api.logger, `[GuardClaw] S3 synthesis complete \u2014 forwarding to cloud (${_synthLatency}ms)`);
             if (sessionMgr) {
-              sessionMgr.appendToFullHistory(sessionKey, { role: "user", content: userMessage });
-              sessionMgr.appendToCleanHistory(sessionKey, { role: "user", content: synthResult.synthetic });
+              sessionMgr.appendToFullHistory(sessionKey2, { role: "user", content: userMessage });
+              sessionMgr.appendToCleanHistory(sessionKey2, { role: "user", content: synthResult.synthetic });
             }
             params.messages = (params.messages ?? []).map(
               (m, i, arr) => i === arr.length - 1 && m.role === "user" ? { ...m, content: synthResult.synthetic } : m
             );
           } else {
             api.logger.warn(`[GuardClaw] S3 synthesis failed (${synthResult.reason}) \u2014 falling back to local-only`);
-            stashDetection(sessionKey, { level: "S3", reason: `synthesis-fallback: ${synthResult.reason}` });
+            stashDetection(sessionKey2, { level: "S3", reason: `synthesis-fallback: ${synthResult.reason}` });
           }
         }
-        setActiveLocalRouting(sessionKey);
-        registerGuardSessionParent(sessionKey);
-        stashDetection(sessionKey, {
+        setActiveLocalRouting(sessionKey2);
+        registerGuardSessionParent(sessionKey2);
+        stashDetection(sessionKey2, {
           level: "S3",
           reason: rulePreCheck.reason,
           originalPrompt: msgStr,
@@ -3795,9 +3850,8 @@ function registerHooks(api) {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-        gcDebug(api.logger, `[GuardClaw] S3 (rule fast-path) \u2014 routing to ${provider}/${model}`);
-        return { providerOverride: provider, modelOverride: model };
+        gcDebug(api.logger, `[GuardClaw] S3 (rule fast-path) \u2014 routing to ${provider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""}`);
+        return { providerOverride: provider, ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {} };
       }
       const pipeline = getGlobalPipeline();
       if (!pipeline) {
@@ -3809,20 +3863,20 @@ function registerHooks(api) {
         {
           checkpoint: "onUserMessage",
           message: prompt,
-          sessionKey,
+          sessionKey: sessionKey2,
           agentId: ctx.agentId
         },
         getPipelineConfig()
       );
-      recordDetection(sessionKey, decision.level, "onUserMessage", decision.reason);
+      recordDetection(sessionKey2, decision.level, "onUserMessage", decision.reason);
       updateGuardclawStats(decision.level).catch(() => {
       });
-      gcDebug(api.logger, `[GuardClaw] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`);
+      gcDebug(api.logger, `[GuardClaw] ROUTE: session=${sessionKey2} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`);
       if (decision.level === "S3" || decision.level === "S2") {
         const webhooks = privacyConfig.webhooks ?? [];
         if (webhooks.length > 0) {
           const event2 = decision.level === "S3" ? "s3_detected" : "s2_detected";
-          fireWebhooks(event2, { sessionKey, level: decision.level, reason: decision.reason }, webhooks);
+          fireWebhooks(event2, { sessionKey: sessionKey2, level: decision.level, reason: decision.reason }, webhooks);
         }
       }
       if (decision.level === "S1" && decision.action === "passthrough") {
@@ -3846,10 +3900,10 @@ function registerHooks(api) {
         api.logger.info(`[GuardClaw] Auto-learned S2 channel: ${channelId} (${updatedChannels.length} total)`);
       }
       if (decision.level === "S3") {
-        trackSessionLevel(sessionKey, "S3");
-        setActiveLocalRouting(sessionKey);
-        registerGuardSessionParent(sessionKey);
-        stashDetection(sessionKey, {
+        trackSessionLevel(sessionKey2, "S3");
+        setActiveLocalRouting(sessionKey2);
+        registerGuardSessionParent(sessionKey2);
+        stashDetection(sessionKey2, {
           level: "S3",
           reason: decision.reason,
           originalPrompt: msgStr,
@@ -3864,10 +3918,10 @@ function registerHooks(api) {
         }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
-        gcDebug(api.logger, `[GuardClaw] S3 \u2014 routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"} [${decision.routerId}]`);
+        gcDebug(api.logger, `[GuardClaw] S3 \u2014 routing to ${guardCfg?.provider ?? defaultProvider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""} [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
+          ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}
         };
       }
       if (decision.level === "S2") {
@@ -3876,22 +3930,22 @@ function registerHooks(api) {
         const allLocalProviders = privacyConfig.localProviders ?? [];
         if (requestedProvider && isLocalProvider(requestedProvider, allLocalProviders)) {
           gcDebug(api.logger, `[GuardClaw] S2 skip \u2014 original model "${requestedModel}" is already local, no proxy needed`);
-          recordDetection(sessionKey, "S2", "onUserMessage", `${decision.reason}; local model \u2014 proxy skipped`);
+          recordDetection(sessionKey2, "S2", "onUserMessage", `${decision.reason}; local model \u2014 proxy skipped`);
           updateGuardclawStats("S2").catch(() => {
           });
-          markSessionAsPrivate(sessionKey, "S2");
+          markSessionAsPrivate(sessionKey2, "S2");
           return;
         }
       }
       let desensitized;
       if (decision.level === "S2") {
-        const result = await desensitizeWithLocalModel(msgStr, privacyConfig, sessionKey);
+        const result = await desensitizeWithLocalModel(msgStr, privacyConfig, sessionKey2);
         if (result.failed) {
           api.logger.warn("[GuardClaw] S2 desensitization failed \u2014 escalating to S3 (local-only) to prevent PII leak");
-          trackSessionLevel(sessionKey, "S3");
-          setActiveLocalRouting(sessionKey);
-          registerGuardSessionParent(sessionKey);
-          stashDetection(sessionKey, {
+          trackSessionLevel(sessionKey2, "S3");
+          setActiveLocalRouting(sessionKey2);
+          registerGuardSessionParent(sessionKey2);
+          stashDetection(sessionKey2, {
             level: "S3",
             reason: `${decision.reason}; desensitization failed \u2014 escalated to S3`,
             originalPrompt: msgStr,
@@ -3901,12 +3955,12 @@ function registerHooks(api) {
           const fallbackProvider = privacyConfig.localModel?.provider ?? "ollama";
           return {
             providerOverride: guardCfg?.provider ?? fallbackProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
+            ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}
           };
         }
         desensitized = result.desensitized;
       }
-      stashDetection(sessionKey, {
+      stashDetection(sessionKey2, {
         level: decision.level,
         reason: decision.reason,
         desensitized,
@@ -3914,7 +3968,7 @@ function registerHooks(api) {
         timestamp: Date.now()
       });
       if (decision.level === "S2" && decision.action === "redirect" && decision.target?.provider !== "guardclaw-privacy") {
-        markSessionAsPrivate(sessionKey, decision.level);
+        markSessionAsPrivate(sessionKey2, decision.level);
         if (decision.target) {
           gcDebug(api.logger, `[GuardClaw] S2 \u2014 routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`);
           return {
@@ -3924,7 +3978,7 @@ function registerHooks(api) {
         }
       }
       if (decision.level === "S2" && decision.target?.provider === "guardclaw-privacy") {
-        markSessionAsPrivate(sessionKey, "S2");
+        markSessionAsPrivate(sessionKey2, "S2");
         const defaults = api.config.agents?.defaults;
         const primaryModel = defaults?.model?.primary ?? "";
         const defaultProvider = defaults?.provider || primaryModel.split("/")[0] || "openai";
@@ -3938,7 +3992,7 @@ function registerHooks(api) {
             provider: defaultProvider,
             api: providerApi
           };
-          stashOriginalProvider(sessionKey, stashTarget);
+          stashOriginalProvider(sessionKey2, stashTarget);
         }
         const modelInfo = decision.target.model ? ` (model=${decision.target.model})` : "";
         gcDebug(api.logger, `[GuardClaw] S2 \u2014 routing through privacy proxy${modelInfo} [${decision.routerId}]`);
@@ -3956,25 +4010,25 @@ function registerHooks(api) {
       }
       if (decision.action === "block") {
         if (decision.level === "S3") {
-          trackSessionLevel(sessionKey, "S3");
-          setActiveLocalRouting(sessionKey);
+          trackSessionLevel(sessionKey2, "S3");
+          setActiveLocalRouting(sessionKey2);
         } else {
-          markSessionAsPrivate(sessionKey, decision.level);
+          markSessionAsPrivate(sessionKey2, decision.level);
         }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         api.logger.warn(`[GuardClaw] ${decision.level} BLOCK \u2014 redirecting to edge model [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
+          ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}
         };
       }
       if (decision.action === "transform") {
         if (decision.level === "S3") {
-          trackSessionLevel(sessionKey, "S3");
-          setActiveLocalRouting(sessionKey);
-          registerGuardSessionParent(sessionKey);
-          stashDetection(sessionKey, {
+          trackSessionLevel(sessionKey2, "S3");
+          setActiveLocalRouting(sessionKey2);
+          registerGuardSessionParent(sessionKey2);
+          stashDetection(sessionKey2, {
             level: "S3",
             reason: decision.reason,
             originalPrompt: msgStr,
@@ -3985,19 +4039,19 @@ function registerHooks(api) {
           gcDebug(api.logger, `[GuardClaw] S3 TRANSFORM \u2014 routing to edge model [${decision.routerId}]`);
           return {
             providerOverride: guardCfg?.provider ?? defaultProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
+            ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}
           };
         }
         if (decision.level === "S2") {
           const transformedText = decision.transformedContent ?? desensitized ?? msgStr;
-          stashDetection(sessionKey, {
+          stashDetection(sessionKey2, {
             level: "S2",
             reason: decision.reason,
             desensitized: transformedText,
             originalPrompt: msgStr,
             timestamp: Date.now()
           });
-          markSessionAsPrivate(sessionKey, "S2");
+          markSessionAsPrivate(sessionKey2, "S2");
           const s2Policy = privacyConfig.s2Policy ?? "proxy";
           if (s2Policy === "local") {
             const guardCfg = getGuardAgentConfig(privacyConfig);
@@ -4005,7 +4059,7 @@ function registerHooks(api) {
             gcDebug(api.logger, `[GuardClaw] S2 TRANSFORM \u2014 routing to local ${guardCfg?.provider ?? defaultProvider2} [${decision.routerId}]`);
             return {
               providerOverride: guardCfg?.provider ?? defaultProvider2,
-              modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
+              ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}
             };
           }
           const defaults = api.config.agents?.defaults;
@@ -4015,7 +4069,7 @@ function registerHooks(api) {
           if (providerConfig) {
             const pc = providerConfig;
             const providerApi = pc.api ?? void 0;
-            stashOriginalProvider(sessionKey, {
+            stashOriginalProvider(sessionKey2, {
               baseUrl: pc.baseUrl ?? resolveDefaultBaseUrl(defaultProvider, providerApi),
               apiKey: pc.apiKey ?? "",
               provider: defaultProvider,
@@ -4029,14 +4083,25 @@ function registerHooks(api) {
       }
       return;
     } catch (err) {
-      api.logger.error(`[GuardClaw] Error in before_model_resolve hook: ${String(err)}`);
+      const errMsg = String(err);
+      if (errMsg.includes("[GuardClaw S0]") || errMsg.includes("[GuardClaw] Request blocked")) throw err;
+      api.logger.error(`[GuardClaw] Pipeline error \u2014 failing safe to local model: ${errMsg}`);
+      try {
+        const safeCfg = getLiveConfig();
+        const safeGuardCfg = getGuardAgentConfig(safeCfg);
+        const safeProvider = safeGuardCfg?.provider ?? safeCfg.localModel?.provider ?? "ollama";
+        const safeModel = safeGuardCfg?.modelName ?? safeCfg.localModel?.model ?? "llama3.2:3b";
+        return { providerOverride: safeProvider, modelOverride: safeModel };
+      } catch {
+        throw new Error("[GuardClaw] Pipeline error and failsafe failed \u2014 request blocked for safety");
+      }
     }
   });
   api.on("before_prompt_build", async (_event, ctx) => {
+    const sessionKey2 = ctx.sessionKey ?? "";
     try {
-      const sessionKey = ctx.sessionKey ?? "";
-      if (!sessionKey) return;
-      const pending = getPendingDetection(sessionKey);
+      if (!sessionKey2) return;
+      const pending = getPendingDetection(sessionKey2);
       if (!pending || pending.level === "S1") return;
       const privacyConfig = getLiveConfig();
       const sessionCfg = privacyConfig.session ?? {};
@@ -4044,7 +4109,7 @@ function registerHooks(api) {
       const historyLimit = sessionCfg.historyLimit ?? 20;
       if (pending.level === "S3") {
         if (shouldInject) {
-          const context = await loadDualTrackContext(sessionKey, ctx.agentId, historyLimit);
+          const context = await loadDualTrackContext(sessionKey2, ctx.agentId, historyLimit);
           if (context) {
             gcDebug(api.logger, `[GuardClaw] Injected dual-track history context for S3 turn`);
             return { prependContext: context };
@@ -4055,7 +4120,7 @@ function registerHooks(api) {
       const s2Policy = privacyConfig.s2Policy ?? "proxy";
       if (pending.level === "S2" && s2Policy === "local") {
         if (shouldInject) {
-          const context = await loadDualTrackContext(sessionKey, ctx.agentId, historyLimit);
+          const context = await loadDualTrackContext(sessionKey2, ctx.agentId, historyLimit);
           if (context) {
             gcDebug(api.logger, `[GuardClaw] Injected dual-track history context for S2-local turn`);
             return { prependContext: context };
@@ -4071,26 +4136,38 @@ ${GUARDCLAW_S2_CLOSE}`
         };
       }
     } catch (err) {
+      try {
+        const pendingOnErr = getPendingDetection(sessionKey2);
+        if (pendingOnErr?.level === "S2") {
+          const s2PolicyOnErr = getLiveConfig().s2Policy ?? "proxy";
+          if (s2PolicyOnErr === "proxy") {
+            api.logger.warn(
+              `[GuardClaw] SECURITY: before_prompt_build error during S2-proxy \u2014 markers not injected, PII may pass through proxy unstripped (session=${sessionKey2})`
+            );
+          }
+        }
+      } catch {
+      }
       api.logger.error(`[GuardClaw] Error in before_prompt_build hook: ${String(err)}`);
     }
   });
   api.on("before_tool_call", async (event, ctx) => {
     try {
       const { toolName, params: params2 } = event;
-      const sessionKey = ctx.sessionKey ?? "";
+      const sessionKey2 = ctx.sessionKey ?? "";
       if (!toolName) return;
       const typedParams = params2;
       const privacyConfig = getLiveConfig();
       const baseDir = privacyConfig.session?.baseDir ?? "~/.openclaw";
       const baConfig = privacyConfig.behavioralAttestation;
-      if (baConfig?.enabled && !isVerifiedGuardSession(sessionKey)) {
-        const currentLevel = getPendingDetection(sessionKey)?.level ?? null;
-        logToolEvent(sessionKey, toolName, typedParams, currentLevel);
+      if (baConfig?.enabled && !isVerifiedGuardSession(sessionKey2)) {
+        const currentLevel = getPendingDetection(sessionKey2)?.level ?? null;
+        logToolEvent(sessionKey2, toolName, typedParams, currentLevel);
       }
       if (toolName === "use_secret") {
         const secretResult = await handleUseSecret(
           typedParams,
-          sessionKey,
+          sessionKey2,
           privacyConfig,
           privacyConfig.webhooks,
           api.logger
@@ -4108,45 +4185,53 @@ ${GUARDCLAW_S2_CLOSE}`
 ${secretResult.result}`
         };
       }
-      if (isVerifiedGuardSession(sessionKey)) {
-        if (isNetworkTool(toolName)) {
-          api.logger.warn(
-            `[GuardClaw] BLOCKED guard session network tool: ${toolName} (session=${sessionKey})`
-          );
-          return {
-            block: true,
-            blockReason: `GuardClaw: network tools are blocked in guard sessions to prevent secret exfiltration (${toolName})`
-          };
-        }
-        const bashCmd = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
-        if (bashCmd && parseKeychainCommand(bashCmd)) {
-          markKeychainFetchPending(sessionKey);
-          gcDebug(api.logger, `[GuardClaw] Guard session keychain fetch detected \u2014 result will be tracked (session=${sessionKey})`);
-        }
-        if (isExecTool(toolName) && bashCmd) {
-          const networkTool = isGuardNetworkCommand(bashCmd);
-          if (networkTool) {
+      if (isVerifiedGuardSession(sessionKey2)) {
+        try {
+          if (isNetworkTool(toolName)) {
             api.logger.warn(
-              `[GuardClaw] BLOCKED guard session network command via bash: ${networkTool} (session=${sessionKey})`
+              `[GuardClaw] BLOCKED guard session network tool: ${toolName} (session=${sessionKey2})`
             );
             return {
               block: true,
-              blockReason: `GuardClaw: outbound network commands are blocked in guard sessions to prevent secret exfiltration (${networkTool})`
+              blockReason: `GuardClaw: network tools are blocked in guard sessions to prevent secret exfiltration (${toolName})`
             };
           }
-        }
-        const paramStr = JSON.stringify(typedParams);
-        if (containsTrackedSecret(sessionKey, paramStr)) {
-          api.logger.warn(
-            `[GuardClaw] BLOCKED guard session tool "${toolName}": params contain a tracked secret (session=${sessionKey})`
-          );
+          const bashCmd = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
+          if (bashCmd && parseKeychainCommand(bashCmd)) {
+            markKeychainFetchPending(sessionKey2);
+            gcDebug(api.logger, `[GuardClaw] Guard session keychain fetch detected \u2014 result will be tracked (session=${sessionKey2})`);
+          }
+          if (isExecTool(toolName) && bashCmd) {
+            const networkTool = isGuardNetworkCommand(bashCmd);
+            if (networkTool) {
+              api.logger.warn(
+                `[GuardClaw] BLOCKED guard session network command via bash: ${networkTool} (session=${sessionKey2})`
+              );
+              return {
+                block: true,
+                blockReason: `GuardClaw: outbound network commands are blocked in guard sessions to prevent secret exfiltration (${networkTool})`
+              };
+            }
+          }
+          const paramStr = JSON.stringify(typedParams);
+          if (containsTrackedSecret(sessionKey2, paramStr)) {
+            api.logger.warn(
+              `[GuardClaw] BLOCKED guard session tool "${toolName}": params contain a tracked secret (session=${sessionKey2})`
+            );
+            return {
+              block: true,
+              blockReason: `GuardClaw: tool parameters contain a tracked Keychain secret and cannot be called in this context (${toolName})`
+            };
+          }
+        } catch (guardErr) {
+          api.logger.error(`[GuardClaw] Guard session check error \u2014 blocking tool for safety: ${String(guardErr)} (tool=${toolName}, session=${sessionKey2})`);
           return {
             block: true,
-            blockReason: `GuardClaw: tool parameters contain a tracked Keychain secret and cannot be called in this context (${toolName})`
+            blockReason: `GuardClaw: safety check error in guard session \u2014 tool blocked for safety (${toolName})`
           };
         }
       }
-      if (!isVerifiedGuardSession(sessionKey) && !isActiveLocalRouting(sessionKey)) {
+      if (!isVerifiedGuardSession(sessionKey2) && !isActiveLocalRouting(sessionKey2)) {
         const pathValues = extractPathsFromParams(typedParams);
         for (const p of pathValues) {
           if (isProtectedMemoryPath(p, baseDir)) {
@@ -4158,7 +4243,7 @@ ${secretResult.result}`
         for (const p of pathValues) {
           if (isSecretsMountPath(p)) {
             api.logger.warn(
-              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": secrets-mount path "${p}" \u2014 would expose secrets to cloud model (session=${sessionKey})`
+              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": secrets-mount path "${p}" \u2014 would expose secrets to cloud model (session=${sessionKey2})`
             );
             return {
               block: true,
@@ -4167,7 +4252,7 @@ ${secretResult.result}`
           }
           if (s3Paths.length > 0 && matchesPathPattern(p, s3Paths)) {
             api.logger.warn(
-              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": S3 path "${p}" \u2014 would expose sensitive data to cloud model (session=${sessionKey})`
+              `[GuardClaw GCF-004] BLOCKED cloud-session tool "${toolName}": S3 path "${p}" \u2014 would expose sensitive data to cloud model (session=${sessionKey2})`
             );
             return {
               block: true,
@@ -4179,13 +4264,13 @@ ${secretResult.result}`
         if (_taintBtcCfg?.enabled !== false) {
           for (const p of pathValues) {
             if (isSecretsMountPath(p)) {
-              markPendingTaint(sessionKey, `secrets-file:${p}`, "S3");
-              gcDebug(api.logger, `[GuardClaw:taint] Secrets-mount read detected \u2014 result will be taint-tracked (path=${p}, session=${sessionKey})`);
+              markPendingTaint(sessionKey2, `secrets-file:${p}`, "S3");
+              gcDebug(api.logger, `[GuardClaw:taint] Secrets-mount read detected \u2014 result will be taint-tracked (path=${p}, session=${sessionKey2})`);
             }
           }
         }
       }
-      if (toolName === "memory_get" && shouldUseFullMemoryTrack(sessionKey)) {
+      if (toolName === "memory_get" && shouldUseFullMemoryTrack(sessionKey2)) {
         const p = String(typedParams.path ?? "");
         if (p === "MEMORY.md" || p === "memory.md") {
           return { params: { ...typedParams, path: "MEMORY-FULL.md" } };
@@ -4200,36 +4285,36 @@ ${secretResult.result}`
         const contentField = isSpawn ? String(typedParams?.task ?? "") : String(typedParams?.message ?? "");
         if (contentField.trim()) {
           const ruleResult = detectByRules(
-            { checkpoint: "onToolCallProposed", message: contentField, toolName, toolParams: typedParams, sessionKey },
+            { checkpoint: "onToolCallProposed", message: contentField, toolName, toolParams: typedParams, sessionKey: sessionKey2 },
             privacyConfig
           );
-          recordDetection(sessionKey, ruleResult.level, "onToolCallProposed", ruleResult.reason);
+          recordDetection(sessionKey2, ruleResult.level, "onToolCallProposed", ruleResult.reason);
           updateGuardclawStats(ruleResult.level).catch(() => {
           });
           if (ruleResult.level === "S3") {
-            trackSessionLevel(sessionKey, "S3");
+            trackSessionLevel(sessionKey2, "S3");
             return { block: true, blockReason: `GuardClaw: ${isSpawn ? "subagent task" : "A2A message"} blocked \u2014 S3 (${ruleResult.reason ?? "sensitive"})` };
           }
           if (ruleResult.level === "S2") {
-            markSessionAsPrivate(sessionKey, "S2");
+            markSessionAsPrivate(sessionKey2, "S2");
           }
         }
       }
-      if (isExecTool(toolName) && !isActiveLocalRouting(sessionKey) && !isVerifiedGuardSession(sessionKey)) {
+      if (isExecTool(toolName) && !isActiveLocalRouting(sessionKey2) && !isVerifiedGuardSession(sessionKey2)) {
         const command = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
         if (command) {
           const blocked = isHighRiskExecCommand(command);
           if (blocked) {
             api.logger.warn(`[GuardClaw] BLOCKED high-risk exec command: ${command.slice(0, 80)}`);
-            recordDetection(sessionKey, "S3", "onToolCallProposed", `high-risk exec: ${blocked}`);
+            recordDetection(sessionKey2, "S3", "onToolCallProposed", `high-risk exec: ${blocked}`);
             updateGuardclawStats("S3").catch(() => {
             });
-            trackSessionLevel(sessionKey, "S3");
+            trackSessionLevel(sessionKey2, "S3");
             return { block: true, blockReason: `GuardClaw: exec command blocked \u2014 likely to output secrets (${blocked}). Use a local model session for this operation.` };
           }
         }
       }
-      if (!isActiveLocalRouting(sessionKey) && !isToolAllowlisted(toolName)) {
+      if (!isActiveLocalRouting(sessionKey2) && !isToolAllowlisted(toolName)) {
         const detectors = privacyConfig.checkpoints?.onToolCallProposed ?? ["ruleDetector"];
         const usePipeline = detectors.includes("localModelDetector");
         let level = "S1";
@@ -4239,7 +4324,7 @@ ${secretResult.result}`
           if (pipeline) {
             const decision = await pipeline.run(
               "onToolCallProposed",
-              { checkpoint: "onToolCallProposed", toolName, toolParams: typedParams, sessionKey },
+              { checkpoint: "onToolCallProposed", toolName, toolParams: typedParams, sessionKey: sessionKey2 },
               getPipelineConfig()
             );
             level = decision.level;
@@ -4247,21 +4332,21 @@ ${secretResult.result}`
           }
         } else {
           const ruleResult = detectByRules(
-            { checkpoint: "onToolCallProposed", toolName, toolParams: typedParams, sessionKey },
+            { checkpoint: "onToolCallProposed", toolName, toolParams: typedParams, sessionKey: sessionKey2 },
             privacyConfig
           );
           level = ruleResult.level;
           reason = ruleResult.reason;
         }
-        recordDetection(sessionKey, level, "onToolCallProposed", reason);
+        recordDetection(sessionKey2, level, "onToolCallProposed", reason);
         updateGuardclawStats(level).catch(() => {
         });
         if (level === "S3") {
-          trackSessionLevel(sessionKey, "S3");
+          trackSessionLevel(sessionKey2, "S3");
           return { block: true, blockReason: `GuardClaw: tool "${toolName}" blocked \u2014 S3 (${reason ?? "sensitive"})` };
         }
         if (level === "S2") {
-          markSessionAsPrivate(sessionKey, "S2");
+          markSessionAsPrivate(sessionKey2, "S2");
         }
       }
     } catch (err) {
@@ -4270,20 +4355,20 @@ ${secretResult.result}`
   });
   api.on("after_tool_call", async (event, ctx) => {
     try {
-      const sessionKey = ctx.sessionKey ?? "";
-      if (!sessionKey) return;
+      const sessionKey2 = ctx.sessionKey ?? "";
+      if (!sessionKey2) return;
       const privacyConfig = getLiveConfig();
       if ((privacyConfig.s3Policy ?? "local-only") !== "synthesize") return;
       if (!privacyConfig.localModel?.enabled) return;
-      if (isActiveLocalRouting(sessionKey)) return;
-      if (isVerifiedGuardSession(sessionKey)) return;
+      if (isActiveLocalRouting(sessionKey2)) return;
+      if (isVerifiedGuardSession(sessionKey2)) return;
       if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
       const ev = event;
       const raw = ev.output ?? ev.result ?? ev.text ?? ev.content ?? "";
       const textContent = typeof raw === "string" ? raw : JSON.stringify(raw);
       if (!textContent || textContent.length < 10) return;
       const ruleCheck = detectByRules(
-        { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: textContent, sessionKey },
+        { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: textContent, sessionKey: sessionKey2 },
         privacyConfig
       );
       if (ruleCheck.level !== "S3") return;
@@ -4295,15 +4380,15 @@ ${secretResult.result}`
         textContent,
         taskContext,
         privacyConfig,
-        sessionKey
+        sessionKey2
       );
       const _synthLatency = Date.now() - _synthT0;
       updateSynthesisStats("tool_result", _synthLatency, synthResult.ok).catch(() => {
       });
       if (synthResult.ok) {
-        const queue = _synthesisPendingQueue.get(sessionKey) ?? [];
+        const queue = _synthesisPendingQueue.get(sessionKey2) ?? [];
         queue.push({ toolName: ctx.toolName ?? "", synthetic: synthResult.synthetic });
-        _synthesisPendingQueue.set(sessionKey, queue);
+        _synthesisPendingQueue.set(sessionKey2, queue);
         gcDebug(api.logger, `[GuardClaw] Synthesis stashed for tool_result_persist \u2014 ${_synthLatency}ms (tool=${ctx.toolName ?? "unknown"})`);
       } else {
         api.logger.warn(`[GuardClaw] Tool result synthesis failed after ${_synthLatency}ms (${synthResult.reason}) \u2014 tool_result_persist will redact normally`);
@@ -4314,10 +4399,10 @@ ${secretResult.result}`
   });
   api.on("after_tool_call", async (event, ctx) => {
     try {
-      const sessionKey = ctx.sessionKey ?? "";
-      if (!sessionKey) return;
-      if (isActiveLocalRouting(sessionKey)) return;
-      if (isVerifiedGuardSession(sessionKey)) return;
+      const sessionKey2 = ctx.sessionKey ?? "";
+      if (!sessionKey2) return;
+      if (isActiveLocalRouting(sessionKey2)) return;
+      if (isVerifiedGuardSession(sessionKey2)) return;
       if (ctx.toolName && isToolAllowlisted(ctx.toolName)) return;
       const injectionCfg = getLiveInjectionConfig();
       if (injectionCfg.enabled === false) return;
@@ -4332,7 +4417,7 @@ ${secretResult.result}`
       const injResult = await detectInjection(textContent, source, injectionCfg);
       if (injResult.action === "block" || injResult.action === "sanitise") {
         api.logger.warn(
-          `[GuardClaw S0] DeBERTa audit: tool result injection confirmed: tool=${toolName} score=${injResult.score} patterns=${injResult.matches.join(",")} session=${sessionKey}`
+          `[GuardClaw S0] DeBERTa audit: tool result injection confirmed: tool=${toolName} score=${injResult.score} patterns=${injResult.matches.join(",")} session=${sessionKey2}`
         );
       }
     } catch (err) {
@@ -4340,76 +4425,69 @@ ${secretResult.result}`
     }
   });
   api.on("tool_result_persist", (event, ctx) => {
+    const sessionKey2 = ctx.sessionKey ?? "";
+    const msg = event.message;
     try {
-      const sessionKey = ctx.sessionKey ?? "";
-      if (!sessionKey) return;
-      const msg = event.message;
+      if (!sessionKey2) return;
       if (!msg) return;
       if (ctx.toolName === "write" || ctx.toolName === "write_file") {
         const writePath = String(event.params?.path ?? "");
         if (writePath && isMemoryWritePath(writePath)) {
           const workspaceDir = _cachedWorkspaceDir ?? process.cwd();
           const privacyConfig2 = getLiveConfig();
-          const writePromise = syncMemoryWrite(writePath, workspaceDir, privacyConfig2, api.logger, isVerifiedGuardSession(sessionKey)).catch((err) => {
+          const writePromise = syncMemoryWrite(writePath, workspaceDir, privacyConfig2, api.logger, isVerifiedGuardSession(sessionKey2)).catch((err) => {
             api.logger.warn(`[GuardClaw] Memory dual-write sync failed: ${String(err)}`);
           });
-          trackMemoryWrite(sessionKey, writePromise);
+          trackMemoryWrite(sessionKey2, writePromise);
         }
       }
       if (ctx.toolName === "memory_search") {
-        const filtered = filterMemorySearchResults(msg, shouldUseFullMemoryTrack(sessionKey));
+        const filtered = filterMemorySearchResults(msg, shouldUseFullMemoryTrack(sessionKey2));
         if (filtered) return { message: filtered };
         return;
       }
-      if (isActiveLocalRouting(sessionKey)) {
+      if (isActiveLocalRouting(sessionKey2)) {
         const textContent2 = extractMessageText(msg);
         if (textContent2 && textContent2.length >= 10) {
           const sessionManager = getDefaultSessionManager();
-          sessionManager.writeToFull(sessionKey, {
-            role: "tool",
-            content: textContent2,
-            timestamp: Date.now(),
-            sessionKey
-          }).catch(() => {
-          });
           const redacted2 = redactForCleanTranscript(textContent2, getLiveConfig().redaction);
           if (redacted2 !== textContent2) {
             gcDebug(api.logger, `[GuardClaw] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`);
-            sessionManager.writeToClean(sessionKey, {
+            sessionManager.writeToClean(sessionKey2, {
               role: "tool",
               content: redacted2,
               timestamp: Date.now(),
-              sessionKey
+              sessionKey: sessionKey2
             }).catch(() => {
             });
             const modified = replaceMessageText(msg, redacted2);
             if (modified) return { message: modified };
           } else {
-            sessionManager.writeToClean(sessionKey, {
+            sessionManager.writeToClean(sessionKey2, {
               role: "tool",
               content: textContent2,
               timestamp: Date.now(),
-              sessionKey
+              sessionKey: sessionKey2
             }).catch(() => {
             });
           }
         }
         return;
       }
-      if (isVerifiedGuardSession(sessionKey)) {
+      if (isVerifiedGuardSession(sessionKey2)) {
         const resultText = extractMessageText(msg);
         if (resultText) {
-          if (consumeKeychainFetchPending(sessionKey)) {
+          if (consumeKeychainFetchPending(sessionKey2)) {
             const secretValue = resultText.trim();
-            trackSecret(sessionKey, secretValue);
-            gcDebug(api.logger, `[GuardClaw] Guard session Keychain secret tracked (session=${sessionKey})`);
-            const redactedResult = redactTrackedSecrets(sessionKey, resultText);
+            trackSecret(sessionKey2, secretValue);
+            gcDebug(api.logger, `[GuardClaw] Guard session Keychain secret tracked (session=${sessionKey2})`);
+            const redactedResult = redactTrackedSecrets(sessionKey2, resultText);
             if (redactedResult !== resultText) {
               const modified = replaceMessageText(msg, redactedResult);
               if (modified) return { message: modified };
             }
           } else {
-            const redactedResult = redactTrackedSecrets(sessionKey, resultText);
+            const redactedResult = redactTrackedSecrets(sessionKey2, resultText);
             if (redactedResult !== resultText) {
               const modified = replaceMessageText(msg, redactedResult);
               if (modified) return { message: modified };
@@ -4422,39 +4500,32 @@ ${secretResult.result}`
       const textContent = extractMessageText(msg);
       if (!textContent || textContent.length < 10) return;
       if (textContent.length < 200 && isToolNoise(textContent, ctx.toolName)) {
-        if (isSessionMarkedPrivate(sessionKey)) {
+        if (isSessionMarkedPrivate(sessionKey2)) {
           const sessionManager = getDefaultSessionManager();
-          sessionManager.writeToFull(sessionKey, {
+          sessionManager.writeToClean(sessionKey2, {
             role: "tool",
             content: textContent,
             timestamp: Date.now(),
-            sessionKey
-          }).catch(() => {
-          });
-          sessionManager.writeToClean(sessionKey, {
-            role: "tool",
-            content: textContent,
-            timestamp: Date.now(),
-            sessionKey
+            sessionKey: sessionKey2
           }).catch(() => {
           });
         }
         return;
       }
       {
-        const rollingBuf = appendToRollingBuffer(sessionKey, textContent);
+        const rollingBuf = appendToRollingBuffer(sessionKey2, textContent);
         if (rollingBuf.length >= 10) {
           const rollingPrivCfg = getLiveConfig();
           const rollingCheck = detectByRules(
-            { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: rollingBuf, sessionKey },
+            { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: rollingBuf, sessionKey: sessionKey2 },
             rollingPrivCfg
           );
           if (rollingCheck.level === "S2" || rollingCheck.level === "S3") {
             api.logger.warn(
-              `[GuardClaw:rolling] Cross-turn sensitive content detected level=${rollingCheck.level} session=${sessionKey} reason=${rollingCheck.reason ?? ""}`
+              `[GuardClaw:rolling] Cross-turn sensitive content detected level=${rollingCheck.level} session=${sessionKey2} reason=${rollingCheck.reason ?? ""}`
             );
-            markSessionAsPrivate(sessionKey, rollingCheck.level);
-            recordDetection(sessionKey, rollingCheck.level, "onToolCallExecuted", `[rolling-buffer] ${rollingCheck.reason ?? ""}`);
+            markSessionAsPrivate(sessionKey2, rollingCheck.level);
+            recordDetection(sessionKey2, rollingCheck.level, "onToolCallExecuted", `[rolling-buffer] ${rollingCheck.reason ?? ""}`);
           }
         }
       }
@@ -4473,7 +4544,7 @@ ${secretResult.result}`
             const injReason = `Injection detected (heuristics score ${heuristic.score}): ${heuristic.matches.join(", ")}`;
             void appendInjectionLog({
               ts: (/* @__PURE__ */ new Date()).toISOString(),
-              session: sessionKey,
+              session: sessionKey2,
               action: injAction,
               score: heuristic.score,
               patterns: heuristic.matches,
@@ -4481,10 +4552,10 @@ ${secretResult.result}`
               preview: redactSensitiveInfo(textContent.slice(0, 80), getLiveConfig().redaction)
             });
             void updateS0Stats(injAction);
-            recordDetection(sessionKey, "S0", "onToolCallExecuted", injReason);
+            recordDetection(sessionKey2, "S0", "onToolCallExecuted", injReason);
             if (injAction === "block") {
               api.logger.warn(
-                `[GuardClaw S0] Tool result blocked (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey}`
+                `[GuardClaw S0] Tool result blocked (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey2}`
               );
               const blocked = replaceMessageText(
                 msg,
@@ -4494,7 +4565,7 @@ ${secretResult.result}`
             } else {
               gcDebug(
                 api.logger,
-                `[GuardClaw S0] Tool result sanitised (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey}`
+                `[GuardClaw S0] Tool result sanitised (injection heuristics): tool=${toolNameTrp} score=${heuristic.score} session=${sessionKey2}`
               );
               const sanitisedText = sanitiseContent(textContent, heuristic.matchedPatterns);
               const sanitised = replaceMessageText(msg, sanitisedText);
@@ -4504,21 +4575,21 @@ ${secretResult.result}`
         }
       }
       const privacyConfig = getLiveConfig();
-      const wasPrivateBefore = isSessionMarkedPrivate(sessionKey);
+      const wasPrivateBefore = isSessionMarkedPrivate(sessionKey2);
       const _taintCfg = privacyConfig.taintTracking;
       const taintEnabled = _taintCfg?.enabled !== false;
       const taintMinLen = _taintCfg?.minValueLength ?? 8;
       if (taintEnabled) {
-        const pendingTaint = consumePendingTaint(sessionKey);
+        const pendingTaint = consumePendingTaint(sessionKey2);
         if (pendingTaint) {
           const taintVals = extractTaintValues(textContent, taintMinLen);
           for (const v of taintVals) {
-            registerTaint(sessionKey, v, pendingTaint.source, pendingTaint.sensitivity, taintMinLen);
+            registerTaint(sessionKey2, v, pendingTaint.source, pendingTaint.sensitivity, taintMinLen);
           }
           if (taintVals.length > 0) {
             gcDebug(
               api.logger,
-              `[GuardClaw:taint] Registered ${taintVals.length} tainted value(s) from ${pendingTaint.source} (session=${sessionKey})`
+              `[GuardClaw:taint] Registered ${taintVals.length} tainted value(s) from ${pendingTaint.source} (session=${sessionKey2})`
             );
           }
         }
@@ -4528,16 +4599,16 @@ ${secretResult.result}`
           checkpoint: "onToolCallExecuted",
           toolName: ctx.toolName,
           toolResult: textContent,
-          sessionKey
+          sessionKey: sessionKey2
         },
         privacyConfig
       );
       const detectedSensitive = ruleCheck.level === "S3" || ruleCheck.level === "S2";
       const effectiveLevel = ruleCheck.level === "S3" ? "S2" : ruleCheck.level;
       if (detectedSensitive) {
-        trackSessionLevel(sessionKey, ruleCheck.level);
-        markSessionAsPrivate(sessionKey, effectiveLevel);
-        recordDetection(sessionKey, ruleCheck.level, "onToolCallExecuted", ruleCheck.reason);
+        trackSessionLevel(sessionKey2, ruleCheck.level);
+        markSessionAsPrivate(sessionKey2, effectiveLevel);
+        recordDetection(sessionKey2, ruleCheck.level, "onToolCallExecuted", ruleCheck.reason);
         updateGuardclawStats(ruleCheck.level).catch(() => {
         });
         if (ruleCheck.level === "S3") {
@@ -4551,22 +4622,20 @@ ${secretResult.result}`
         const taintSource = `${ruleCheck.level.toLowerCase()}-tool-result:${ctx.toolName ?? "unknown"}`;
         const taintSens = ruleCheck.level === "S3" ? "S3" : "S2";
         for (const v of taintValsFromResult) {
-          registerTaint(sessionKey, v, taintSource, taintSens, taintMinLen);
+          registerTaint(sessionKey2, v, taintSource, taintSens, taintMinLen);
         }
         if (taintValsFromResult.length > 0) {
           gcDebug(
             api.logger,
-            `[GuardClaw:taint] Registered ${taintValsFromResult.length} tainted value(s) from ${ruleCheck.level} tool result (tool=${ctx.toolName ?? "unknown"}, session=${sessionKey})`
+            `[GuardClaw:taint] Registered ${taintValsFromResult.length} tainted value(s) from ${ruleCheck.level} tool result (tool=${ctx.toolName ?? "unknown"}, session=${sessionKey2})`
           );
         }
       }
       if (ruleCheck.level === "S3" && (privacyConfig.s3Policy ?? "local-only") === "synthesize") {
-        const synthetic = _popSynthesisPending(sessionKey, ctx.toolName ?? "");
+        const synthetic = _popSynthesisPending(sessionKey2, ctx.toolName ?? "");
         if (synthetic) {
           const sessionManager = getDefaultSessionManager();
-          sessionManager.writeToFull(sessionKey, { role: "tool", content: textContent, timestamp: Date.now(), sessionKey }).catch(() => {
-          });
-          sessionManager.writeToClean(sessionKey, { role: "tool", content: synthetic, timestamp: Date.now(), sessionKey }).catch(() => {
+          sessionManager.writeToClean(sessionKey2, { role: "tool", content: synthetic, timestamp: Date.now(), sessionKey: sessionKey2 }).catch(() => {
           });
           gcDebug(api.logger, `[GuardClaw] S3 tool result replaced with synthesis (tool=${ctx.toolName ?? "unknown"})`);
           const modified = replaceMessageText(msg, synthetic);
@@ -4577,23 +4646,16 @@ ${secretResult.result}`
       const wasRedacted = redacted !== textContent;
       if (detectedSensitive || wasRedacted || wasPrivateBefore) {
         const sessionManager = getDefaultSessionManager();
-        sessionManager.writeToFull(sessionKey, {
-          role: "tool",
-          content: textContent,
-          timestamp: Date.now(),
-          sessionKey
-        }).catch(() => {
-        });
-        sessionManager.writeToClean(sessionKey, {
+        sessionManager.writeToClean(sessionKey2, {
           role: "tool",
           content: wasRedacted ? redacted : textContent,
           timestamp: Date.now(),
-          sessionKey
+          sessionKey: sessionKey2
         }).catch(() => {
         });
       }
       if (wasRedacted) {
-        if (!detectedSensitive) markSessionAsPrivate(sessionKey, "S2");
+        if (!detectedSensitive) markSessionAsPrivate(sessionKey2, "S2");
         gcDebug(api.logger, `[GuardClaw] PII-redacted tool result for transcript (tool=${ctx.toolName ?? "unknown"})`);
         const modified = replaceMessageText(msg, redacted);
         if (modified) return { message: modified };
@@ -4601,16 +4663,16 @@ ${secretResult.result}`
       const skipSyncLlm = wasPrivateBefore || detectedSensitive;
       if (privacyConfig.localModel?.enabled && ruleCheck.level !== "S3" && !skipSyncLlm) {
         const llmResult = syncDetectByLocalModel(
-          { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: textContent, sessionKey },
+          { checkpoint: "onToolCallExecuted", toolName: ctx.toolName, toolResult: textContent, sessionKey: sessionKey2 },
           privacyConfig
         );
         if (llmResult.level !== "S1" && llmResult.levelNumeric > ruleCheck.levelNumeric) {
           const llmEffective = llmResult.level === "S3" ? "S2" : llmResult.level;
-          trackSessionLevel(sessionKey, llmResult.level);
+          trackSessionLevel(sessionKey2, llmResult.level);
           if (!detectedSensitive) {
-            markSessionAsPrivate(sessionKey, llmEffective);
+            markSessionAsPrivate(sessionKey2, llmEffective);
           }
-          recordDetection(sessionKey, llmResult.level, "onToolCallExecuted", llmResult.reason);
+          recordDetection(sessionKey2, llmResult.level, "onToolCallExecuted", llmResult.reason);
           updateGuardclawStats(llmResult.level).catch(() => {
           });
           if (llmResult.level === "S3") {
@@ -4623,9 +4685,7 @@ ${secretResult.result}`
           if (!detectedSensitive && !wasRedacted && !wasPrivateBefore) {
             const sessionManager = getDefaultSessionManager();
             const ts = Date.now();
-            sessionManager.writeToFull(sessionKey, { role: "tool", content: textContent, timestamp: ts, sessionKey }).catch(() => {
-            });
-            sessionManager.writeToClean(sessionKey, { role: "tool", content: redacted, timestamp: ts, sessionKey }).catch(() => {
+            sessionManager.writeToClean(sessionKey2, { role: "tool", content: redacted, timestamp: ts, sessionKey: sessionKey2 }).catch(() => {
             });
           }
           if (llmResult.level === "S3") {
@@ -4636,76 +4696,90 @@ ${secretResult.result}`
         }
       }
     } catch (err) {
-      api.logger.error(`[GuardClaw] Error in tool_result_persist hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in tool_result_persist hook \u2014 attempting emergency redaction: ${String(err)}`);
+      if (msg) {
+        try {
+          const emergencyText = extractMessageText(msg);
+          if (emergencyText) {
+            const emergencyRedacted = redactForCleanTranscript(emergencyText, getLiveConfig().redaction);
+            if (emergencyRedacted !== emergencyText) {
+              api.logger.warn(`[GuardClaw] Emergency redaction applied to tool result (session=${sessionKey2})`);
+              const modified = replaceMessageText(msg, emergencyRedacted);
+              if (modified) return { message: modified };
+            }
+          }
+        } catch {
+        }
+      }
     }
   });
   api.on("before_message_write", (event, ctx) => {
     try {
-      const sessionKey = ctx.sessionKey ?? "";
-      if (!sessionKey) return;
+      const sessionKey2 = ctx.sessionKey ?? "";
+      if (!sessionKey2) return;
       const msg = event.message;
       if (!msg) return;
       const role = msg.role ?? "";
-      const pending = getPendingDetection(sessionKey);
-      const needsDualHistory = isSessionMarkedPrivate(sessionKey) || pending?.level === "S3" || isActiveLocalRouting(sessionKey);
+      const pending = getPendingDetection(sessionKey2);
+      const needsDualHistory = isSessionMarkedPrivate(sessionKey2) || pending?.level === "S3" || isActiveLocalRouting(sessionKey2);
       if (needsDualHistory && role !== "tool") {
         const sessionManager = getDefaultSessionManager();
         const msgText = extractMessageText(msg);
         const ts = Date.now();
         if (role === "user" && pending && pending.level !== "S1") {
           const original = pending.originalPrompt ?? msgText;
-          sessionManager.writeToFull(sessionKey, {
+          sessionManager.writeToFull(sessionKey2, {
             role: "user",
             content: original,
             timestamp: ts,
-            sessionKey
+            sessionKey: sessionKey2
           }).catch((err) => {
             console.error("[GuardClaw] Failed to persist user message to full history:", err);
           });
           const cleanContent = pending.level === "S3" ? buildMainSessionPlaceholder("S3") : pending.desensitized ?? msgText;
-          sessionManager.writeToClean(sessionKey, {
+          sessionManager.writeToClean(sessionKey2, {
             role: "user",
             content: cleanContent,
             timestamp: ts,
-            sessionKey
+            sessionKey: sessionKey2
           }).catch((err) => {
             console.error("[GuardClaw] Failed to persist user message to clean history:", err);
           });
         } else if (msgText) {
-          if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
+          if (role === "assistant" && isActiveLocalRouting(sessionKey2)) {
             const redacted = redactForCleanTranscript(msgText, getLiveConfig().redaction);
-            sessionManager.writeToFull(sessionKey, {
+            sessionManager.writeToFull(sessionKey2, {
               role: "assistant",
               content: msgText,
               timestamp: ts,
-              sessionKey
+              sessionKey: sessionKey2
             }).catch((err) => {
               console.error("[GuardClaw] Failed to persist assistant message to full history:", err);
             });
-            sessionManager.writeToClean(sessionKey, {
+            sessionManager.writeToClean(sessionKey2, {
               role: "assistant",
               content: redacted,
               timestamp: ts,
-              sessionKey
+              sessionKey: sessionKey2
             }).catch((err) => {
               console.error("[GuardClaw] Failed to persist assistant message to clean history:", err);
             });
           } else {
-            sessionManager.persistMessage(sessionKey, {
+            sessionManager.persistMessage(sessionKey2, {
               role: role || "assistant",
               content: msgText,
               timestamp: ts,
-              sessionKey
+              sessionKey: sessionKey2
             }).catch((err) => {
               console.error("[GuardClaw] Failed to persist message to dual history:", err);
             });
           }
         }
       }
-      if (role === "assistant" && isVerifiedGuardSession(sessionKey)) {
+      if (role === "assistant" && isVerifiedGuardSession(sessionKey2)) {
         const assistantText = extractMessageText(msg);
         if (assistantText && assistantText.length >= 4) {
-          const secretRedacted = redactTrackedSecrets(sessionKey, assistantText);
+          const secretRedacted = redactTrackedSecrets(sessionKey2, assistantText);
           const fullyRedacted = redactSensitiveInfo(secretRedacted, getLiveConfig().redaction);
           if (fullyRedacted !== assistantText) {
             gcDebug(api.logger, "[GuardClaw] Redacted secrets/PII from guard session assistant response");
@@ -4714,7 +4788,7 @@ ${secretResult.result}`
         }
         return;
       }
-      if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
+      if (role === "assistant" && isActiveLocalRouting(sessionKey2)) {
         const assistantText = extractMessageText(msg);
         if (assistantText && assistantText.length >= 10) {
           const redacted = redactForCleanTranscript(assistantText, getLiveConfig().redaction);
@@ -4724,15 +4798,15 @@ ${secretResult.result}`
           }
         }
       }
-      if (role === "assistant" && !isVerifiedGuardSession(sessionKey) && !isActiveLocalRouting(sessionKey)) {
+      if (role === "assistant" && !isVerifiedGuardSession(sessionKey2) && !isActiveLocalRouting(sessionKey2)) {
         const scanCfg = getLiveConfig().responseScanning;
         if (scanCfg?.enabled) {
           const assistantText = extractMessageText(msg);
           if (assistantText && assistantText.length >= 20) {
             const result = scanResponse(assistantText, scanCfg);
             if (result.hit) {
-              api.logger.warn(`[GuardClaw] Response scan hit: ${result.reason} (session=${sessionKey})`);
-              fireWebhooks("response_scan_hit", { sessionKey, reason: result.reason, details: { matches: result.matches.join(", ") } }, getLiveConfig().webhooks ?? []);
+              api.logger.warn(`[GuardClaw] Response scan hit: ${result.reason} (session=${sessionKey2})`);
+              fireWebhooks("response_scan_hit", { sessionKey: sessionKey2, reason: result.reason, details: { matches: result.matches.join(", ") } }, getLiveConfig().webhooks ?? []);
               if (result.action === "block") {
                 return { message: { ...msg, content: [{ type: "text", text: "[GuardClaw: Response blocked \u2014 contained sensitive content. Use a local model session to work with sensitive data.]" }] } };
               }
@@ -4747,56 +4821,85 @@ ${secretResult.result}`
       if (role !== "user") return;
       if (!pending || pending.level === "S1") return;
       if (pending.level === "S3") {
-        consumeDetection(sessionKey);
+        consumeDetection(sessionKey2);
         return { message: { ...msg, content: [{ type: "text", text: buildMainSessionPlaceholder("S3") }] } };
       }
       if (pending.level === "S2" && pending.desensitized) {
-        consumeDetection(sessionKey);
+        consumeDetection(sessionKey2);
         return { message: { ...msg, content: [{ type: "text", text: pending.desensitized }] } };
       }
     } catch (err) {
+      if (sessionKey) {
+        try {
+          consumeDetection(sessionKey);
+        } catch {
+        }
+      }
       api.logger.error(`[GuardClaw] Error in before_message_write hook: ${String(err)}`);
     }
   });
   api.on("session_end", async (event, ctx) => {
+    const sessionKey2 = event.sessionKey ?? ctx.sessionKey;
     try {
-      const sessionKey = event.sessionKey ?? ctx.sessionKey;
-      if (!sessionKey) return;
-      await awaitPendingMemoryWrites(sessionKey, api.logger);
-      const wasPrivate = isSessionMarkedPrivate(sessionKey);
-      api.logger.info(`[GuardClaw] ${wasPrivate ? "private" : "cloud"} session ${sessionKey} ended. Syncing memory\u2026`);
+      if (!sessionKey2) return;
+      await awaitPendingMemoryWrites(sessionKey2, api.logger);
+      const wasPrivate = isSessionMarkedPrivate(sessionKey2);
+      api.logger.info(`[GuardClaw] ${wasPrivate ? "private" : "cloud"} session ${sessionKey2} ended.`);
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
-      await memMgr.syncAllMemoryToClean(privacyConfig);
-      clearSessionState(sessionKey);
-      clearSessionSecrets(sessionKey);
-      clearBehavioralSession(sessionKey);
-      deregisterGuardSession(sessionKey);
+      if (isPrimaryModelCloud(api)) {
+        api.logger.info("[GuardClaw] Skipping FULL\u2192CLEAN memory sync \u2014 primary model is cloud (PII safety)");
+      } else {
+        await memMgr.syncAllMemoryToClean(privacyConfig);
+      }
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in session_end hook: ${String(err)}`);
+    } finally {
+      if (sessionKey2) {
+        try {
+          clearSessionState(sessionKey2);
+        } catch {
+        }
+        try {
+          clearSessionSecrets(sessionKey2);
+        } catch {
+        }
+        try {
+          clearBehavioralSession(sessionKey2);
+        } catch {
+        }
+        try {
+          deregisterGuardSession(sessionKey2);
+        } catch {
+        }
+      }
     }
   });
   api.on("after_compaction", async (_event, ctx) => {
     try {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
-      const memMgr = getDefaultMemoryManager();
-      const privacyConfig = getLiveConfig();
-      await memMgr.syncAllMemoryToClean(privacyConfig);
-      gcDebug(api.logger, "[GuardClaw] Memory synced after compaction");
+      if (isPrimaryModelCloud(api)) {
+        gcDebug(api.logger, "[GuardClaw] Skipping memory sync after compaction \u2014 primary model is cloud");
+      } else {
+        const memMgr = getDefaultMemoryManager();
+        const privacyConfig = getLiveConfig();
+        await memMgr.syncAllMemoryToClean(privacyConfig);
+        gcDebug(api.logger, "[GuardClaw] Memory synced after compaction");
+      }
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in after_compaction hook: ${String(err)}`);
     }
   });
   api.on("llm_output", async (event, ctx) => {
     try {
-      const sessionKey = ctx.sessionKey ?? event.sessionId ?? "";
+      const sessionKey2 = ctx.sessionKey ?? event.sessionId ?? "";
       const provider = event.provider ?? "unknown";
       const model = event.model ?? "unknown";
       const collector = getGlobalCollector();
       collector?.record({
-        sessionKey,
+        sessionKey: sessionKey2,
         provider,
         model,
         source: "task",
@@ -4811,14 +4914,14 @@ ${secretResult.result}`
           const status = checkBudget(budgetCfg);
           if (status.warning && !status.exceeded) {
             const msg = `Budget at ${Math.round(status.dailyCost / (status.dailyCap ?? Infinity) * 100)}% daily / ${Math.round(status.monthlyCost / (status.monthlyCap ?? Infinity) * 100)}% monthly`;
-            fireWebhooks("budget_warning", { sessionKey, reason: msg, details: { dailyCost: status.dailyCost, monthlyCost: status.monthlyCost } }, liveConfig.webhooks ?? []);
+            fireWebhooks("budget_warning", { sessionKey: sessionKey2, reason: msg, details: { dailyCost: status.dailyCost, monthlyCost: status.monthlyCost } }, liveConfig.webhooks ?? []);
           }
         }
       }
       const origin = provider === "guardclaw-privacy" ? "cloud" : isLocalProvider(provider, liveConfig.localProviders) ? "local" : "cloud";
       const reason = provider === "guardclaw-privacy" ? "guardclaw_proxy_to_cloud" : origin === "local" ? "local_provider" : "provider_not_local";
       recordFinalReply({
-        sessionKey,
+        sessionKey: sessionKey2,
         provider,
         model,
         usage: event.usage,
@@ -4826,7 +4929,7 @@ ${secretResult.result}`
         originHint: origin,
         reasonHint: reason
       });
-      finalizeLoop(sessionKey);
+      finalizeLoop(sessionKey2);
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in llm_output hook: ${String(err)}`);
     }
@@ -4834,12 +4937,16 @@ ${secretResult.result}`
   api.on("before_reset", async (_event, ctx) => {
     try {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
-      const sessionKey = ctx.sessionKey ?? "";
-      if (sessionKey) await awaitPendingMemoryWrites(sessionKey, api.logger);
-      const memMgr = getDefaultMemoryManager();
-      const privacyConfig = getLiveConfig();
-      await memMgr.syncAllMemoryToClean(privacyConfig);
-      gcDebug(api.logger, "[GuardClaw] Memory synced before reset");
+      const sessionKey2 = ctx.sessionKey ?? "";
+      if (sessionKey2) await awaitPendingMemoryWrites(sessionKey2, api.logger);
+      if (isPrimaryModelCloud(api)) {
+        gcDebug(api.logger, "[GuardClaw] Skipping memory sync before reset \u2014 primary model is cloud");
+      } else {
+        const memMgr = getDefaultMemoryManager();
+        const privacyConfig = getLiveConfig();
+        await memMgr.syncAllMemoryToClean(privacyConfig);
+        gcDebug(api.logger, "[GuardClaw] Memory synced before reset");
+      }
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in before_reset hook: ${String(err)}`);
     }
@@ -4850,6 +4957,19 @@ ${secretResult.result}`
       if (!content?.trim()) return;
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
+      const sessionKey2 = ctx.sessionKey ?? "";
+      if (isActiveLocalRouting(sessionKey2)) {
+        gcDebug(api.logger, `[GuardClaw] Local routing active \u2014 skipping outbound redaction (session=${sessionKey2})`);
+        return;
+      }
+      if (isSessionMarkedPrivate(sessionKey2) && (privacyConfig.s2Policy ?? "proxy") === "local") {
+        gcDebug(api.logger, `[GuardClaw] S2-local session \u2014 skipping outbound redaction (session=${sessionKey2})`);
+        return;
+      }
+      if (!isPrimaryModelCloud(api)) {
+        gcDebug(api.logger, `[GuardClaw] Primary model is local \u2014 skipping outbound redaction (session=${sessionKey2})`);
+        return;
+      }
       const explicitOperators = privacyConfig.operatorPassthrough ?? [];
       if (explicitOperators.length > 0 && to && explicitOperators.includes(to)) {
         api.logger.info(`[GuardClaw] Operator passthrough \u2014 skipping redaction for trusted recipient: ${to}`);
@@ -4861,16 +4981,15 @@ ${secretResult.result}`
       }
       const pipeline = getGlobalPipeline();
       if (!pipeline) return;
-      const sessionKey = ctx.sessionKey ?? "";
       let outboundContent = content;
-      const secretRedacted = redactTrackedSecrets(sessionKey, outboundContent);
+      const secretRedacted = redactTrackedSecrets(sessionKey2, outboundContent);
       if (secretRedacted !== outboundContent) {
-        api.logger.warn(`[GuardClaw] Redacted tracked secret(s) from outbound message (session=${sessionKey})`);
+        api.logger.warn(`[GuardClaw] Redacted tracked secret(s) from outbound message (session=${sessionKey2})`);
         outboundContent = secretRedacted;
       }
       const decision = await pipeline.run(
         "onUserMessage",
-        { checkpoint: "onUserMessage", message: outboundContent, sessionKey },
+        { checkpoint: "onUserMessage", message: outboundContent, sessionKey: sessionKey2 },
         getPipelineConfig()
       );
       if (decision.level === "S3" || decision.action === "block") {
@@ -4893,38 +5012,36 @@ ${secretResult.result}`
   api.on("before_agent_start", async (event, ctx) => {
     try {
       const { prompt } = event;
-      const sessionKey = ctx.sessionKey ?? "";
-      if (!sessionKey.includes(":subagent:") || !prompt?.trim()) return;
+      const sessionKey2 = ctx.sessionKey ?? "";
+      if (!sessionKey2.includes(":subagent:") || !prompt?.trim()) return;
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
       const pipeline = getGlobalPipeline();
       if (!pipeline) return;
       const decision = await pipeline.run(
         "onUserMessage",
-        { checkpoint: "onUserMessage", message: prompt, sessionKey, agentId: ctx.agentId },
+        { checkpoint: "onUserMessage", message: prompt, sessionKey: sessionKey2, agentId: ctx.agentId },
         getPipelineConfig()
       );
       if (decision.level === "S3" || decision.action === "block") {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-        api.logger.info(`[GuardClaw] Subagent ${decision.level} \u2014 routing to ${provider}/${model}`);
+        api.logger.info(`[GuardClaw] Subagent ${decision.level} \u2014 routing to ${provider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""}`);
         return {
           providerOverride: provider,
-          modelOverride: model
+          ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}
         };
       }
       if (decision.level === "S2") {
         const privacyCfg = getLiveConfig();
-        const desenResult = await desensitizeWithLocalModel(prompt, privacyCfg, sessionKey);
+        const desenResult = await desensitizeWithLocalModel(prompt, privacyCfg, sessionKey2);
         if (desenResult.failed) {
           const guardCfg = getGuardAgentConfig(privacyCfg);
           const fallbackProvider = privacyCfg.localModel?.provider ?? "ollama";
           const provider = guardCfg?.provider ?? fallbackProvider;
-          const model = guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-          api.logger.warn(`[GuardClaw] Subagent S2 desensitization failed \u2014 routing to local ${provider}/${model}`);
-          return { providerOverride: provider, modelOverride: model };
+          api.logger.warn(`[GuardClaw] Subagent S2 desensitization failed \u2014 routing to local ${provider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""}`);
+          return { providerOverride: provider, ...guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {} };
         }
         api.logger.info("[GuardClaw] Subagent S2 \u2014 prompt desensitized before forwarding");
         return { prompt: desenResult.desensitized };
@@ -5155,10 +5272,10 @@ function replaceMessageText(msg, newText) {
   }
   return null;
 }
-async function loadDualTrackContext(sessionKey, agentId, limit) {
+async function loadDualTrackContext(sessionKey2, agentId, limit) {
   try {
     const mgr = getDefaultSessionManager();
-    const delta = await mgr.loadHistoryDelta(sessionKey, agentId ?? "main", limit);
+    const delta = await mgr.loadHistoryDelta(sessionKey2, agentId ?? "main", limit);
     if (delta.length === 0) return null;
     return DualSessionManager.formatAsContext(delta);
   } catch {
@@ -5413,28 +5530,30 @@ function detectionToDecision(level, reason, privacyConfig) {
   }
   if (level === "S3") {
     const guardCfg = getGuardAgentConfig(privacyConfig);
-    const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
     return {
       level: "S3",
       action: "redirect",
-      target: {
-        provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
-      },
+      ...guardCfg ? {
+        target: {
+          provider: guardCfg.provider,
+          ...guardCfg.modelName ? { model: guardCfg.modelName } : {}
+        }
+      } : {},
       reason
     };
   }
   const s2Policy = privacyConfig.s2Policy ?? "proxy";
   if (s2Policy === "local") {
     const guardCfg = getGuardAgentConfig(privacyConfig);
-    const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
     return {
       level: "S2",
       action: "redirect",
-      target: {
-        provider: guardCfg?.provider ?? defaultProvider,
-        model: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
-      },
+      ...guardCfg ? {
+        target: {
+          provider: guardCfg.provider,
+          ...guardCfg.modelName ? { model: guardCfg.modelName } : {}
+        }
+      } : {},
       reason
     };
   }
@@ -5483,7 +5602,7 @@ var OPENROUTER_DEFAULT_MODEL = "auto";
 var DEFAULT_CONFIG2 = {
   enabled: false,
   judgeEndpoint: "http://localhost:11434",
-  judgeModel: "qwen/qwen3-30b-a3b-2507",
+  judgeModel: DEFAULT_LOCAL_CLASSIFIER_MODEL,
   judgeProviderType: "openai-compatible",
   tiers: {
     SIMPLE: { provider: "openai", model: "gpt-4o-mini" },
@@ -5937,22 +6056,22 @@ function resolveTargetForLevel(level, pluginConfig) {
   const pCfg = getPrivacyConfig2(pluginConfig);
   if (level === "S3") {
     const guardCfg = getGuardAgentConfig(pCfg);
-    const defaultProvider = pCfg.localModel?.provider ?? "ollama";
+    if (!guardCfg) return null;
     return {
-      provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
+      provider: guardCfg.provider,
+      ...guardCfg.modelName ? { model: guardCfg.modelName } : {}
     };
   }
   const s2Policy = pCfg.s2Policy ?? "proxy";
   if (s2Policy === "local") {
     const guardCfg = getGuardAgentConfig(pCfg);
-    const defaultProvider = pCfg.localModel?.provider ?? "ollama";
+    if (!guardCfg) return null;
     return {
-      provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"
+      provider: guardCfg.provider,
+      ...guardCfg.modelName ? { model: guardCfg.modelName } : {}
     };
   }
-  return { provider: "guardclaw-privacy", model: "" };
+  return { provider: "guardclaw-privacy" };
 }
 function createConfigurableRouter(id) {
   return {
@@ -5990,7 +6109,7 @@ function createConfigurableRouter(id) {
       const action = opts.action ?? "redirect";
       let target;
       if (finalLevel !== "S1" && action === "redirect") {
-        target = resolveTargetForLevel(finalLevel, pluginConfig);
+        target = resolveTargetForLevel(finalLevel, pluginConfig) ?? void 0;
       }
       return {
         level: finalLevel,
@@ -6293,7 +6412,7 @@ async function checkLLMFitModels(minDiskGb) {
   } catch {
     return [];
   }
-  const currentJudge = getLiveConfig().localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+  const currentJudge = getLiveConfig().localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
   const freeDiskGb = await getFreeDiskGb();
   const suggestions = [];
   for (const entry of entries.slice(0, 5)) {
@@ -6469,7 +6588,7 @@ async function runAdvisorChecks() {
     if (benchmarkEnabled) {
       const privacy = getLiveConfig();
       const localEndpoint = privacy.localModel?.endpoint ?? "http://localhost:11434";
-      const localModel = privacy.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+      const localModel = privacy.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
       const providerType = privacy.localModel?.type ?? "openai-compatible";
       let currentBenchmark;
       try {
@@ -6733,13 +6852,13 @@ async function statsHttpHandler(req, res) {
     return true;
   }
   if (req.method === "GET" && sub === "/api/current-loop-highest-level") {
-    const sessionKey = parsedUrl.searchParams.get("sessionKey") ?? void 0;
-    json(res, getCurrentLoopHighestLevel(sessionKey));
+    const sessionKey2 = parsedUrl.searchParams.get("sessionKey") ?? void 0;
+    json(res, getCurrentLoopHighestLevel(sessionKey2));
     return true;
   }
   if (req.method === "GET" && sub === "/api/last-turn-tokens") {
-    const sessionKey = parsedUrl.searchParams.get("sessionKey") ?? void 0;
-    const data = getLastTurnTokens(sessionKey);
+    const sessionKey2 = parsedUrl.searchParams.get("sessionKey") ?? void 0;
+    const data = getLastTurnTokens(sessionKey2);
     if (!data) {
       json(res, { error: "no last-turn router tokens yet" }, 404);
       return true;
@@ -6748,9 +6867,9 @@ async function statsHttpHandler(req, res) {
     return true;
   }
   if (req.method === "GET" && sub === "/api/reply-model-origin") {
-    const sessionKey = parsedUrl.searchParams.get("sessionKey") ?? void 0;
-    const origin = getLastReplyModelOrigin(sessionKey);
-    const loopSummary = getLastReplyLoopSummary(sessionKey);
+    const sessionKey2 = parsedUrl.searchParams.get("sessionKey") ?? void 0;
+    const origin = getLastReplyModelOrigin(sessionKey2);
+    const loopSummary = getLastReplyLoopSummary(sessionKey2);
     if (!origin || !loopSummary) {
       json(res, { error: "no reply-model-origin data yet" }, 404);
       return true;
@@ -8191,7 +8310,7 @@ function dashboardHtml() {
     </div>
     <div class="field"><label data-i18n="cfg.provider">Provider</label><input id="cfg-lm-provider" placeholder="ollama"></div>
     <div class="field"><label>Endpoint</label><input id="cfg-lm-endpoint" placeholder="http://localhost:11434"><div class="hint" style="margin-top:4px">Full URL of your local model server \u2014 e.g. Ollama: http://localhost:11434 \xB7 LM Studio: http://localhost:1234 \xB7 vLLM: http://localhost:8000 \xB7 SGLang: http://localhost:30000 \xB7 Remote: http://192.168.1.10:11434</div></div>
-    <div class="field"><label>Model</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-lm-model" placeholder="qwen/qwen3-30b-a3b-2507" style="flex:1"><button type="button" onclick="fetchAndPickModel('lm')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div></div>
+    <div class="field"><label>Model</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-lm-model" placeholder="llama3.2:3b" style="flex:1"><button type="button" onclick="fetchAndPickModel('lm')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div></div>
     <div class="field"><label data-i18n="cfg.api_key">API Key</label><input id="cfg-lm-apikey" type="password" placeholder="sk-..."></div>
     <div class="field" id="cfg-lm-module-wrap" style="display:none"><label>Custom Module Path</label><input id="cfg-lm-module" placeholder="./my-provider.js"></div>
   </div>
@@ -8231,7 +8350,7 @@ function dashboardHtml() {
     <div class="hint" style="margin-bottom:14px" data-i18n="cfg.guard_desc">A local agent that handles sensitive tasks entirely on-device.</div>
     <div class="field"><label data-i18n="cfg.agent_id">Agent ID</label><input id="cfg-ga-id" placeholder="guard"></div>
     <div class="field"><label data-i18n="cfg.workspace">Workspace</label><input id="cfg-ga-workspace" placeholder="~/.openclaw/workspace-guard"></div>
-    <div class="field"><label>Model (provider/model)</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-ga-model" placeholder="ollama/qwen3.5-27b" style="flex:1"><button type="button" onclick="fetchAndPickModel('ga')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div><div class="hint" style="margin-top:4px">Format: provider/model-name \u2014 e.g. ollama-server/qwen3.5:35b \xB7 lmstudio-server/qwen3.5-35b</div></div>
+    <div class="field"><label>Model (provider/model)</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-ga-model" placeholder="ollama-remote/qwen3-coder-next:latest" style="flex:1"><button type="button" onclick="fetchAndPickModel('ga')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div><div class="hint" style="margin-top:4px">Format: provider/model-name \u2014 e.g. ollama-server/qwen3.5:35b \xB7 lmstudio-server/qwen3.5-35b</div></div>
   </div>
 
   <div class="config-section">
@@ -10383,7 +10502,8 @@ var plugin = {
         ...modelStreamingPref === false ? { streaming: false } : {}
       });
       if (apiKey) {
-        api.logger.info(`[GuardClaw] Default proxy target: ${defaultProvider} (key: ${apiKey.slice(0, 8)}\u2026)`);
+        const apiKeyStr = typeof apiKey === "string" ? apiKey : JSON.stringify(apiKey);
+        api.logger.info(`[GuardClaw] Default proxy target: ${defaultProvider} (key: ${apiKeyStr.slice(0, 8)}\u2026)`);
       } else {
         api.logger.warn(`[GuardClaw] No API key found for default provider ${defaultProvider} \u2014 proxy auth will fail`);
       }

@@ -1,0 +1,7 @@
+{
+  "last_sync_commit": "121d8369057bdba64c4db29bf3c959222f306e01",
+  "total_pages": 77,
+  "provider": "ollama",
+  "model": "qwen2.5:7b",
+  "total_tokens": 267605
+}

@@ -27,6 +27,7 @@ import type { PrivacyConfig } from "../types.js";
 import { getGuardAgentConfig } from "../guard-agent.js";
 import { getKeywordRegex } from "../rules.js";
 
+
 export interface ConfigurableRouterOptions {
   keywords?: { S2?: string[]; S3?: string[] };
   patterns?: { S2?: string[]; S3?: string[] };
@@ -147,27 +148,27 @@ async function classifyWithPrompt(
 function resolveTargetForLevel(
   level: SensitivityLevel,
   pluginConfig: Record<string, unknown>,
-): { provider: string; model: string } {
+): { provider: string; model?: string } | null {
   const pCfg = getPrivacyConfig(pluginConfig);
   if (level === "S3") {
     const guardCfg = getGuardAgentConfig(pCfg);
-    const defaultProvider = pCfg.localModel?.provider ?? "ollama";
+    if (!guardCfg) return null; // provider not configured — caller should warn
     return {
-      provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
+      provider: guardCfg.provider,
+      ...(guardCfg.modelName ? { model: guardCfg.modelName } : {}),
     };
   }
   // S2
   const s2Policy = pCfg.s2Policy ?? "proxy";
   if (s2Policy === "local") {
     const guardCfg = getGuardAgentConfig(pCfg);
-    const defaultProvider = pCfg.localModel?.provider ?? "ollama";
+    if (!guardCfg) return null; // provider not configured — caller should warn
     return {
-      provider: guardCfg?.provider ?? defaultProvider,
-      model: guardCfg?.modelName ?? pCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
+      provider: guardCfg.provider,
+      ...(guardCfg.modelName ? { model: guardCfg.modelName } : {}),
     };
   }
-  return { provider: "guardclaw-privacy", model: "" };
+  return { provider: "guardclaw-privacy" };
 }
 
 /**
@@ -221,9 +222,9 @@ export function createConfigurableRouter(id: string): GuardClawRouter {
       const finalLevel = maxLevel(...levels);
       const action = (opts.action ?? "redirect") as RouterAction;
 
-      let target: { provider: string; model: string } | undefined;
+      let target: { provider: string; model?: string } | undefined;
       if (finalLevel !== "S1" && action === "redirect") {
-        target = resolveTargetForLevel(finalLevel, pluginConfig);
+        target = resolveTargetForLevel(finalLevel, pluginConfig) ?? undefined;
       }
 
       return {

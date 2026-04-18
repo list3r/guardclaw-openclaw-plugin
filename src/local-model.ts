@@ -19,6 +19,7 @@ import { buildFewShotExamples, loadCorrections, getAuthoritativeOverride } from 
 import { levelToNumeric } from "./types.js";
 import { getGlobalCollector } from "./token-stats.js";
 import { recordRouterOperation } from "./usage-intel.js";
+import { DEFAULT_LOCAL_CLASSIFIER_MODEL } from "./model-defaults.js";
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
@@ -471,7 +472,7 @@ async function callLocalModel(
   userContent: string,
   config: PrivacyConfig,
 ): Promise<ChatCompletionResult> {
-  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+  const model = config.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
   const providerType = config.localModel?.type ?? "openai-compatible";
 
@@ -665,7 +666,7 @@ export async function desensitizeWithLocalModel(
 
   try {
     const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-    const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+    const model = config.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
     const providerType = config.localModel?.type ?? "openai-compatible";
     const customModule = config.localModel?.module;
 

@@ -14,48 +14,66 @@
 import type { PrivacyConfig, SensitivityLevel } from "./types.js";
 
 /**
- * Check if guard agent is properly configured
+ * Check if the guard agent has a provider configured.
+ * GuardClaw requires an explicit provider — there is no hardcoded default.
  */
 export function isGuardAgentConfigured(config: PrivacyConfig): boolean {
-  return Boolean(
-    config.guardAgent?.id &&
-    config.guardAgent?.model &&
-    config.guardAgent?.workspace
-  );
+  return Boolean(config.guardAgent?.provider);
 }
 
 /**
- * Get guard agent configuration (returns null if not fully configured).
+ * Get guard agent configuration. Returns null if no provider is configured.
  *
- * The model field uses "provider/model" format (e.g. "ollama/llama3.2:3b", "vllm/qwen2.5:7b").
- * When no slash is present, the provider is inferred from localModel.provider config,
- * falling back to "ollama" only if nothing else is configured.
+ * Config shape (guardclaw.json → privacy.guardAgent):
+ *
+ *   provider  — required. Any OpenClaw provider alias defined in openclaw.json.
+ *               Examples: "ollama", "ollama-remote", "ollama-120",
+ *                         "financial-llm", "image-llm", "vllm-gpu2"
+ *               This is the ONLY required field. GuardClaw has no hardcoded default.
+ *
+ *   model     — optional. Pin a specific model within the provider.
+ *               Omit to use whatever model the provider resolves by default.
+ *               Examples: "llama3.2:3b", "qwen3:14b"
+ *
+ *   id        — optional. Sub-session identifier. Default: "guard".
+ *   workspace — optional. Guard agent workspace path. Default: "~/.openclaw/workspace-guard".
+ *
+ * If provider is not set, getGuardAgentConfig returns null and GuardClaw
+ * will emit a startup warning — S3 content will not be routed until configured.
  */
 export function getGuardAgentConfig(config: PrivacyConfig): {
   id: string;
-  model: string;
   workspace: string;
   provider: string;
-  modelName: string;
+  /** Undefined when no model is pinned — OpenClaw resolves from the provider config. */
+  modelName: string | undefined;
 } | null {
   if (!isGuardAgentConfigured(config)) {
     return null;
   }
 
-  const fullModel = config.guardAgent?.model ?? "ollama/qwen/qwen3-30b-a3b-2507";
-  const firstSlash = fullModel.indexOf("/");
-  const defaultProvider = config.localModel?.provider ?? "ollama";
-  const [provider, modelName] = firstSlash >= 0
-    ? [fullModel.slice(0, firstSlash), fullModel.slice(firstSlash + 1)]
-    : [defaultProvider, fullModel];
-
   return {
-    id: config.guardAgent?.id ?? "guard",
-    model: fullModel,
+    id:        config.guardAgent?.id       ?? "guard",
     workspace: config.guardAgent?.workspace ?? "~/.openclaw/workspace-guard",
-    provider,
-    modelName,
+    provider:  config.guardAgent!.provider!,
+    modelName: config.guardAgent?.model || undefined,
   };
+}
+
+/**
+ * Emit a one-time startup warning if the guard agent provider is not configured.
+ * Call this during plugin initialisation.
+ */
+export function warnIfGuardAgentUnconfigured(config: PrivacyConfig, logger?: { warn: (msg: string) => void }): void {
+  if (!isGuardAgentConfigured(config)) {
+    const msg =
+      "[GuardClaw] WARNING: privacy.guardAgent.provider is not set. " +
+      "S3 (private) content will not be routed to a local model until you configure it. " +
+      "Set \"provider\" to any OpenClaw provider alias in your guardclaw.json " +
+      "(e.g. \"ollama\", \"ollama-remote\", \"financial-llm\").";
+    if (logger?.warn) logger.warn(msg);
+    else console.warn(msg);
+  }
 }
 
 /**

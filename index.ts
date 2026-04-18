@@ -304,7 +304,8 @@ const plugin = {
         ...(modelStreamingPref === false ? { streaming: false } : {}),
       });
       if (apiKey) {
-        api.logger.info(`[GuardClaw] Default proxy target: ${defaultProvider} (key: ${apiKey.slice(0, 8)}…)`);
+        const apiKeyStr = typeof apiKey === 'string' ? apiKey : JSON.stringify(apiKey);
+        api.logger.info(`[GuardClaw] Default proxy target: ${defaultProvider} (key: ${apiKeyStr.slice(0, 8)}…)`);
       } else {
         api.logger.warn(`[GuardClaw] No API key found for default provider ${defaultProvider} — proxy auth will fail`);
       }

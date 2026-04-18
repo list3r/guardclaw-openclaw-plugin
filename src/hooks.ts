@@ -96,9 +96,47 @@ import {
   extractTaintValues,
   isSecretsMountPath,
 } from "./taint-store.js";
+import { DEFAULT_LOCAL_CLASSIFIER_MODEL } from "./model-defaults.js";
 
 function getPipelineConfig(): Record<string, unknown> {
   return { privacy: getLiveConfig() };
+}
+
+/**
+ * Returns true when the primary model target is a cloud provider.
+ * When true, syncing MEMORY-FULL.md → MEMORY.md is unsafe because
+ * the clean file is injected into every cloud request — any PII that
+ * slips past redaction would be sent to the cloud provider.
+ */
+let _lastPrimaryWasCloud: boolean | null = null;
+
+function isPrimaryModelCloud(api: OpenClawPluginApi): boolean {
+  const defaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
+  const primaryModel = (defaults?.model as Record<string, unknown> | undefined)?.primary as string ?? "";
+  const provider = primaryModel.includes("/") ? primaryModel.split("/")[0] : "";
+  if (!provider) return true; // assume cloud if unknown
+  const liveConfig = getLiveConfig();
+  const isCloud = !isLocalProvider(provider, liveConfig.localProviders);
+
+  // Detect local → cloud transition: scrub MEMORY.md to remove any PII
+  // that accumulated while local models were the primary target.
+  if (isCloud && _lastPrimaryWasCloud === false) {
+    api.logger.info("[GuardClaw] Primary model switched local → cloud — scrubbing MEMORY.md");
+    const memMgr = getDefaultMemoryManager();
+    memMgr.readMemory(true).then(async (content) => {
+      if (!content.trim()) return;
+      const scrubbed = redactSensitiveInfo(content, liveConfig.redaction);
+      if (scrubbed !== content) {
+        await memMgr.writeMemory(scrubbed, true);
+        api.logger.info(`[GuardClaw] MEMORY.md scrubbed on cloud transition (${content.length} → ${scrubbed.length} chars)`);
+      }
+    }).catch((err) => {
+      api.logger.error(`[GuardClaw] Failed to scrub MEMORY.md on cloud transition: ${String(err)}`);
+    });
+  }
+  _lastPrimaryWasCloud = isCloud;
+
+  return isCloud;
 }
 
 /** Emit a debug-level log only when guardclaw.json → privacy.debugLogging is true. */
@@ -407,8 +445,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             api.logger.info("[GuardClaw] Budget exceeded — routing to local model");
             const guardCfg = getGuardAgentConfig(privacyConfig);
             const localProvider = guardCfg?.provider ?? privacyConfig.localModel?.provider ?? "ollama";
-            const localModel = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-            return { providerOverride: localProvider, modelOverride: localModel };
+            return { providerOverride: localProvider, ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}) };
           }
         } else if (budgetStatus.warning) {
           const msg = `Budget warning — daily: $${budgetStatus.dailyCost.toFixed(4)}${budgetCfg.dailyCap ? `/$${budgetCfg.dailyCap}` : ""}, monthly: $${budgetStatus.monthlyCost.toFixed(4)}${budgetCfg.monthlyCap ? `/$${budgetCfg.monthlyCap}` : ""}`;
@@ -444,7 +481,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
         const guardCfg = getGuardAgentConfig(privacyConfig);
         if (guardCfg) {
-          return { providerOverride: guardCfg.provider, modelOverride: guardCfg.modelName };
+          return { providerOverride: guardCfg.provider, ...(guardCfg.modelName ? { modelOverride: guardCfg.modelName } : {}) };
         }
         return;
       }
@@ -496,7 +533,18 @@ export function registerHooks(api: OpenClawPluginApi): void {
           timestamp: Date.now(),
         });
 
-        // Route through privacy proxy
+        // Route according to s2Policy — respect it even in the fast path
+        const s2PolicyFast = privacyConfig.s2Policy ?? "proxy";
+        if (s2PolicyFast === "local") {
+          const guardCfgFast = getGuardAgentConfig(privacyConfig);
+          const fastLocalProvider = privacyConfig.localModel?.provider ?? "ollama";
+          gcDebug(api.logger, `[GuardClaw] s2Channels fast path — s2Policy=local, routing to ${guardCfgFast?.provider ?? fastLocalProvider}/${guardCfgFast?.modelName ?? privacyConfig.localModel?.model}`);
+          return {
+            providerOverride: guardCfgFast?.provider ?? fastLocalProvider,
+            modelOverride: guardCfgFast?.modelName ?? privacyConfig.localModel?.model,
+          };
+        }
+        // s2Policy="proxy": route through privacy proxy
         const defaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
         const primaryModel = (defaults?.model as Record<string, unknown> | undefined)?.primary as string ?? "";
         const defaultProvider = (defaults?.provider as string) || primaryModel.split("/")[0] || "openai";
@@ -753,9 +801,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-        gcDebug(api.logger, `[GuardClaw] S3 (rule fast-path) — routing to ${provider}/${model}`);
-        return { providerOverride: provider, modelOverride: model };
+        gcDebug(api.logger, `[GuardClaw] S3 (rule fast-path) — routing to ${provider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""}`);
+        return { providerOverride: provider, ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}) };
       }
 
       // ── Normal path: run the full router pipeline ──────────────────
@@ -834,10 +881,10 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
-        gcDebug(api.logger, `[GuardClaw] S3 — routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507"} [${decision.routerId}]`);
+        gcDebug(api.logger, `[GuardClaw] S3 — routing to ${guardCfg?.provider ?? defaultProvider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""} [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
+          ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}),
         };
       }
 
@@ -880,7 +927,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const fallbackProvider = privacyConfig.localModel?.provider ?? "ollama";
           return {
             providerOverride: guardCfg?.provider ?? fallbackProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
+            ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}),
           };
         }
         desensitized = result.desensitized;
@@ -955,7 +1002,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         api.logger.warn(`[GuardClaw] ${decision.level} BLOCK — redirecting to edge model [${decision.routerId}]`);
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
-          modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
+          ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}),
         };
       }
 
@@ -978,7 +1025,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           gcDebug(api.logger, `[GuardClaw] S3 TRANSFORM — routing to edge model [${decision.routerId}]`);
           return {
             providerOverride: guardCfg?.provider ?? defaultProvider,
-            modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
+            ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}),
           };
         }
 
@@ -1000,7 +1047,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             gcDebug(api.logger, `[GuardClaw] S2 TRANSFORM — routing to local ${guardCfg?.provider ?? defaultProvider} [${decision.routerId}]`);
             return {
               providerOverride: guardCfg?.provider ?? defaultProvider,
-              modelOverride: guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507",
+              ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}),
             };
           }
 
@@ -1032,7 +1079,21 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // cleaning, transcript policy) in openclaw core still triggers correctly.
       return;
     } catch (err) {
-      api.logger.error(`[GuardClaw] Error in before_model_resolve hook: ${String(err)}`);
+      const errMsg = String(err);
+      // Re-throw deliberate blocks — these must propagate to stop the request
+      if (errMsg.includes("[GuardClaw S0]") || errMsg.includes("[GuardClaw] Request blocked")) throw err;
+      // Any other pipeline error: fail safe to local model — never silently leak to cloud
+      api.logger.error(`[GuardClaw] Pipeline error — failing safe to local model: ${errMsg}`);
+      try {
+        const safeCfg = getLiveConfig();
+        const safeGuardCfg = getGuardAgentConfig(safeCfg);
+        const safeProvider = safeGuardCfg?.provider ?? safeCfg.localModel?.provider ?? "ollama";
+        const safeModel = safeGuardCfg?.modelName ?? safeCfg.localModel?.model ?? "llama3.2:3b";
+        return { providerOverride: safeProvider, modelOverride: safeModel };
+      } catch {
+        // If even the failsafe lookup fails, block the request entirely
+        throw new Error("[GuardClaw] Pipeline error and failsafe failed — request blocked for safety");
+      }
     }
   });
 
@@ -1041,8 +1102,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
   //         dual-track history for local models
   // =========================================================================
   api.on("before_prompt_build", async (_event, ctx) => {
+    const sessionKey = ctx.sessionKey ?? "";
     try {
-      const sessionKey = ctx.sessionKey ?? "";
       if (!sessionKey) return;
 
       const pending = getPendingDetection(sessionKey);
@@ -1098,6 +1159,20 @@ export function registerHooks(api: OpenClawPluginApi): void {
         };
       }
     } catch (err) {
+      // If this errored during S2-proxy, the <guardclaw-s2> markers weren't
+      // injected — log a security warning so it's visible in the audit trail.
+      try {
+        const pendingOnErr = getPendingDetection(sessionKey);
+        if (pendingOnErr?.level === "S2") {
+          const s2PolicyOnErr = getLiveConfig().s2Policy ?? "proxy";
+          if (s2PolicyOnErr === "proxy") {
+            api.logger.warn(
+              `[GuardClaw] SECURITY: before_prompt_build error during S2-proxy — ` +
+              `markers not injected, PII may pass through proxy unstripped (session=${sessionKey})`,
+            );
+          }
+        }
+      } catch { /* best-effort */ }
       api.logger.error(`[GuardClaw] Error in before_prompt_build hook: ${String(err)}`);
     }
   });
@@ -1160,52 +1235,65 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // elevated trust for local tools but must be prevented from exfiltrating
       // secrets via network calls or by leaking secret values in tool params.
       // Use isVerifiedGuardSession (#12) to prevent session-key forgery attacks.
+      //
+      // CRITICAL: wrapped in its own try/catch so any internal check error
+      // blocks the tool rather than silently falling through to execution.
       if (isVerifiedGuardSession(sessionKey)) {
-        // 1. Block all outbound network tools unconditionally.
-        if (isNetworkTool(toolName)) {
-          api.logger.warn(
-            `[GuardClaw] BLOCKED guard session network tool: ${toolName} (session=${sessionKey})`,
-          );
-          return {
-            block: true,
-            blockReason: `GuardClaw: network tools are blocked in guard sessions to prevent secret exfiltration (${toolName})`,
-          };
-        }
-
-        // 2. Detect macOS Keychain fetch commands so the result can be tracked.
-        //    security find-generic-password -w prints the password to stdout.
-        const bashCmd = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
-        if (bashCmd && parseKeychainCommand(bashCmd)) {
-          markKeychainFetchPending(sessionKey);
-          gcDebug(api.logger, `[GuardClaw] Guard session keychain fetch detected — result will be tracked (session=${sessionKey})`);
-        }
-
-        // 2b. Block bash commands that make outbound network connections (#1).
-        //     Scans the full raw command string, which covers $(...) and backtick
-        //     sub-expressions — the literal tool name is present regardless of nesting.
-        if (isExecTool(toolName) && bashCmd) {
-          const networkTool = isGuardNetworkCommand(bashCmd);
-          if (networkTool) {
+        try {
+          // 1. Block all outbound network tools unconditionally.
+          if (isNetworkTool(toolName)) {
             api.logger.warn(
-              `[GuardClaw] BLOCKED guard session network command via bash: ${networkTool} (session=${sessionKey})`,
+              `[GuardClaw] BLOCKED guard session network tool: ${toolName} (session=${sessionKey})`,
             );
             return {
               block: true,
-              blockReason: `GuardClaw: outbound network commands are blocked in guard sessions to prevent secret exfiltration (${networkTool})`,
+              blockReason: `GuardClaw: network tools are blocked in guard sessions to prevent secret exfiltration (${toolName})`,
             };
           }
-        }
 
-        // 3. Scan tool parameters for any already-tracked secrets.
-        //    Block if a tracked secret would be sent outside the local environment.
-        const paramStr = JSON.stringify(typedParams);
-        if (containsTrackedSecret(sessionKey, paramStr)) {
-          api.logger.warn(
-            `[GuardClaw] BLOCKED guard session tool "${toolName}": params contain a tracked secret (session=${sessionKey})`,
-          );
+          // 2. Detect macOS Keychain fetch commands so the result can be tracked.
+          //    security find-generic-password -w prints the password to stdout.
+          const bashCmd = String(typedParams.command ?? typedParams.cmd ?? typedParams.script ?? "");
+          if (bashCmd && parseKeychainCommand(bashCmd)) {
+            markKeychainFetchPending(sessionKey);
+            gcDebug(api.logger, `[GuardClaw] Guard session keychain fetch detected — result will be tracked (session=${sessionKey})`);
+          }
+
+          // 2b. Block bash commands that make outbound network connections (#1).
+          //     Scans the full raw command string, which covers $(...) and backtick
+          //     sub-expressions — the literal tool name is present regardless of nesting.
+          if (isExecTool(toolName) && bashCmd) {
+            const networkTool = isGuardNetworkCommand(bashCmd);
+            if (networkTool) {
+              api.logger.warn(
+                `[GuardClaw] BLOCKED guard session network command via bash: ${networkTool} (session=${sessionKey})`,
+              );
+              return {
+                block: true,
+                blockReason: `GuardClaw: outbound network commands are blocked in guard sessions to prevent secret exfiltration (${networkTool})`,
+              };
+            }
+          }
+
+          // 3. Scan tool parameters for any already-tracked secrets.
+          //    Block if a tracked secret would be sent outside the local environment.
+          const paramStr = JSON.stringify(typedParams);
+          if (containsTrackedSecret(sessionKey, paramStr)) {
+            api.logger.warn(
+              `[GuardClaw] BLOCKED guard session tool "${toolName}": params contain a tracked secret (session=${sessionKey})`,
+            );
+            return {
+              block: true,
+              blockReason: `GuardClaw: tool parameters contain a tracked Keychain secret and cannot be called in this context (${toolName})`,
+            };
+          }
+        } catch (guardErr) {
+          // If any guard session check itself errors, block the tool — never
+          // allow a check failure to silently permit execution in S3 context.
+          api.logger.error(`[GuardClaw] Guard session check error — blocking tool for safety: ${String(guardErr)} (tool=${toolName}, session=${sessionKey})`);
           return {
             block: true,
-            blockReason: `GuardClaw: tool parameters contain a tracked Keychain secret and cannot be called in this context (${toolName})`,
+            blockReason: `GuardClaw: safety check error in guard session — tool blocked for safety (${toolName})`,
           };
         }
       }
@@ -1480,11 +1568,10 @@ export function registerHooks(api: OpenClawPluginApi): void {
   //         + memory_search filtering + memory dual-write sync
   // =========================================================================
   api.on("tool_result_persist", (event, ctx) => {
+    const sessionKey = ctx.sessionKey ?? "";
+    const msg = event.message;
     try {
-      const sessionKey = ctx.sessionKey ?? "";
       if (!sessionKey) return;
-
-      const msg = event.message;
       if (!msg) return;
 
       // ── Memory dual-write sync ──
@@ -1516,13 +1603,12 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // The local model sees full content (via dual-track history injection),
       // but the main transcript must be redacted so future S1 turns don't
       // leak S3 tool results to cloud models.
+      // NOTE: OpenClaw core already persists the tool result to the full
+      // transcript — only write to the clean track here to avoid duplication.
       if (isActiveLocalRouting(sessionKey)) {
         const textContent = extractMessageText(msg);
         if (textContent && textContent.length >= 10) {
           const sessionManager = getDefaultSessionManager();
-          sessionManager.writeToFull(sessionKey, {
-            role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
-          }).catch(() => {});
           const redacted = redactForCleanTranscript(textContent, getLiveConfig().redaction);
           if (redacted !== textContent) {
             gcDebug(api.logger, `[GuardClaw] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`);
@@ -1587,13 +1673,11 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // heuristics, sync LLM, taint tracking) generates useless proxy
       // requests that amplify into TCP connection storms during multi-tool
       // turns. Skip the heavy path for clearly benign output; still write
-      // to dual-track for audit if the session is already private.
+      // to clean track for audit if the session is already private.
+      // NOTE: OpenClaw core already persists to the full transcript.
       if (textContent.length < 200 && isToolNoise(textContent, ctx.toolName)) {
         if (isSessionMarkedPrivate(sessionKey)) {
           const sessionManager = getDefaultSessionManager();
-          sessionManager.writeToFull(sessionKey, {
-            role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
-          }).catch(() => {});
           sessionManager.writeToClean(sessionKey, {
             role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
           }).catch(() => {});
@@ -1759,11 +1843,12 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // after_tool_call (async) already synthesized this result and stashed it.
       // Use the synthesis instead of blunt redaction: the cloud model gets a
       // natural-language description rather than [REDACTED] placeholders.
+      // NOTE: OpenClaw core persists the (possibly modified) tool result to
+      // the full transcript — only write the synthetic version to clean track.
       if (ruleCheck.level === "S3" && (privacyConfig.s3Policy ?? "local-only") === "synthesize") {
         const synthetic = _popSynthesisPending(sessionKey, ctx.toolName ?? "");
         if (synthetic) {
           const sessionManager = getDefaultSessionManager();
-          sessionManager.writeToFull(sessionKey, { role: "tool", content: textContent, timestamp: Date.now(), sessionKey }).catch(() => {});
           sessionManager.writeToClean(sessionKey, { role: "tool", content: synthetic, timestamp: Date.now(), sessionKey }).catch(() => {});
           gcDebug(api.logger, `[GuardClaw] S3 tool result replaced with synthesis (tool=${ctx.toolName ?? "unknown"})`);
           const modified = replaceMessageText(msg, synthetic);
@@ -1775,11 +1860,11 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const redacted = redactForCleanTranscript(textContent, getLiveConfig().redaction);
       const wasRedacted = redacted !== textContent;
 
+      // NOTE: OpenClaw core already persists the tool result to the full
+      // transcript — only write to the clean track (with redacted content
+      // when applicable) to avoid duplication in the full session file.
       if (detectedSensitive || wasRedacted || wasPrivateBefore) {
         const sessionManager = getDefaultSessionManager();
-        sessionManager.writeToFull(sessionKey, {
-          role: "tool", content: textContent, timestamp: Date.now(), sessionKey,
-        }).catch(() => {});
         sessionManager.writeToClean(sessionKey, {
           role: "tool", content: wasRedacted ? redacted : textContent, timestamp: Date.now(), sessionKey,
         }).catch(() => {});
@@ -1833,10 +1918,10 @@ export function registerHooks(api: OpenClawPluginApi): void {
           // Use the snapshot taken before detection: if the turn wasn't
           // already private AND rules/regex didn't write above, the LLM
           // is the first to detect — dual-write here.
+          // NOTE: OpenClaw core already persists to the full transcript.
           if (!detectedSensitive && !wasRedacted && !wasPrivateBefore) {
             const sessionManager = getDefaultSessionManager();
             const ts = Date.now();
-            sessionManager.writeToFull(sessionKey, { role: "tool", content: textContent, timestamp: ts, sessionKey }).catch(() => {});
             sessionManager.writeToClean(sessionKey, { role: "tool", content: redacted, timestamp: ts, sessionKey }).catch(() => {});
           }
 
@@ -1850,7 +1935,22 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
       }
     } catch (err) {
-      api.logger.error(`[GuardClaw] Error in tool_result_persist hook: ${String(err)}`);
+      // Emergency redaction: if the hook errored mid-processing, attempt to
+      // redact the raw tool result before it lands in the transcript.
+      api.logger.error(`[GuardClaw] Error in tool_result_persist hook — attempting emergency redaction: ${String(err)}`);
+      if (msg) {
+        try {
+          const emergencyText = extractMessageText(msg);
+          if (emergencyText) {
+            const emergencyRedacted = redactForCleanTranscript(emergencyText, getLiveConfig().redaction);
+            if (emergencyRedacted !== emergencyText) {
+              api.logger.warn(`[GuardClaw] Emergency redaction applied to tool result (session=${sessionKey})`);
+              const modified = replaceMessageText(msg, emergencyRedacted);
+              if (modified) return { message: modified };
+            }
+          }
+        } catch { /* best-effort — do not throw from emergency path */ }
+      }
     }
   });
 
@@ -2000,6 +2100,11 @@ export function registerHooks(api: OpenClawPluginApi): void {
         return { message: { ...msg, content: [{ type: "text", text: pending.desensitized }] } };
       }
     } catch (err) {
+      // Consume any pending S2/S3 detection to prevent stale state from
+      // mis-routing the next turn if this hook errored mid-processing.
+      if (sessionKey) {
+        try { consumeDetection(sessionKey); } catch { /* best-effort */ }
+      }
       api.logger.error(`[GuardClaw] Error in before_message_write hook: ${String(err)}`);
     }
   });
@@ -2008,29 +2113,38 @@ export function registerHooks(api: OpenClawPluginApi): void {
   // Hook 7: session_end — Memory sync
   // =========================================================================
   api.on("session_end", async (event, ctx) => {
+    const sessionKey = event.sessionKey ?? ctx.sessionKey;
     try {
-      const sessionKey = event.sessionKey ?? ctx.sessionKey;
       if (!sessionKey) return;
 
       // GCF-026: Await any pending fire-and-forget memory writes before syncing.
       await awaitPendingMemoryWrites(sessionKey, api.logger);
 
       const wasPrivate = isSessionMarkedPrivate(sessionKey);
-      api.logger.info(`[GuardClaw] ${wasPrivate ? "private" : "cloud"} session ${sessionKey} ended. Syncing memory…`);
+      api.logger.info(`[GuardClaw] ${wasPrivate ? "private" : "cloud"} session ${sessionKey} ended.`);
 
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
-      await memMgr.syncAllMemoryToClean(privacyConfig);
-
-      clearSessionState(sessionKey);
-      clearSessionSecrets(sessionKey); // Free any in-memory Keychain secret values
-      clearBehavioralSession(sessionKey); // Free behavioral log in-memory buffers
-      deregisterGuardSession(sessionKey); // #12: clean up registry entry for guard subsessions
+      if (isPrimaryModelCloud(api)) {
+        api.logger.info("[GuardClaw] Skipping FULL\u2192CLEAN memory sync \u2014 primary model is cloud (PII safety)");
+      } else {
+        await memMgr.syncAllMemoryToClean(privacyConfig);
+      }
 
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in session_end hook: ${String(err)}`);
+    } finally {
+      // Always free in-memory resources regardless of errors above.
+      // Keychain secrets MUST be cleared — leaving them in memory is a
+      // security risk if the session key is later reused.
+      if (sessionKey) {
+        try { clearSessionState(sessionKey); } catch { /* best-effort */ }
+        try { clearSessionSecrets(sessionKey); } catch { /* best-effort */ }
+        try { clearBehavioralSession(sessionKey); } catch { /* best-effort */ }
+        try { deregisterGuardSession(sessionKey); } catch { /* best-effort */ }
+      }
     }
   });
 
@@ -2040,10 +2154,14 @@ export function registerHooks(api: OpenClawPluginApi): void {
   api.on("after_compaction", async (_event, ctx) => {
     try {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
-      const memMgr = getDefaultMemoryManager();
-      const privacyConfig = getLiveConfig();
-      await memMgr.syncAllMemoryToClean(privacyConfig);
-      gcDebug(api.logger, "[GuardClaw] Memory synced after compaction");
+      if (isPrimaryModelCloud(api)) {
+        gcDebug(api.logger, "[GuardClaw] Skipping memory sync after compaction — primary model is cloud");
+      } else {
+        const memMgr = getDefaultMemoryManager();
+        const privacyConfig = getLiveConfig();
+        await memMgr.syncAllMemoryToClean(privacyConfig);
+        gcDebug(api.logger, "[GuardClaw] Memory synced after compaction");
+      }
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in after_compaction hook: ${String(err)}`);
     }
@@ -2124,10 +2242,14 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // GCF-026: Await any pending fire-and-forget memory writes before syncing.
       const sessionKey = ctx.sessionKey ?? "";
       if (sessionKey) await awaitPendingMemoryWrites(sessionKey, api.logger);
-      const memMgr = getDefaultMemoryManager();
-      const privacyConfig = getLiveConfig();
-      await memMgr.syncAllMemoryToClean(privacyConfig);
-      gcDebug(api.logger, "[GuardClaw] Memory synced before reset");
+      if (isPrimaryModelCloud(api)) {
+        gcDebug(api.logger, "[GuardClaw] Skipping memory sync before reset — primary model is cloud");
+      } else {
+        const memMgr = getDefaultMemoryManager();
+        const privacyConfig = getLiveConfig();
+        await memMgr.syncAllMemoryToClean(privacyConfig);
+        gcDebug(api.logger, "[GuardClaw] Memory synced before reset");
+      }
     } catch (err) {
       api.logger.error(`[GuardClaw] Error in before_reset hook: ${String(err)}`);
     }
@@ -2143,6 +2265,24 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
+
+      const sessionKey = ctx.sessionKey ?? "";
+
+      // ── Skip outbound redaction for local-inference sessions ───────────────
+      // When the model ran locally the data never left the machine — redacting
+      // the response only causes false-positive blocks on legitimate replies.
+      if (isActiveLocalRouting(sessionKey)) {
+        gcDebug(api.logger, `[GuardClaw] Local routing active — skipping outbound redaction (session=${sessionKey})`);
+        return;
+      }
+      if (isSessionMarkedPrivate(sessionKey) && (privacyConfig.s2Policy ?? "proxy") === "local") {
+        gcDebug(api.logger, `[GuardClaw] S2-local session — skipping outbound redaction (session=${sessionKey})`);
+        return;
+      }
+      if (!isPrimaryModelCloud(api)) {
+        gcDebug(api.logger, `[GuardClaw] Primary model is local — skipping outbound redaction (session=${sessionKey})`);
+        return;
+      }
 
       // ── Operator passthrough (channel-scoped) ──────────────────────────────
       // Only bypass redaction if the recipient is explicitly trusted for THIS channel.
@@ -2175,8 +2315,6 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       const pipeline = getGlobalPipeline();
       if (!pipeline) return;
-
-      const sessionKey = ctx.sessionKey ?? "";
 
       // Redact any in-memory tracked Keychain secrets before the message leaves (#14)
       let outboundContent = content;
@@ -2240,11 +2378,10 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         const provider = guardCfg?.provider ?? defaultProvider;
-        const model = guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-        api.logger.info(`[GuardClaw] Subagent ${decision.level} — routing to ${provider}/${model}`);
+        api.logger.info(`[GuardClaw] Subagent ${decision.level} — routing to ${provider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""}`);
         return {
           providerOverride: provider,
-          modelOverride: model,
+          ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}),
         };
       }
       if (decision.level === "S2") {
@@ -2254,9 +2391,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const guardCfg = getGuardAgentConfig(privacyCfg);
           const fallbackProvider = privacyCfg.localModel?.provider ?? "ollama";
           const provider = guardCfg?.provider ?? fallbackProvider;
-          const model = guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
-          api.logger.warn(`[GuardClaw] Subagent S2 desensitization failed — routing to local ${provider}/${model}`);
-          return { providerOverride: provider, modelOverride: model };
+          api.logger.warn(`[GuardClaw] Subagent S2 desensitization failed — routing to local ${provider}${guardCfg?.modelName ? "/" + guardCfg.modelName : ""}`);
+          return { providerOverride: provider, ...(guardCfg?.modelName ? { modelOverride: guardCfg.modelName } : {}) };
         }
         api.logger.info("[GuardClaw] Subagent S2 — prompt desensitized before forwarding");
         return { prompt: desenResult.desensitized };

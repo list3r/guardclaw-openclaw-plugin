@@ -1,5 +1,10 @@
 # GuardClaw — Claude Code Brief
 
+## Working Rules
+
+- **Read before editing:** Always read a file fully before modifying it. Before changing a function, grep for all callers first. Research before you edit.
+- **Exact locations:** When referencing code, use file + line numbers (e.g. `src/index.ts:42`). Do not re-read files you already have in context.
+
 ## What You're Working On
 
 GuardClaw is a production TypeScript privacy plugin for OpenClaw (an AI assistant framework).

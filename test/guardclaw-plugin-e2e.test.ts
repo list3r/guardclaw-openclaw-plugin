@@ -112,7 +112,8 @@ describe("GuardClaw Plugin E2E", () => {
 
       expect(decision.level).toBe("S3");
       expect(decision.action).toBe("redirect");
-      expect(decision.target?.provider).toBe("ollama");
+      // No guardAgent.provider configured — target is intentionally absent until user configures it
+      expect(decision.target).toBeUndefined();
 
       markSessionAsPrivate(sessionKey, decision.level);
       expect(isSessionMarkedPrivate(sessionKey)).toBe(true);
@@ -177,7 +178,8 @@ describe("GuardClaw Plugin E2E", () => {
         ruleOnlyConfig,
       );
       expect(sensitiveDecision.level).toBe("S3");
-      expect(sensitiveDecision.target?.provider).toBe("ollama");
+      // No guardAgent.provider configured — target absent until configured
+      expect(sensitiveDecision.target).toBeUndefined();
     });
   });
 

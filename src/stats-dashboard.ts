@@ -1731,7 +1731,7 @@ function dashboardHtml(): string {
     </div>
     <div class="field"><label data-i18n="cfg.provider">Provider</label><input id="cfg-lm-provider" placeholder="ollama"></div>
     <div class="field"><label>Endpoint</label><input id="cfg-lm-endpoint" placeholder="http://localhost:11434"><div class="hint" style="margin-top:4px">Full URL of your local model server — e.g. Ollama: http://localhost:11434 · LM Studio: http://localhost:1234 · vLLM: http://localhost:8000 · SGLang: http://localhost:30000 · Remote: http://192.168.1.10:11434</div></div>
-    <div class="field"><label>Model</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-lm-model" placeholder="qwen/qwen3-30b-a3b-2507" style="flex:1"><button type="button" onclick="fetchAndPickModel('lm')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div></div>
+    <div class="field"><label>Model</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-lm-model" placeholder="llama3.2:3b" style="flex:1"><button type="button" onclick="fetchAndPickModel('lm')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div></div>
     <div class="field"><label data-i18n="cfg.api_key">API Key</label><input id="cfg-lm-apikey" type="password" placeholder="sk-..."></div>
     <div class="field" id="cfg-lm-module-wrap" style="display:none"><label>Custom Module Path</label><input id="cfg-lm-module" placeholder="./my-provider.js"></div>
   </div>
@@ -1771,7 +1771,7 @@ function dashboardHtml(): string {
     <div class="hint" style="margin-bottom:14px" data-i18n="cfg.guard_desc">A local agent that handles sensitive tasks entirely on-device.</div>
     <div class="field"><label data-i18n="cfg.agent_id">Agent ID</label><input id="cfg-ga-id" placeholder="guard"></div>
     <div class="field"><label data-i18n="cfg.workspace">Workspace</label><input id="cfg-ga-workspace" placeholder="~/.openclaw/workspace-guard"></div>
-    <div class="field"><label>Model (provider/model)</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-ga-model" placeholder="ollama/qwen3.5-27b" style="flex:1"><button type="button" onclick="fetchAndPickModel('ga')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div><div class="hint" style="margin-top:4px">Format: provider/model-name — e.g. ollama-server/qwen3.5:35b · lmstudio-server/qwen3.5-35b</div></div>
+    <div class="field"><label>Model (provider/model)</label><div style="display:flex;gap:8px;align-items:center"><input id="cfg-ga-model" placeholder="ollama-remote/qwen3-coder-next:latest" style="flex:1"><button type="button" onclick="fetchAndPickModel('ga')" style="padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-secondary);cursor:pointer;font-size:12px;white-space:nowrap">Browse</button></div><div class="hint" style="margin-top:4px">Format: provider/model-name — e.g. ollama-server/qwen3.5:35b · lmstudio-server/qwen3.5-35b</div></div>
   </div>
 
   <div class="config-section">

@@ -23,6 +23,7 @@ import type { GuardClawRouter, DetectionContext, EdgeProviderType, RouterDecisio
 import { callChatCompletion } from "../local-model.js";
 import { loadPrompt } from "../prompt-loader.js";
 import { getGlobalCollector } from "../token-stats.js";
+import { DEFAULT_LOCAL_CLASSIFIER_MODEL } from "../model-defaults.js";
 
 // ── Types ──
 
@@ -63,7 +64,7 @@ const OPENROUTER_DEFAULT_MODEL = "auto";
 const DEFAULT_CONFIG: TokenSaverConfig = {
   enabled: false,
   judgeEndpoint: "http://localhost:11434",
-  judgeModel: "qwen/qwen3-30b-a3b-2507",
+  judgeModel: DEFAULT_LOCAL_CLASSIFIER_MODEL,
   judgeProviderType: "openai-compatible",
   tiers: {
     SIMPLE:    { provider: "openai",    model: "gpt-4o-mini" },

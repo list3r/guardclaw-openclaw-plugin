@@ -36,6 +36,7 @@ import { getLiveConfig, updateLiveConfig } from "./live-config.js";
 import { triggerDebertaReload } from "./injection/deberta.js";
 import { DEFAULT_JUDGE_PROMPT } from "./routers/token-saver.js";
 import type { EdgeProviderType, ModelAdvisorConfig, ModelSuggestion, SuggestionType, SuggestionStatus, BenchmarkResult } from "./types.js";
+import { DEFAULT_LOCAL_CLASSIFIER_MODEL } from "./model-defaults.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -458,7 +459,7 @@ async function checkLLMFitModels(minDiskGb: number): Promise<ModelSuggestion[]> 
     return [];
   }
 
-  const currentJudge = getLiveConfig().localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+  const currentJudge = getLiveConfig().localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
 
   const freeDiskGb = await getFreeDiskGb();
   const suggestions: ModelSuggestion[] = [];
@@ -692,7 +693,7 @@ export async function runAdvisorChecks(): Promise<void> {
     if (benchmarkEnabled) {
       const privacy = getLiveConfig();
       const localEndpoint = privacy.localModel?.endpoint ?? "http://localhost:11434";
-      const localModel = privacy.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+      const localModel = privacy.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
       const providerType = (privacy.localModel?.type ?? "openai-compatible") as EdgeProviderType;
 
       // Benchmark current judge model as baseline

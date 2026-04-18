@@ -230,7 +230,13 @@ async def classify(req: ClassifyRequest):
         log.error(f"Inference error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    label = int(result["label"].split("_")[1])
+    raw_label = result["label"]
+    parts = raw_label.split("_")
+    if len(parts) >= 2 and parts[-1].isdigit():
+        label = int(parts[-1])
+    else:
+        # Handle descriptive labels (e.g. "INJECTION", "SAFE", "BENIGN")
+        label = 1 if raw_label.upper() in ("INJECTION", "MALICIOUS", "POSITIVE") else 0
     score = round(float(result["score"]), 4)
     return {"label": label, "score": score, "injection": label == 1 and score > 0.5}
 

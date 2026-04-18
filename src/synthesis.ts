@@ -15,6 +15,7 @@
 import { callChatCompletion } from "./local-model.js";
 import { loadPromptWithVars } from "./prompt-loader.js";
 import type { PrivacyConfig, SynthesisConfig } from "./types.js";
+import { DEFAULT_LOCAL_CLASSIFIER_MODEL } from "./model-defaults.js";
 
 // ── Fallback prompts (used if prompts/s3-synthesis.md or s3-verify.md are missing) ──
 
@@ -67,7 +68,7 @@ async function callSynthesis(
   timeoutMs: number,
 ): Promise<string> {
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+  const model = config.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
   const providerType = config.localModel?.type ?? "openai-compatible";
 
   const prompt = loadPromptWithVars("s3-synthesis", DEFAULT_SYNTHESIS_PROMPT, {
@@ -106,7 +107,7 @@ async function verifySynthesis(
   timeoutMs: number,
 ): Promise<{ safe: boolean; reason?: string }> {
   const endpoint = config.localModel?.endpoint ?? "http://localhost:11434";
-  const model = config.localModel?.model ?? "qwen/qwen3-30b-a3b-2507";
+  const model = config.localModel?.model ?? DEFAULT_LOCAL_CLASSIFIER_MODEL;
   const providerType = config.localModel?.type ?? "openai-compatible";
 
   const prompt = loadPromptWithVars("s3-verify", DEFAULT_VERIFY_PROMPT, {

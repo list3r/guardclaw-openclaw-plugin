@@ -106,7 +106,7 @@ describe("Token-Saver Router", () => {
     it("uses defaults when no config provided", () => {
       const config = resolveConfig({});
       expect(config.enabled).toBe(false);
-      expect(config.judgeModel).toBe("openbmb/minicpm4.1");
+      expect(config.judgeModel).toBe("llama3.2:3b");
     });
 
     it("inherits judge endpoint from privacy localModel", () => {

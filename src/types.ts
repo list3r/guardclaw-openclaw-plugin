@@ -78,7 +78,22 @@ export type PrivacyConfig = {
   guardAgent?: {
     id?: string;
     workspace?: string;
-    /** Full model reference in "provider/model" format (e.g. "ollama/llama3.2:3b", "vllm/qwen2.5:7b") */
+    /**
+     * The OpenClaw provider alias to route S3 (and optionally S2-local) content to.
+     * Must match a provider key in openclaw.json. No default — must be set explicitly.
+     *
+     * Examples: "ollama", "ollama-remote", "ollama-120", "financial-llm", "image-llm"
+     *
+     * GuardClaw does not hardcode any provider name. What works on one deployment
+     * may not exist on another. Configure this to match your local inference stack.
+     */
+    provider?: string;
+    /**
+     * Optional: pin a specific model within the provider.
+     * Omit to use the provider's configured default model.
+     *
+     * Examples: "llama3.2:3b", "qwen3:14b", "mistral:7b"
+     */
     model?: string;
   };
   session?: {

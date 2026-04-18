@@ -327,6 +327,13 @@ export function isOllamaTarget(target: OriginalProviderTarget): boolean {
   const provider = target.provider.toLowerCase();
   const url = target.baseUrl.toLowerCase();
 
+  // If the provider explicitly uses an OpenAI-compatible API, treat it as
+  // a standard OpenAI endpoint regardless of provider name or URL patterns.
+  // This prevents the proxy from converting /v1/chat/completions → /api/chat
+  // for Ollama servers accessed through their OpenAI-compatible layer.
+  const OPENAI_COMPAT_APIS = ["openai-completions", "openai-chat", "openai"];
+  if (OPENAI_COMPAT_APIS.includes(api)) return false;
+
   if (OLLAMA_APIS.includes(api)) return true;
   if (provider.includes("ollama")) return true;
   if (OLLAMA_URL_MARKERS.some((p) => url.includes(p))) return true;
@@ -476,11 +483,14 @@ export function buildUpstreamUrl(targetBaseUrl: string, reqUrl: string | undefin
 
   // Ollama: uses /api/chat instead of /v1/chat/completions
   if (target && isOllamaTarget(target)) {
+    // Strip /v1 suffix from baseUrl — native Ollama API sits at the root,
+    // not under /v1 (which is reserved for the OpenAI-compatible layer).
+    const ollamaBase = baseUrl.replace(/\/v1$/, "");
     if (rawPath.includes("/chat/completions") || rawPath.includes("/chat")) {
-      return `${baseUrl}/api/chat`;
+      return `${ollamaBase}/api/chat`;
     }
     // Other Ollama endpoints: /api/generate, /api/embeddings, etc.
-    return `${baseUrl}/api${rawPath.replace(/^\/v1/, "")}`;
+    return `${ollamaBase}/api${rawPath.replace(/^\/v1/, "")}`;
   }
 
   // Other providers: strip /v1 prefix (it's already in the base URL)
